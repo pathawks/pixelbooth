@@ -8,9 +8,10 @@ image data** and **explaining exactly what was saved**.
 - AVFoundation capture (`AVCaptureVideoDataOutput`), prioritizing UVC cameras
 - **JPEG passthrough**: native MJPEG samples are archived with the camera's own
   image-coding data — markers, tables, and scan payload — never recompressed
-- **Lossless AVIF** for uncompressed RGB/YUV and decoded H.264 input, encoded
-  in-process by pinned libavif + libaom at speed 0, verified by exact
-  native-channel round-trip comparison
+- **Lossless AVIF** for the layouts listed as supported in
+  [`docs/CAPABILITY_MATRIX.md`](docs/CAPABILITY_MATRIX.md), encoded in-process
+  by pinned libavif + libaom at speed 0 and verified by exact native-channel
+  round-trip comparison
 - Photos-first saving with durable staging, a crash-recoverable journal, and
   recoverable failure states
 
@@ -18,29 +19,39 @@ image data** and **explaining exactly what was saved**.
 
 Requirements:
 - Apple Silicon Mac
-- macOS 27.0 SDK (Command Line Tools are sufficient for command-line builds; the
-  full Xcode 27 toolchain is required to open the package as a project and run
-  XCTest-based UI tests)
+- macOS 27.0 SDK and full Xcode 27 for app builds. The headless test runner can
+  be built with Command Line Tools, but they cannot load the SwiftUI macro plugin
+  required by the app target.
 - Camera permission when running the app
 
 ```sh
-scripts/build.sh          # build everything + run the test suite
-scripts/build_app.sh      # build release and assemble build/PixelBooth.app
+scripts/validate.sh       # debug builds + automated tests; does not update the .app
+scripts/build_app.sh      # create/replace the release build/PixelBooth.app
 open build/PixelBooth.app
 ```
 
-First run asks for camera permission. Default saving destination is the System
-Photo Library (Photos add-only authorization).
+First run asks for camera permission. PixelBooth requests Photos add-only access
+when you first save; if access was previously denied, the app explains how to
+enable it in System Settings. Default saving destination is the System Photo
+Library.
 
 ## Build and test commands
 
 | Command | Purpose |
 |---------|---------|
-| `scripts/build.sh` | Fetch/build pinned native deps, build all targets, run test runner |
-| `scripts/build_app.sh` | Release build + assemble `build/PixelBooth.app` |
+| `scripts/validate.sh` | Strict lint, pinned native deps, debug app/test builds, automated tests; does not assemble `.app` |
+| `scripts/build_app.sh` | Strict lint, release build, and assembly; replaces `build/PixelBooth.app` |
+| `swift format lint --strict --recursive Sources Tests Tools` | Check formatting and Swift style rules |
 | `swift build --product PixelBooth` | Executable only |
 | `swift run --skip-build PixelBoothTestRunner` | Automated test suite |
 | `scripts/fetch_deps.sh` | Re-fetch/rebuild libavif 1.3.0 + libaom 3.13.1 (checksum-verified) |
+
+## Project-local Xcode selection
+
+The build scripts leave the machine-wide `xcode-select` setting unchanged. If
+it points to Command Line Tools, copy `.env.local.example` to `.env.local` and
+set `DEVELOPER_DIR` to the full Xcode Developer directory. The scripts load
+that file only when `DEVELOPER_DIR` is not already set in the environment.
 
 ## The fidelity contract, in short
 
@@ -49,15 +60,28 @@ Photo Library (Photos add-only authorization).
 - Uncompressed RGB/YUV input → every meaningful channel sample is preserved at
   its original bit depth and chroma sampling (AVIF lossless, verified by exact
   round-trip, not visual similarity).
-- H.264 input → decoded via VideoToolbox and saved as lossless AVIF; the source
-  stream is not stored.
+- H.264 input has a VideoToolbox decode-to-snapshot path, but it is not yet a
+  verified capability: the current host's VideoToolbox returns `-12911` while
+  creating a decoder session for the synthetic encoded acceptance fixture.
+  The compressed source is never stored as an image archive.
 - No resizing, cropping, mirroring, rotation, denoise, sharpen, tone-mapping,
   deinterlacing, or YUV-through-RGB on the archival path. Ever.
 - Unsupported representations are rejected with an explicit error, not
   silently normalized.
-- This is not sensor RAW, and preservation after macOS delivery is not proof of
-  untouched USB-level acquisition. The inspector says exactly what was
-  preserved and on what evidence.
+
+### Frames delivered by macOS
+
+PixelBooth preserves the image representation delivered by macOS. A known
+conversion that conflicts with the selected camera mode is rejected. When the
+upstream path cannot be established, the capture is labeled
+`macDeliveredUnknownUpstream`; that uncertainty does not block capture. Matching
+format identifiers alone do not prove untouched USB-level acquisition, and
+PixelBooth is not sensor RAW. The saved evidence records what was delivered and
+what is known about its origin.
+
+The format matrix distinguishes known FourCC facts from formats that have a
+tested archival adapter. In particular, `v210` is packed 10-bit 4:2:2 and is
+not currently supported by the archival path.
 
 ## Documentation
 

@@ -9,9 +9,9 @@ public enum ModeSelector {
   public static func bitsPerChannel(of f: CaptureFormat) -> Int? {
     if let b = f.bitsPerChannel { return b }
     switch f.fourCC {
-    case 0x32313276: return 10  // v210
-    case 0x32363179: return 10  // y216 container, 10-bit meaningful
-    default: return 8           // 8-bit layouts
+    case 0x3231_3276: return 10  // v210
+    case 0x3236_3179: return 10  // y216 container, 10-bit meaningful
+    default: return 8  // 8-bit layouts
     }
   }
 
@@ -19,9 +19,9 @@ public enum ModeSelector {
   public static func chromaSampling(of f: CaptureFormat) -> CaptureFormat.ChromaSampling? {
     if let c = f.chromaSampling { return c }
     switch f.fourCC {
-    case 0x4e563132, 0x66303234, 0x76303234: return .yuv420  // NV12, 420f, 420v
-    case 0x32757976, 0x73757679: return .yuv422             // YUY2, UYVY
-    case 0x38303476: return .yuv444                          // v408
+    case 0x4e56_3132, 0x6630_3234, 0x7630_3234: return .yuv420  // NV12, 420f, 420v
+    case 0x3275_7976, 0x7375_7679: return .yuv422  // YUY2, UYVY
+    case 0x3830_3476: return .yuv444  // v408
     default: return nil
     }
   }

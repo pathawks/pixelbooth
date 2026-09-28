@@ -56,7 +56,9 @@ Do not reopen them in future work.
 - The acquisition-fidelity classification is evidence-driven. A known
   conversion that violates the selected native mode must fail that mode.
   Unestablishable upstream behavior is labeled "macOS-delivered preservation"
-  and requires explicit acknowledgment — never silently substituted.
+  and recorded as uncertain provenance. This uncertainty does not gate capture;
+  it must never be presented as verified native acquisition. The README explains
+  this preservation boundary to users.
 - Identity enrichment (USB IDs, strings) is isolated from frame acquisition;
   unavailable fields are reported unavailable.
 - Stream configuration stays off the main actor. Accepted photographs own
@@ -183,6 +185,16 @@ Do not reopen them in future work.
 - Pinned native dependencies with checksums, reproducible arm64 builds,
   recorded licenses/notices; no arbitrary branch fetches during ordinary
   builds; no bundling shell-out tools for every photograph.
+
+## Formatting and lint (mandatory)
+
+- All Swift files under `Sources`, `Tests`, and `Tools` must comply with the
+  checked-in `.swift-format` configuration. The required check is
+  `swift format lint --strict --recursive Sources Tests Tools`.
+- This check is part of the build pipelines and must not be bypassed: do not
+  skip it, exclude files, add suppressions, or weaken the configuration to
+  make violations pass. Format code with `swift format format` and resolve the
+  findings before completing a change.
 
 ## Testing discipline (settled)
 

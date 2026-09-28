@@ -22,8 +22,10 @@ public struct MetadataObservation: Hashable, Sendable, Codable {
   /// Arbitrary verbatim payload preserved from the source when useful.
   public var rawPayload: String?
 
-  public init(key: String, rawValueString: String, provenance: MetadataProvenance,
-              observedAtISO: String? = nil, rawPayload: String? = nil) {
+  public init(
+    key: String, rawValueString: String, provenance: MetadataProvenance,
+    observedAtISO: String? = nil, rawPayload: String? = nil
+  ) {
     self.key = key
     self.rawValueString = rawValueString
     self.provenance = provenance
@@ -43,9 +45,11 @@ public struct HostLocationObservation: Hashable, Sendable, Codable {
   /// Host-clock age at capture, in seconds.
   public var ageAtCaptureSeconds: Double
 
-  public init(latitude: Double, longitude: Double, altitude: Double?,
-              horizontalAccuracy: Double, verticalAccuracy: Double?,
-              timestampISO: String, ageAtCaptureSeconds: Double) {
+  public init(
+    latitude: Double, longitude: Double, altitude: Double?,
+    horizontalAccuracy: Double, verticalAccuracy: Double?,
+    timestampISO: String, ageAtCaptureSeconds: Double
+  ) {
     self.latitude = latitude
     self.longitude = longitude
     self.altitude = altitude
@@ -73,19 +77,34 @@ public struct FrameMetadataSnapshot: Hashable, Sendable, Codable {
   public var wallClockAnchorISO: String
   /// Configuration generation this snapshot belongs to.
   public var generation: Int
+  /// Host-observed device identity (capture backend's reported device
+  /// manufacturer and localized name). Never claimed as camera-Exif; the
+  /// save path mirrors it into Exif Make/Model with this provenance labeled
+  /// in the application XMP.
+  public var hostObservedDeviceMake: String?
+  public var hostObservedDeviceModel: String?
+  /// Capture backend and host software version observed at the shutter.
+  public var captureBackend: String?
+  public var captureBackendVersion: String?
 
-  public init(sampleBufferAttachments: [String: String] = [:],
-              pixelBufferAttachments: [String: String] = [:],
-              formatDescriptionData: [String: String] = [:],
-              embeddedSourceExif: [UInt8]? = nil,
-              embeddedSourceXMP: [UInt8]? = nil,
-              embeddedSourceICC: [UInt8]? = nil,
-              unknownSegments: [[UInt8]] = [],
-              hostObservations: [MetadataObservation] = [],
-              hostLocation: HostLocationObservation? = nil,
-              mediaTimeNanos: UInt64,
-              wallClockAnchorISO: String,
-              generation: Int) {
+  public init(
+    sampleBufferAttachments: [String: String] = [:],
+    pixelBufferAttachments: [String: String] = [:],
+    formatDescriptionData: [String: String] = [:],
+    embeddedSourceExif: [UInt8]? = nil,
+    embeddedSourceXMP: [UInt8]? = nil,
+    embeddedSourceICC: [UInt8]? = nil,
+    unknownSegments: [[UInt8]] = [],
+    hostObservations: [MetadataObservation] = [],
+    hostLocation: HostLocationObservation? = nil,
+    mediaTimeNanos: UInt64,
+    wallClockAnchorISO: String,
+    generation: Int,
+    hostObservedDeviceMake: String? = nil,
+    hostObservedDeviceModel: String? = nil,
+    captureBackend: String? = nil,
+    captureBackendVersion: String? = nil
+  ) {
     self.sampleBufferAttachments = sampleBufferAttachments
     self.pixelBufferAttachments = pixelBufferAttachments
     self.formatDescriptionData = formatDescriptionData
@@ -98,6 +117,10 @@ public struct FrameMetadataSnapshot: Hashable, Sendable, Codable {
     self.mediaTimeNanos = mediaTimeNanos
     self.wallClockAnchorISO = wallClockAnchorISO
     self.generation = generation
+    self.hostObservedDeviceMake = hostObservedDeviceMake
+    self.hostObservedDeviceModel = hostObservedDeviceModel
+    self.captureBackend = captureBackend
+    self.captureBackendVersion = captureBackendVersion
   }
 }
 
@@ -123,15 +146,18 @@ public struct PixelBoothXMP {
     fidelity: String,
     hostLocation: HostLocationObservation?,
     mediaTimeNanos: UInt64,
-    wallClockAnchorISO: String
+    wallClockAnchorISO: String,
+    sourceFormat: String? = nil,
+    dataSource: String? = nil
   ) -> [UInt8] {
     var xmp = """
-    <?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
-    <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="PixelBooth \(appVersion)">
-    <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
-    <rdf:Description rdf:about=""
-      xmlns:\(namespacePrefix)="\((namespaceURI))"
-    """
+      <?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
+      <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="PixelBooth \(appVersion)">
+      <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+      <rdf:Description rdf:about=""
+        xmlns:\(namespacePrefix)="\((namespaceURI))"
+        xmlns:exif="http://ns.adobe.com/exif/1.0/"
+      """
 
     xmp += "\n  \(namespacePrefix):CaptureUUID=\"\(captureUUID.uuidString)\""
     xmp += "\n  \(namespacePrefix):ApplicationVersion=\"\(escape(appVersion))\""
@@ -139,6 +165,12 @@ public struct PixelBoothXMP {
     xmp += "\n  \(namespacePrefix):CaptureBackendVersion=\"\(escape(backendVersion))\""
     xmp += "\n  \(namespacePrefix):LibavifVersion=\"\(escape(libavifVersion))\""
     xmp += "\n  \(namespacePrefix):ActualCaptureFormat=\"\(escape(actualCaptureFormat))\""
+    if let sourceFormat {
+      xmp += "\n  \(namespacePrefix):SourceFormat=\"\(escape(sourceFormat))\""
+    }
+    if let dataSource {
+      xmp += "\n  \(namespacePrefix):DataSource=\"\(escape(dataSource))\""
+    }
     xmp += "\n  \(namespacePrefix):EncoderSettings=\"\(escape(encoderSettings))\""
     xmp += "\n  \(namespacePrefix):AcquisitionFidelity=\"\(escape(fidelity))\""
     xmp += "\n  \(namespacePrefix):SchemaVersion=\"\(schemaVersion)\""
@@ -149,11 +181,32 @@ public struct PixelBoothXMP {
       xmp += "\n  \(namespacePrefix):HostLongitude=\"\(loc.longitude)\""
       if let a = loc.altitude { xmp += "\n  \(namespacePrefix):HostAltitude=\"\(a)\"" }
       xmp += "\n  \(namespacePrefix):HostHorizontalAccuracy=\"\(loc.horizontalAccuracy)\""
+      if let accuracy = loc.verticalAccuracy {
+        xmp += "\n  \(namespacePrefix):HostVerticalAccuracy=\"\(accuracy)\""
+      }
       xmp += "\n  \(namespacePrefix):HostLocationTimestamp=\"\(escape(loc.timestampISO))\""
       xmp += "\n  \(namespacePrefix):HostLocationAgeAtCaptureSeconds=\"\(loc.ageAtCaptureSeconds)\""
+      // Standard XMP Exif geotags let photo software recognize a host
+      // geotag. The pbx:Host* fields above preserve its provenance explicitly.
+      if let latitude = xmpCoordinate(loc.latitude, limit: 90, positive: "N", negative: "S"),
+        let longitude = xmpCoordinate(loc.longitude, limit: 180, positive: "E", negative: "W"),
+        !(loc.latitude == 0 && loc.longitude == 0)
+      {
+        xmp += "\n  exif:GPSLatitude=\"\(escape(latitude))\""
+        xmp += "\n  exif:GPSLongitude=\"\(escape(longitude))\""
+      }
+      if let altitude = loc.altitude, altitude.isFinite {
+        xmp += "\n  exif:GPSAltitude=\"\(abs(altitude))\""
+        xmp += "\n  exif:GPSAltitudeRef=\"\(altitude < 0 ? 1 : 0)\""
+      }
+      if loc.horizontalAccuracy.isFinite, loc.horizontalAccuracy >= 0 {
+        xmp += "\n  exif:GPSHPositioningError=\"\(loc.horizontalAccuracy)\""
+      }
+      xmp += "\n  exif:GPSTimeStamp=\"\(escape(loc.timestampISO))\""
     }
     for (i, obs) in metadataProvenance.enumerated() {
-      xmp += "\n  \(namespacePrefix):Provenance\(i)=\"\(escape(obs.key))=\(escape(obs.rawValueString))|\(obs.provenance.rawValue)\""
+      xmp +=
+        "\n  \(namespacePrefix):Provenance\(i)=\"\(escape(obs.key))=\(escape(obs.rawValueString))|\(obs.provenance.rawValue)\""
       if let at = obs.observedAtISO {
         xmp += "\n  \(namespacePrefix):Provenance\(i)ObservedAt=\"\(escape(at))\""
       }
@@ -169,6 +222,20 @@ public struct PixelBoothXMP {
     out = out.replacingOccurrences(of: ">", with: "&gt;")
     out = out.replacingOccurrences(of: "\"", with: "&quot;")
     return out
+  }
+
+  private static func xmpCoordinate(
+    _ value: Double, limit: Double,
+    positive: String, negative: String
+  ) -> String? {
+    guard value.isFinite, abs(value) <= limit else { return nil }
+    let absolute = abs(value)
+    let degrees = Int(absolute)
+    let minutes = (absolute - Double(degrees)) * 60
+    let hemisphere = value < 0 ? negative : positive
+    return String(
+      format: "%d,%.8f%@", locale: Locale(identifier: "en_US_POSIX"),
+      degrees, minutes, hemisphere)
   }
 }
 
@@ -189,22 +256,37 @@ public struct LocationAcceptance {
   ) -> HostLocationObservation? {
     guard let obs else { return nil }
     // Validity of coordinates.
-    guard obs.latitude >= -90, obs.latitude <= 90,
-          obs.longitude >= -180, obs.longitude <= 180 else {
+    guard obs.latitude.isFinite, obs.longitude.isFinite,
+      obs.latitude >= -90, obs.latitude <= 90,
+      obs.longitude >= -180, obs.longitude <= 180
+    else {
       return nil
     }
     // Reject the degenerate zero-coordinate case; never invent coordinates.
     guard !(obs.latitude == 0 && obs.longitude == 0) else { return nil }
     // Reject stale observations.
-    guard obs.ageAtCaptureSeconds >= 0,
-          obs.ageAtCaptureSeconds <= policy.maximumAgeSeconds else {
+    guard policy.maximumAgeSeconds.isFinite, policy.maximumAgeSeconds >= 0,
+      obs.ageAtCaptureSeconds.isFinite, obs.ageAtCaptureSeconds >= 0,
+      obs.ageAtCaptureSeconds <= policy.maximumAgeSeconds
+    else {
       return nil
     }
+    guard obs.horizontalAccuracy.isFinite, obs.horizontalAccuracy >= 0 else { return nil }
     // Reject invalid altitude (below the Earth's center is not plausible).
-    if let alt = obs.altitude, alt < -10000 { return nil }
+    if let alt = obs.altitude, !alt.isFinite || alt < -10000 { return nil }
+    if let accuracy = obs.verticalAccuracy, !accuracy.isFinite || accuracy < 0 { return nil }
     // Sanity-check that the capture timestamp is parseable; the observation's
     // own timestamp is what is recorded.
-    guard !captureISO.isEmpty else { return nil }
+    guard parseISO(captureISO) != nil, parseISO(obs.timestampISO) != nil else { return nil }
     return obs
+  }
+
+  private static func parseISO(_ value: String) -> Date? {
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = fractional.date(from: value) { return date }
+    let plain = ISO8601DateFormatter()
+    plain.formatOptions = [.withInternetDateTime]
+    return plain.date(from: value)
   }
 }

@@ -1,10 +1,12 @@
 // Helpers for the headless hardware probe (no XCTest dependency).
 
-import Foundation
 import AVFoundation
 import CoreMedia
+import Foundation
 
-final class ProbeDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable {
+final class ProbeDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate,
+  @unchecked Sendable
+{
   // Narrow documented exception: forwards immutable buffers to a local
   // handler on the probe's own queue.
   private let onFrame: @Sendable (CMSampleBuffer) -> Void
@@ -13,8 +15,10 @@ final class ProbeDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     self.onFrame = onFrame
   }
 
-  func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
-                     from connection: AVCaptureConnection) {
+  func captureOutput(
+    _ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
+    from connection: AVCaptureConnection
+  ) {
     onFrame(sampleBuffer)
   }
 }
@@ -37,8 +41,10 @@ func wait(_ e: ProbeExpectation, seconds: Double) async -> Bool {
 }
 
 func fourCCText(_ v: UInt32) -> String {
-  let bytes = [UInt8(truncatingIfNeeded: v >> 24), UInt8(truncatingIfNeeded: v >> 16),
-               UInt8(truncatingIfNeeded: v >> 8), UInt8(truncatingIfNeeded: v)]
+  let bytes = [
+    UInt8(truncatingIfNeeded: v >> 24), UInt8(truncatingIfNeeded: v >> 16),
+    UInt8(truncatingIfNeeded: v >> 8), UInt8(truncatingIfNeeded: v),
+  ]
   return bytes.map { b -> String in
     let printable = 0x21...0x7e
     return printable.contains(Int(b)) ? String(UnicodeScalar(b)) : "?"

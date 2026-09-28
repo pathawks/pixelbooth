@@ -38,7 +38,7 @@ Investigate and use native delivery through `AVCaptureVideoDataOutput`. On macOS
 
 Track separately: device-reported/negotiated format where accessible; actual delivered sample format; any decoding/conversion known to have occurred; and output representation. Do not label a camera as natively RGB just because macOS delivered RGB. Matching FourCCs alone does not verify the upstream acquisition path.
 
-Build an explicit acquisition-fidelity classification. Mark native preservation verified only when evidence supports it. A known conversion that violates the selected native mode must fail that mode. When upstream behavior cannot be established, label it clearly as macOS-delivered preservation, and require an explicit acknowledgment before using that compatibility path. Do not silently substitute it for native preservation.
+Build an explicit acquisition-fidelity classification. Mark native preservation verified only when evidence supports it. A known conversion that violates the selected native mode must fail that mode. When upstream behavior cannot be established, label it clearly as macOS-delivered preservation. Do not block capture solely because upstream behavior is unknown, and do not include an acknowledgment control in the app; explain this preservation boundary in the README. Do not silently substitute uncertain provenance for verified native preservation.
 
 Read camera identity and additional USB/UVC information through supported APIs where accessible. Do not assume AVFoundation exposes every descriptor or control. Isolate optional identity enrichment from frame acquisition, and report unavailable fields as unavailable.
 

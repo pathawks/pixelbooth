@@ -53,7 +53,7 @@ let package = Package(
     // AVFoundation capture: discovery, configuration, sample delivery, provenance.
     .target(name: "PixelBoothCapture", dependencies: ["PixelBoothCore", "PixelBoothAdapters"], path: "Sources/PixelBoothCapture"),
     // Destination: staging, journal, Photos-first import, recovery.
-    .target(name: "PixelBoothLibrary", dependencies: ["PixelBoothCore", "PixelBoothAVIF", "PixelBoothAdapters", "PixelBoothCapture", "PixelBoothMetadata"], path: "Sources/PixelBoothLibrary"),
+    .target(name: "PixelBoothLibrary", dependencies: ["PixelBoothCore", "PixelBoothAVIF", "PixelBoothAdapters", "PixelBoothCapture", "PixelBoothMetadata", "PixelBoothJPEG"], path: "Sources/PixelBoothLibrary"),
     // SwiftUI application.
     .executableTarget(
       name: "PixelBoothApp",
@@ -66,20 +66,19 @@ let package = Package(
       dependencies: ["PixelBoothCore", "PixelBoothAdapters", "PixelBoothAVIF", "PixelBoothJPEG", "PixelBoothCapture", "PixelBoothLibrary"],
       path: "Tools/HardwareProbe"
     ),
-    // End-to-end hardware verification probe (camera → AVIF → decode-compare).
+    // Synthetic mouse-event driver (tests only): exercises tooltip and
+    // hit-testing paths without a human.
     .executableTarget(
-      name: "EndToEndProbe",
-      dependencies: ["PixelBoothCore", "PixelBoothAdapters", "PixelBoothAVIF", "PixelBoothJPEG", "PixelBoothCapture", "PixelBoothLibrary"],
-      path: "Tools/EndToEndProbe"
+      name: "MouseDriver",
+      path: "Tools/MouseDriver"
     ),
-    // Test-only synthetic camera source for fixtures.
-    .target(name: "PixelBoothTestSupport", dependencies: ["PixelBoothCore", "PixelBoothAdapters"], path: "Sources/PixelBoothTestSupport"),
     // Self-contained test runner (SwiftPM under Command Line Tools cannot
     // load the SDK Testing macro plugin, and XCTest requires full Xcode).
     .executableTarget(
       name: "PixelBoothTestRunner",
-      dependencies: ["PixelBoothCore", "PixelBoothAdapters", "PixelBoothJPEG", "PixelBoothAVIF", "PixelBoothMetadata", "PixelBoothLibrary", "PixelBoothTestSupport", "PixelBoothCapture"],
-      path: "Tests/PixelBoothTestRunner"
+      dependencies: ["PixelBoothCore", "PixelBoothAdapters", "PixelBoothJPEG", "PixelBoothAVIF", "PixelBoothMetadata", "PixelBoothLibrary", "PixelBoothCapture"],
+      path: "Tests/PixelBoothTestRunner",
+      resources: [.copy("Fixtures/h264-synthetic.264")]
     ),
   ],
   swiftLanguageModes: [.v6]

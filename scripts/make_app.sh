@@ -6,13 +6,18 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CONFIG="${1:-release}"
-PRODUCT=".build/out/Products/$CONFIG"
-if [[ ! -d "$PRODUCT" ]]; then
+IDENTITY="${2:--}"
+case "$CONFIG" in
+  debug|release) ;;
+  *) echo "Usage: scripts/make_app.sh [debug|release] [signing-identity]" >&2; exit 2 ;;
+esac
+PRODUCT=".build/out/Products/release"
+if [[ "$CONFIG" == debug ]]; then
   PRODUCT=".build/out/Products/Debug"
 fi
 BIN="$PRODUCT/PixelBooth"
 if [[ ! -x "$BIN" ]]; then
-  echo "Executable not found at $BIN — run scripts/build_app.sh first." >&2
+  echo "Executable for the requested $CONFIG configuration was not found at $BIN — run scripts/build_app.sh first." >&2
   exit 1
 fi
 
@@ -23,15 +28,14 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/PixelBooth"
 cp "Support/Info.plist" "$APP/Contents/Info.plist"
 mkdir -p "$APP/Contents/Resources/en.lproj"
-cp "Support/en.lproj/InfoPlist.strings" "$APP/Contents/Resources/en.lproj/" 2>/dev/null || true
+cp "Support/en.lproj/InfoPlist.strings" "$APP/Contents/Resources/en.lproj/"
 
 # Sign: ad-hoc by default for local development; pass a Developer ID
 # identity to also sign for distribution.
-IDENTITY="${1:--}"
 codesign --force --sign "$IDENTITY" \
   --entitlements Support/PixelBooth.entitlements \
   --options runtime \
-  "$APP" 2>/dev/null || codesign --force -s - --entitlements Support/PixelBooth.entitlements "$APP"
+  "$APP"
 
 echo "Built $APP"
 codesign -dv "$APP" 2>&1 | head -4 || true

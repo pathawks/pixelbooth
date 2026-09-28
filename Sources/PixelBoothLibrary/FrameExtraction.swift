@@ -2,25 +2,22 @@
 // buffer into a PlanarImage via the pure adapters, or extracts a complete
 // JPEG from a native MJPEG sample. Unsupported representations are rejected,
 // never silently normalized.
+//
+// Format evidence rule: the switch is on the CVPixelBuffer's own OSType
+// (byte-exact FourCC, see PixelFormatFourCC) — the negotiated UVC FourCC can
+// differ (UVC UYVY "yuvs" is delivered as pixel-buffer '2vuy').
 
-import Foundation
 import AVFoundation
 import CoreVideo
-import PixelBoothCore
+import Foundation
 import PixelBoothAdapters
+import PixelBoothCore
 import PixelBoothJPEG
 
 public enum FrameExtraction {
-  /// FourCCs the archival path supports today. Each entry has adapter tests;
+  /// OSTypes the archival path supports today. Each entry has adapter tests;
   /// a layout is advertised only after its adapter passes tests.
-  public static let supportedPixelFormats: [UInt32] = [
-    0x4e563132, // NV12 (bi-planar 8-bit 4:2:0)
-    0x76303234, // 420v
-    0x66303234, // 420f
-    0x42475241, // BGRA
-    0x32757976, // YUY2 ("2yuv")
-    0x73757679, // UYVY ("yuvs")
-  ]
+  public static let supportedPixelFormats = PixelFormatFourCC.nativePlaneFormats
 
   /// Extract a complete JPEG from a native MJPEG sample buffer, byte-exact.
   public static func extractJPEG(from sampleBuffer: CMSampleBuffer) throws -> [UInt8] {
@@ -32,7 +29,8 @@ public enum FrameExtraction {
     var data = Data(count: totalLength)
     let copied = data.withUnsafeMutableBytes { raw -> Int in
       guard let ptr = raw.baseAddress else { return 0 }
-      let status = CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: totalLength, destination: ptr)
+      let status = CMBlockBufferCopyDataBytes(
+        block, atOffset: 0, dataLength: totalLength, destination: ptr)
       if status != kCMBlockBufferNoErr { return 0 }
       return totalLength
     }
@@ -43,47 +41,121 @@ public enum FrameExtraction {
     return bytes
   }
 
-  /// Adapt an uncompressed pixel buffer to a PlanarImage.
+  /// Adapt an uncompressed pixel buffer to a PlanarImage. The delivered
+  /// pixel-buffer OSType governs the path (evidence rule); a negotiated
+  /// FourCC that differs means macOS performed a known conversion.
   public static func adapt(_ pixelBuffer: CVPixelBuffer, fourCC: UInt32) throws -> PlanarImage {
+    let lockStatus = CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+    guard lockStatus == kCVReturnSuccess else { throw AdapterError.planeUnavailable }
+    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+    return try adaptLocked(pixelBuffer, fourCC: fourCC)
+  }
+
+  private static func adaptLocked(_ pixelBuffer: CVPixelBuffer, fourCC: UInt32) throws
+    -> PlanarImage
+  {
     let width = CVPixelBufferGetWidth(pixelBuffer)
     let height = CVPixelBufferGetHeight(pixelBuffer)
-    CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
     let deliveredFourCC = CVPixelBufferGetPixelFormatType(pixelBuffer)
-    // Evidence rule (TN3121): the delivered pixel buffer's own format governs
-    // the archival path. A negotiated FourCC that differs means macOS
-    // performed a known conversion; we preserve the delivered representation.
-    let relevant = deliveredFourCC
 
-    switch relevant {
-    case 0x42475241: // BGRA
-      guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { throw AdapterError.planeUnavailable }
+    switch deliveredFourCC {
+    case PixelFormatFourCC.bgra:  // BGRA
+      guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+        throw AdapterError.planeUnavailable
+      }
       return try SampleLayoutAdapter.adaptBGRA32(
         data: UnsafeRawPointer(base),
         bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
         width: width, height: height)
-    case 0x34323076, // "420v" (delivered NV12 bi-planar 8-bit 4:2:0)
-         0x4e563132, // "NV12"
-         0x66303234: // "420f"
-      guard let yBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
-            let chromaBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1) else {
+    case PixelFormatFourCC.bgr24:
+      guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else {
         throw AdapterError.planeUnavailable
       }
-      return try SampleLayoutAdapter.adaptNV12(
-        yPlane: UnsafeRawPointer(yBase), yBytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0),
+      return try adaptPackedRGB(
+        data: UnsafeRawPointer(base), bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+        width: width, height: height, fourCC: deliveredFourCC)
+    case PixelFormatFourCC.rgb24:
+      guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+        throw AdapterError.planeUnavailable
+      }
+      return try adaptPackedRGB(
+        data: UnsafeRawPointer(base), bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+        width: width, height: height, fourCC: deliveredFourCC)
+    case PixelFormatFourCC.x420, PixelFormatFourCC.xf20:
+      guard let yBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
+        let chromaBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1)
+      else { throw AdapterError.planeUnavailable }
+      return try SampleLayoutAdapter.adaptBiPlanar10BitYUV(
+        yPlane: UnsafeRawPointer(yBase),
+        yBytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0),
         chromaPlane: UnsafeRawPointer(chromaBase),
         chromaBytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1),
         width: width, height: height)
-    case 0x32757976, 0x73757679: // YUY2, UYVY
-      guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { throw AdapterError.planeUnavailable }
-      let yFirst = relevant == 0x32757976
+    case PixelFormatFourCC.fourTwentyV,  // '420v' NV12 bi-planar 4:2:0
+      PixelFormatFourCC.fourTwentyF,  // '420f'
+      PixelFormatFourCC.nv12:  // 'NV12'
+      guard let yBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
+        let chromaBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1)
+      else {
+        throw AdapterError.planeUnavailable
+      }
+      return try SampleLayoutAdapter.adaptNV12(
+        yPlane: UnsafeRawPointer(yBase),
+        yBytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0),
+        chromaPlane: UnsafeRawPointer(chromaBase),
+        chromaBytesPerRow: CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1),
+        width: width, height: height)
+    case PixelFormatFourCC.twoVuy:  // '2vuy': Cb Y Cr Y — UYVY order
+      guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+        throw AdapterError.planeUnavailable
+      }
       return try SampleLayoutAdapter.adaptPacked422(
         data: UnsafeRawPointer(base), bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
-        width: width, height: height, yFirst: yFirst)
+        width: width, height: height, yFirst: false)
+    case PixelFormatFourCC.yuvs:  // 'yuvs': Y Cb Y Cr — YUY2 order
+      guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+        throw AdapterError.planeUnavailable
+      }
+      return try SampleLayoutAdapter.adaptPacked422(
+        data: UnsafeRawPointer(base), bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+        width: width, height: height, yFirst: true)
     default:
-      throw AdapterError.unsupportedFourCC(relevant)
+      // Reject with the exact delivered OSType for honest diagnostics.
+      throw AdapterError.unsupportedFourCC(deliveredFourCC)
     }
+  }
+
+  /// Shared production seam for CoreVideo's non-alpha packed 24-bit RGB
+  /// layouts; tests feed padded-stride fixtures through the same dispatch.
+  public static func adaptPackedRGB(
+    data: UnsafeRawPointer, bytesPerRow: Int, width: Int, height: Int, fourCC: UInt32
+  ) throws -> PlanarImage {
+    switch fourCC {
+    case PixelFormatFourCC.bgr24:
+      return try SampleLayoutAdapter.adaptBGR24(
+        data: data, bytesPerRow: bytesPerRow, width: width, height: height)
+    case PixelFormatFourCC.rgb24:
+      return try SampleLayoutAdapter.adaptRGB24(
+        data: data, bytesPerRow: bytesPerRow, width: width, height: height)
+    default:
+      throw AdapterError.unsupportedFourCC(fourCC)
+    }
+  }
+
+  /// Snapshot while the CVPixelBuffer is locked, since some adapters borrow
+  /// its plane addresses. Adapter-owned scratch planes are released afterward.
+  public static func snapshot(_ pixelBuffer: CVPixelBuffer, fourCC: UInt32) throws
+    -> CapturedCapture.PlaneSnapshot
+  {
+    let lockStatus = CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+    guard lockStatus == kCVReturnSuccess else { throw AdapterError.planeUnavailable }
+    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+    let planar = try adaptLocked(pixelBuffer, fourCC: fourCC)
+    defer { for pointer in planar.ownedStorage.compactMap({ $0 }) { pointer.deallocate() } }
+    let snapshot = try CapturedCapture.snapshotPlanes(from: planar)
+    try snapshot.validate(width: planar.width, height: planar.height)
+    return snapshot
   }
 }
 

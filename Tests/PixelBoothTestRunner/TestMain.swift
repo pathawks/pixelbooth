@@ -5,23 +5,33 @@
 // environment lacks the hardware or permissions.
 
 import Foundation
-import PixelBoothCore
-import PixelBoothAdapters
-import PixelBoothJPEG
 import PixelBoothAVIF
-import PixelBoothMetadata
-import PixelBoothLibrary
+import PixelBoothAdapters
 import PixelBoothCapture
+import PixelBoothCore
+import PixelBoothJPEG
+import PixelBoothLibrary
+import PixelBoothMetadata
 
 @main
 struct PixelBoothTestRunner {
-  static func main() {
-    runModeSelectorSuite()
-    runReadinessSuite()
-    runAdapterSuite()
-    runJPEGSuite()
-    runAVIFSuite()
-    runMetadataSuite()
+  static func main() async {
+    await runReproSuite()
+    await runModeSelectorSuite()
+    await runReadinessSuite()
+    await runFreshnessSuite()
+    await runAdapterSuite()
+    await runJPEGSuite()
+    await runAVIFSuite()
+    await runCaptureFidelitySuite()
+    await runH264PipelineSuite()
+    await runAcquisitionPolicySuite()
+    await runCaptureDecisionSuite()
+    await runMetadataSuite()
+    await runMetadataExifSuite()
+    await runFourCCSuite()
+    await runPersistenceSuite()
+    await runRecoverySuite()
     runHardwareDependentNotes()
     exit(Int32(reportSummary()))
   }

@@ -13,6 +13,10 @@ jobs:
     runs-on: macos-15  # arm64 macOS runner; requires Xcode 27 toolchain for macosx27.0 SDK
     steps:
       - uses: actions/checkout@v4
+      - name: Select Xcode 27
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '27'
       - name: Show toolchain
         run: |
           xcodebuild -version
@@ -21,6 +25,6 @@ jobs:
       - name: Install toolchain prerequisites
         run: brew install cmake ninja nasm
       - name: Build + test
-        run: scripts/build.sh
+        run: scripts/validate.sh
       - name: Assemble app bundle
         run: scripts/build_app.sh

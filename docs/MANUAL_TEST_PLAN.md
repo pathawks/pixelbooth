@@ -30,9 +30,9 @@ Expected: real devices, honest mode labels.
 3. Verify negotiated vs delivered format is reported, the acquisition-fidelity
    classification is `nativePreserved` only when evidence supports it, and any
    known conversion is listed.
-4. If upstream behavior cannot be established, verify the app shows the
-   compatibility-path label and requires explicit acknowledgment before
-   accepting a capture.
+4. If upstream behavior cannot be established, verify the inspector and saved
+   provenance label the frame as macOS-delivered with unknown upstream behavior,
+   while a valid capture remains available without an acknowledgment gate.
 
 Expected: classification matches the actual evidence.
 
@@ -48,7 +48,9 @@ Expected: image-coding data identical; only metadata additions differ.
 
 ## 4. Uncompressed capture → lossless AVIF
 
-1. Select an uncompressed mode (NV12/420v/BGRA/v210 if exposed).
+1. Select a supported uncompressed mode from `CAPABILITY_MATRIX.md` (such as
+   NV12/420v, 24BG, or x420 if exposed). Do not count v210 as supported; it is
+   packed 10-bit 4:2:2 and currently has no archival adapter.
 2. Capture; confirm the saved file is AVIF, matrix identity for RGB, range
    signaled as stored.
 3. Verify the journal shows Encoding → Validating success.
@@ -56,6 +58,10 @@ Expected: image-coding data identical; only metadata additions differ.
 Expected: lossless round-trip verified; no invented settings.
 
 ## 5. H.264 input
+
+The automated encoded-fixture-to-AVIF acceptance test must pass before this
+manual test can establish support. It is currently `NOT RUN` after VideoToolbox
+session creation returned `-12911` on the implementation host.
 
 1. Select an H.264 mode.
 2. Confirm warm-up pictures excluded from eligibility do not break decoder
@@ -86,12 +92,22 @@ Expected: lossless round-trip verified; no invented settings.
    confirm the journal reconciles without blind duplicates; ambiguous cases
    exposed with explicit retry.
 
-## 8. Disconnect / sleep / mode changes
+## 8. Disconnect / sleep / mode changes / stalled delivery
 
-1. Unplug the UVC camera mid-stream: app must not auto-activate another camera.
-2. Sleep and wake: session recovers; stale frames excluded.
-3. Change mode: configuration generation increments; queued old-mode frames
-   rejected.
+1. Unplug the UVC camera mid-stream: app must not auto-activate another camera,
+   the shutter must disable, and no frame from the stopped stream may be
+   captured (including immediately after unplugging).
+2. Stop delivery without a disconnect (e.g. camera held by another process):
+   the shutter must not accept the last frame after its freshness window
+   (1.5× the configured frame interval) has elapsed.
+3. Sleep and wake: session recovers; stale frames excluded.
+4. Change mode: configuration generation increments; queued old-mode frames
+   rejected, and the freshness window follows the newly selected mode's rate.
+5. Switch between two connected cameras: the mode list and preview must update
+   and the session must reconfigure for the newly selected device. In
+   particular, with two devices exposing the same descriptive mode label, the
+   capture stream must move to the new device rather than remain on the
+   previous camera.
 
 ## 9. Interface checks
 

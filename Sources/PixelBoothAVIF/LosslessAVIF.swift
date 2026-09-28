@@ -1,7 +1,7 @@
 import Foundation
-import PixelBoothCore
 import PixelBoothAdapters
 import PixelBoothCAvifShim
+import PixelBoothCore
 
 /// Lossless AVIF encoding via pinned libavif + libaom.
 /// codecChoice = AVIF_CODEC_CHOICE_AOM, quality = AVIF_QUALITY_LOSSLESS,
@@ -39,16 +39,72 @@ public enum LosslessAVIF {
     _ image: PlanarImage,
     isRGBIdentity: Bool,
     yuvRange: CaptureFormat.YUVRange?,
-    chromaLocation: CaptureFormat.ChromaLocation?
+    chromaLocation: CaptureFormat.ChromaLocation?,
+    colorPrimaries: Int? = nil, transferCharacteristics: Int? = nil,
+    matrixCoefficients: Int? = nil, iccProfile: [UInt8]? = nil,
+    contentLightLevels: [UInt8]? = nil,
+    exifPayload: [UInt8]? = nil, xmpPayload: [UInt8]? = nil
   ) throws -> (data: [UInt8], settings: AppliedSettings) {
     let depth = image.bitsPerChannel
     guard [8, 10, 12].contains(depth) else {
       throw AVIFError.unsupportedLayout("unsupported bit depth \(depth)")
     }
+    guard image.width > 0, image.height > 0, image.width <= Int(UInt32.max),
+      image.height <= Int(UInt32.max),
+      image.planes.count == 3 || image.planes.count == 4,
+      image.bytesPerRow.count == image.planes.count, image.rowCount.count == image.planes.count,
+      image.chromaWidth > 0, image.chromaHeight > 0
+    else {
+      throw AVIFError.unsupportedLayout("invalid plane geometry")
+    }
+    if let colorPrimaries, ![1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 22].contains(colorPrimaries) {
+      throw AVIFError.unsupportedLayout("invalid CICP primaries \(colorPrimaries)")
+    }
+    if let transferCharacteristics,
+      ![1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18].contains(
+        transferCharacteristics)
+    {
+      throw AVIFError.unsupportedLayout("invalid CICP transfer \(transferCharacteristics)")
+    }
+    if let matrixCoefficients,
+      ![0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14].contains(matrixCoefficients)
+    {
+      throw AVIFError.unsupportedLayout("invalid CICP matrix \(matrixCoefficients)")
+    }
+    let valid420 =
+      image.chromaWidth == image.width / 2 && image.chromaHeight == image.height / 2
+      && image.width % 2 == 0 && image.height % 2 == 0
+    let valid422 =
+      image.chromaWidth == image.width / 2 && image.chromaHeight == image.height
+      && image.width % 2 == 0
+    let valid444 = image.chromaWidth == image.width && image.chromaHeight == image.height
+    guard valid420 || valid422 || valid444,
+      image.bytesPerSample == (depth > 8 ? 2 : 1),
+      image.planes.count != 4 || (isRGBIdentity && valid444)
+    else {
+      throw AVIFError.unsupportedLayout("inconsistent plane geometry or representation")
+    }
+    let rowCounts = [image.height, image.chromaHeight, image.chromaHeight]
+    let rowWidths = [image.width, image.chromaWidth, image.chromaWidth]
+    for i in 0..<3 {
+      let (needed, overflow) = rowWidths[i].multipliedReportingOverflow(by: image.bytesPerSample)
+      guard !overflow, image.rowCount[i] == rowCounts[i], image.bytesPerRow[i] >= needed else {
+        throw AVIFError.unsupportedLayout("invalid plane \(i) bounds")
+      }
+    }
+    if image.planes.count == 4 {
+      guard image.rowCount[3] == image.height,
+        image.bytesPerRow[3] >= image.width * image.bytesPerSample
+      else {
+        throw AVIFError.unsupportedLayout("invalid alpha plane bounds")
+      }
+    }
 
-    guard let avifImage = avifImageCreate(
-      UInt32(image.width), UInt32(image.height), UInt32(depth),
-      AVIF_PIXEL_FORMAT_YUV444) else {
+    guard
+      let avifImage = avifImageCreate(
+        UInt32(image.width), UInt32(image.height), UInt32(depth),
+        AVIF_PIXEL_FORMAT_YUV444)
+    else {
       throw AVIFError.imageCreationFailed
     }
     defer { avifImageDestroy(avifImage) }
@@ -62,28 +118,76 @@ public enum LosslessAVIF {
       avifImage.pointee.yuvFormat = AVIF_PIXEL_FORMAT_YUV422
     } else {
       throw AVIFError.unsupportedLayout(
-        "unsupported chroma geometry \(image.chromaWidth)×\(image.chromaHeight) for \(image.width)×\(image.height)")
+        "unsupported chroma geometry \(image.chromaWidth)×\(image.chromaHeight) for \(image.width)×\(image.height)"
+      )
     }
 
     if isRGBIdentity {
       // Identity-matrix, full-range, 4:4:4 representation at the original bit
       // depth. G,B,R land in Y,U,V slots; no YCbCr conversion occurred.
-      avifImage.pointee.matrixCoefficients = avifMatrixCoefficients(0) // AVIF_MATRIX_COEFFICIENTS_IDENTITY
+      // The identity matrix represents AVIF_MATRIX_COEFFICIENTS_IDENTITY.
+      avifImage.pointee.matrixCoefficients = avifMatrixCoefficients(0)
       avifImage.pointee.yuvRange = AVIF_RANGE_FULL
       // Do not claim a transfer/primaries we do not know; leave unspecified.
-      avifImage.pointee.transferCharacteristics = avifTransferCharacteristics(2) // AVIF_TRANSFER_CHARACTERISTICS_UNSPECIFIED
-      avifImage.pointee.colorPrimaries = avifColorPrimaries(2) // AVIF_COLOR_PRIMARIES_UNSPECIFIED
-    } else if let range = yuvRange {
+      avifImage.pointee.transferCharacteristics = avifTransferCharacteristics(
+        UInt32(transferCharacteristics ?? 2))
+      avifImage.pointee.colorPrimaries = avifColorPrimaries(UInt32(colorPrimaries ?? 2))
+    } else {
+      guard let range = yuvRange else { throw AVIFError.unsupportedLayout("unknown YUV range") }
       avifImage.pointee.yuvRange = range == .full ? AVIF_RANGE_FULL : AVIF_RANGE_LIMITED
+      avifImage.pointee.colorPrimaries = avifColorPrimaries(UInt32(colorPrimaries ?? 2))
+      avifImage.pointee.transferCharacteristics = avifTransferCharacteristics(
+        UInt32(transferCharacteristics ?? 2))
+      avifImage.pointee.matrixCoefficients = avifMatrixCoefficients(UInt32(matrixCoefficients ?? 2))
     }
 
     switch chromaLocation {
-    case .left, .topLeft:
+    case .topLeft:
       avifImage.pointee.yuvChromaSamplePosition = AVIF_CHROMA_SAMPLE_POSITION_COLOCATED
-    case .center:
+    case .left:
       avifImage.pointee.yuvChromaSamplePosition = AVIF_CHROMA_SAMPLE_POSITION_VERTICAL
-    case nil, .top, .topRight, .bottomLeft, .bottom, .bottomRight:
+    case nil:
       avifImage.pointee.yuvChromaSamplePosition = AVIF_CHROMA_SAMPLE_POSITION_UNKNOWN
+    default:
+      throw AVIFError.unsupportedLayout("chroma position is not representable by AVIF")
+    }
+
+    if let iccProfile, !iccProfile.isEmpty {
+      let result = iccProfile.withUnsafeBufferPointer { bytes in
+        avifImageSetProfileICC(avifImage, bytes.baseAddress, bytes.count)
+      }
+      guard result == AVIF_RESULT_OK else {
+        throw AVIFError.unsupportedLayout("ICC profile rejected by libavif")
+      }
+    }
+    if let contentLightLevels {
+      guard contentLightLevels.count == 4 else {
+        throw AVIFError.unsupportedLayout("invalid CLLI attachment")
+      }
+      avifImage.pointee.clli.maxCLL =
+        UInt16(contentLightLevels[0]) << 8 | UInt16(contentLightLevels[1])
+      avifImage.pointee.clli.maxPALL =
+        UInt16(contentLightLevels[2]) << 8 | UInt16(contentLightLevels[3])
+    }
+
+    // Application metadata: Exif (host-observed device identity, capture
+    // time) and the versioned application XMP. Set before encoding; the
+    // round-trip verifier below compares them byte-exactly.
+    if let exifPayload, !exifPayload.isEmpty {
+      let result = exifPayload.withUnsafeBufferPointer { bytes in
+        avifImageSetMetadataExif(avifImage, bytes.baseAddress, exifPayload.count)
+      }
+      guard result == AVIF_RESULT_OK else {
+        throw AVIFError.unsupportedLayout("Exif payload rejected by libavif")
+      }
+    }
+    if let xmpPayload, !xmpPayload.isEmpty {
+      let result = xmpPayload.withUnsafeBufferPointer { bytes in
+        avifImageSetMetadataXMP(avifImage, bytes.baseAddress, xmpPayload.count)
+      }
+      guard result == AVIF_RESULT_OK else {
+        throw AVIFError.unsupportedLayout("XMP payload rejected by libavif")
+      }
     }
 
     // Allocate YUV planes inside the image.
@@ -103,25 +207,28 @@ public enum LosslessAVIF {
     for i in 0..<3 {
       let planesTuple = avifImage.pointee.yuvPlanes
       let rowBytesTuple = avifImage.pointee.yuvRowBytes
-      let dst: UnsafeMutablePointer<UInt8> = switch i {
+      let dst: UnsafeMutablePointer<UInt8> =
+        switch i {
         case 0: planesTuple.0!
         case 1: planesTuple.1!
         default: planesTuple.2!
-      }
-      let rawBpr: UInt32 = switch i {
+        }
+      let rawBpr: UInt32 =
+        switch i {
         case 0: rowBytesTuple.0
         case 1: rowBytesTuple.1
         default: rowBytesTuple.2
-      }
+        }
       let dstBpr = Int(rawBpr)
       let (cols, rows) = planeGeometries[i]
       let rowBytes = cols * bytesPerSample
       let src = image.planes[i]
       guard dstBpr >= rowBytes else { throw AVIFError.planePopulationFailed }
       for row in 0..<rows {
-        memcpy(dst.advanced(by: row * dstBpr),
-               src.advanced(by: row * image.bytesPerRow[i]),
-               rowBytes)
+        memcpy(
+          dst.advanced(by: row * dstBpr),
+          src.advanced(by: row * image.bytesPerRow[i]),
+          rowBytes)
       }
     }
 
@@ -138,9 +245,10 @@ public enum LosslessAVIF {
       let src = image.planes[3]
       guard dstBpr >= rowBytes else { throw AVIFError.planePopulationFailed }
       for row in 0..<image.height {
-        memcpy(dst.advanced(by: row * dstBpr),
-               src.advanced(by: row * image.bytesPerRow[3]),
-               rowBytes)
+        memcpy(
+          dst.advanced(by: row * dstBpr),
+          src.advanced(by: row * image.bytesPerRow[3]),
+          rowBytes)
       }
       hasAlpha = true
     }
@@ -179,19 +287,47 @@ public enum LosslessAVIF {
       depth: depth,
       hasAlpha: hasAlpha,
       alphaSrc: hasAlpha ? image.planes[3] : nil,
-      alphaBytesPerRow: hasAlpha ? image.bytesPerRow[3] : 0)
+      alphaBytesPerRow: hasAlpha ? image.bytesPerRow[3] : 0,
+      expectedRange: isRGBIdentity || yuvRange == .full
+        ? Int(AVIF_RANGE_FULL.rawValue) : Int(AVIF_RANGE_LIMITED.rawValue),
+      expectedPrimaries: colorPrimaries ?? 2,
+      expectedTransfer: transferCharacteristics ?? 2,
+      expectedMatrix: isRGBIdentity ? 0 : (matrixCoefficients ?? 2),
+      expectedChromaPosition: Int(avifImage.pointee.yuvChromaSamplePosition.rawValue),
+      expectedICC: iccProfile, expectedCLLI: contentLightLevels,
+      expectedExif: exifPayload, expectedXMP: xmpPayload)
 
-    let pixelFormatString = switch avifImage.pointee.yuvFormat {
+    let pixelFormatString =
+      switch avifImage.pointee.yuvFormat {
       case AVIF_PIXEL_FORMAT_YUV444: "YUV444"
       case AVIF_PIXEL_FORMAT_YUV422: "YUV422"
       case AVIF_PIXEL_FORMAT_YUV420: "YUV420"
       case AVIF_PIXEL_FORMAT_YUV400: "YUV400"
       default: "unknown"
-    }
+      }
     let settings = AppliedSettings(
       codec: "aom", quality: Int(AVIF_QUALITY_LOSSLESS), qualityAlpha: Int(AVIF_QUALITY_LOSSLESS),
       speed: 0, pixelFormat: pixelFormatString, depth: depth, losslessVerified: true)
     return (raw, settings)
+  }
+
+  /// Byte-exact comparison of a decoded avifRWData metadata block against the
+  /// expected payload.
+  static func compareMetadata(_ decoded: avifRWData, _ expected: [UInt8]?, _ name: String) throws {
+    if let expected, !expected.isEmpty {
+      guard Int(decoded.size) == expected.count else {
+        throw AVIFError.validationFailed("decoded \(name) size differs")
+      }
+      let matches = expected.withUnsafeBytes { raw -> Bool in
+        guard let base = raw.baseAddress else { return false }
+        return memcmp(decoded.data, base, expected.count) == 0
+      }
+      guard matches else {
+        throw AVIFError.validationFailed("decoded \(name) differs")
+      }
+    } else if decoded.size != 0 {
+      throw AVIFError.validationFailed("unexpected decoded \(name)")
+    }
   }
 
   /// Decode an AVIF and compare all native-channel samples exactly.
@@ -206,7 +342,16 @@ public enum LosslessAVIF {
     depth: Int,
     hasAlpha: Bool,
     alphaSrc: UnsafeRawPointer?,
-    alphaBytesPerRow: Int
+    alphaBytesPerRow: Int,
+    expectedRange: Int? = nil,
+    expectedPrimaries: Int? = nil,
+    expectedTransfer: Int? = nil,
+    expectedMatrix: Int? = nil,
+    expectedChromaPosition: Int? = nil,
+    expectedICC: [UInt8]? = nil,
+    expectedCLLI: [UInt8]? = nil,
+    expectedExif: [UInt8]? = nil,
+    expectedXMP: [UInt8]? = nil
   ) throws {
     guard let decoded = avifImageCreateEmpty() else {
       throw AVIFError.validationFailed("decoder image allocation failed")
@@ -218,11 +363,66 @@ public enum LosslessAVIF {
     defer { avifDecoderDestroy(decoder) }
     let parseResult = encoded.withUnsafeBytes { rawBytes -> avifResult in
       guard let base = rawBytes.baseAddress else { return AVIF_RESULT_NO_CONTENT }
-      return avifDecoderReadMemory(decoder, decoded, base.assumingMemoryBound(to: UInt8.self), rawBytes.count)
+      return avifDecoderReadMemory(
+        decoder, decoded, base.assumingMemoryBound(to: UInt8.self), rawBytes.count)
     }
     guard parseResult == AVIF_RESULT_OK else {
       throw AVIFError.validationFailed(
         "decode failed: \(String(cString: avifResultToString(parseResult)))")
+    }
+    if let expectedRange, Int(decoded.pointee.yuvRange.rawValue) != expectedRange {
+      throw AVIFError.validationFailed("decoded range differs")
+    }
+    if let expectedPrimaries, Int(decoded.pointee.colorPrimaries) != expectedPrimaries {
+      throw AVIFError.validationFailed("decoded primaries differ")
+    }
+    if let expectedTransfer, Int(decoded.pointee.transferCharacteristics) != expectedTransfer {
+      throw AVIFError.validationFailed("decoded transfer differs")
+    }
+    if let expectedMatrix, Int(decoded.pointee.matrixCoefficients) != expectedMatrix {
+      throw AVIFError.validationFailed("decoded matrix differs")
+    }
+    if let expectedChromaPosition,
+      Int(decoded.pointee.yuvChromaSamplePosition.rawValue) != expectedChromaPosition
+    {
+      throw AVIFError.validationFailed("decoded chroma position differs")
+    }
+    let profile = decoded.pointee.icc
+    if let expectedICC {
+      guard Int(profile.size) == expectedICC.count else {
+        throw AVIFError.validationFailed("decoded ICC size differs")
+      }
+      let matches = expectedICC.withUnsafeBytes { raw -> Bool in
+        guard let base = raw.baseAddress else { return expectedICC.isEmpty }
+        return memcmp(profile.data, base, expectedICC.count) == 0
+      }
+      guard matches else { throw AVIFError.validationFailed("decoded ICC differs") }
+    } else if profile.size != 0 {
+      throw AVIFError.validationFailed("unexpected decoded ICC")
+    }
+    if let expectedCLLI {
+      guard expectedCLLI.count == 4,
+        decoded.pointee.clli.maxCLL == UInt16(expectedCLLI[0]) << 8 | UInt16(expectedCLLI[1]),
+        decoded.pointee.clli.maxPALL == UInt16(expectedCLLI[2]) << 8 | UInt16(expectedCLLI[3])
+      else {
+        throw AVIFError.validationFailed("decoded CLLI differs")
+      }
+    } else if decoded.pointee.clli.maxCLL != 0 || decoded.pointee.clli.maxPALL != 0 {
+      throw AVIFError.validationFailed("unexpected decoded CLLI")
+    }
+    // Application metadata round-trips byte-exactly (Exif payload, XMP).
+    try compareMetadata(decoded.pointee.exif, expectedExif, "Exif")
+    try compareMetadata(decoded.pointee.xmp, expectedXMP, "XMP")
+
+    guard Int(decoded.pointee.width) == width, Int(decoded.pointee.height) == height,
+      Int(decoded.pointee.depth) == depth,
+      Int(decoded.pointee.yuvFormat.rawValue)
+        == (chromaWidth == width && chromaHeight == height
+          ? AVIF_PIXEL_FORMAT_YUV444.rawValue
+          : (chromaWidth == width / 2 && chromaHeight == height / 2
+            ? AVIF_PIXEL_FORMAT_YUV420.rawValue : AVIF_PIXEL_FORMAT_YUV422.rawValue))
+    else {
+      throw AVIFError.validationFailed("decoded geometry, depth, or subsampling differs")
     }
 
     // Compare planes in their native container (8/10/12-bit as stored).
@@ -266,7 +466,8 @@ public enum LosslessAVIF {
       }
       for row in 0..<height {
         let a = alphaSrc.advanced(by: row * alphaBytesPerRow)
-        let b = UnsafeRawPointer(decodedAlpha).advanced(by: row * Int(decoded.pointee.alphaRowBytes))
+        let b = UnsafeRawPointer(decodedAlpha).advanced(
+          by: row * Int(decoded.pointee.alphaRowBytes))
         if memcmp(a, b, rowBytes) != 0 {
           throw AVIFError.validationFailed("alpha row \(row) differs after decode")
         }
@@ -286,7 +487,8 @@ public enum LosslessAVIF {
     defer { avifDecoderDestroy(decoder) }
     let parseResult = encoded.withUnsafeBytes { rawBytes -> avifResult in
       guard let base = rawBytes.baseAddress else { return AVIF_RESULT_NO_CONTENT }
-      return avifDecoderReadMemory(decoder, decoded, base.assumingMemoryBound(to: UInt8.self), encoded.count)
+      return avifDecoderReadMemory(
+        decoder, decoded, base.assumingMemoryBound(to: UInt8.self), encoded.count)
     }
     guard parseResult == AVIF_RESULT_OK else {
       throw AVIFError.validationFailed(
@@ -297,7 +499,9 @@ public enum LosslessAVIF {
     let w = Int(decoded.pointee.width)
     let h = Int(decoded.pointee.height)
 
-    func extract(_ base: UnsafeMutablePointer<UInt8>?, _ bpr: UInt32, _ rows: Int, _ cols: Int) -> [UInt8] {
+    func extract(_ base: UnsafeMutablePointer<UInt8>?, _ bpr: UInt32, _ rows: Int, _ cols: Int)
+      -> [UInt8]
+    {
       guard let base else { return [] }
       var out = [UInt8]()
       out.reserveCapacity(rows * cols * bytesPerSample)
@@ -308,20 +512,27 @@ public enum LosslessAVIF {
       return out
     }
 
-    func extract32(_ base: UnsafeMutablePointer<UInt8>?, _ bpr: UInt32, _ rows: Int, _ cols: Int) -> [UInt8] {
+    func extract32(_ base: UnsafeMutablePointer<UInt8>?, _ bpr: UInt32, _ rows: Int, _ cols: Int)
+      -> [UInt8]
+    {
       extract(base, bpr, rows, cols)
     }
 
-    var chromaW = w, chromaH = h
+    var chromaW = w
+    var chromaH = h
     switch decoded.pointee.yuvFormat {
     case AVIF_PIXEL_FORMAT_YUV444:
-      chromaW = w; chromaH = h
+      chromaW = w
+      chromaH = h
     case AVIF_PIXEL_FORMAT_YUV422:
-      chromaW = w / 2; chromaH = h
+      chromaW = w / 2
+      chromaH = h
     case AVIF_PIXEL_FORMAT_YUV420:
-      chromaW = w / 2; chromaH = h / 2
+      chromaW = w / 2
+      chromaH = h / 2
     case AVIF_PIXEL_FORMAT_YUV400:
-      chromaW = 0; chromaH = 0
+      chromaW = 0
+      chromaH = 0
     default:
       break
     }
@@ -338,6 +549,9 @@ public enum LosslessAVIF {
       width: w, height: h, depth: depth,
       yuvFormat: decoded.pointee.yuvFormat.rawValue,
       matrixCoefficients: Int(decoded.pointee.matrixCoefficients),
+      colorPrimaries: Int(decoded.pointee.colorPrimaries),
+      transferCharacteristics: Int(decoded.pointee.transferCharacteristics),
+      chromaSamplePosition: Int(decoded.pointee.yuvChromaSamplePosition.rawValue),
       range: Int(decoded.pointee.yuvRange.rawValue),
       planes: planes)
   }
@@ -348,6 +562,9 @@ public enum LosslessAVIF {
     public var depth: Int
     public var yuvFormat: UInt32
     public var matrixCoefficients: Int
+    public var colorPrimaries: Int
+    public var transferCharacteristics: Int
+    public var chromaSamplePosition: Int
     public var range: Int
     public var planes: [[UInt8]]
   }

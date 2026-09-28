@@ -15,9 +15,9 @@ public enum JPEGError: Error, Equatable, Sendable {
 
 /// A parsed JPEG segment, preserving raw bytes exactly.
 public struct JPEGSegment: Equatable, Sendable {
-  public var marker: UInt8        // 0xFF-prefixed marker byte (e.g. 0xE0 for APP0)
-  public var offset: Int          // byte offset in the source stream
-  public var payload: [UInt8]     // includes the length bytes if the marker has them
+  public var marker: UInt8  // 0xFF-prefixed marker byte (e.g. 0xE0 for APP0)
+  public var offset: Int  // byte offset in the source stream
+  public var payload: [UInt8]  // includes the length bytes if the marker has them
 
   public init(marker: UInt8, offset: Int, payload: [UInt8]) {
     self.marker = marker
@@ -45,7 +45,7 @@ public struct JPEGStructure: Equatable, Sendable {
 
   /// The full original byte stream can be reconstructed from segments + scan.
   public func reconstructedBytes() -> [UInt8] {
-    var out: [UInt8] = [0xFF, 0xD8] // SOI
+    var out: [UInt8] = [0xFF, 0xD8]  // SOI
     for seg in segments {
       out.append(0xFF)
       out.append(seg.marker)
@@ -68,6 +68,8 @@ public enum JPEGParser {
     var xmp: JPEGSegment?
     var icc: [JPEGSegment] = []
     var unknown: [JPEGSegment] = []
+    var frameComponentIDs: Set<UInt8> = []
+    var hasFrameHeader = false
     var i = 2
     while i < data.count {
       if data[i] != 0xFF {
@@ -83,17 +85,28 @@ public enum JPEGParser {
       let marker = data[markerIdx]
       let segStart = i
       switch marker {
-      case 0xD8, 0x01, 0xD0...0xD7: // RSTn, TEM: no length field
-        // Not expected between SOI and SOS in normal streams; treat as header.
+      case 0x01:  // TEM: standalone marker
         segments.append(JPEGSegment(marker: marker, offset: segStart, payload: []))
         i = markerIdx + 1
-      case 0xD9: // EOI before SOS: no image data
+      case 0xD8, 0xD0...0xD7:
         throw JPEGError.malformedSegment(marker: marker, offset: segStart)
-      case 0xDA: // Start of Scan — everything from here is scan data + EOI.
-        let scanAndEOI = Array(data[segStart...])
-        guard scanAndEOI.count >= 2, scanAndEOI.endsScanCorrectly() else {
-          throw JPEGError.truncated
+      case 0xD9:  // EOI before SOS: no image data
+        throw JPEGError.malformedSegment(marker: marker, offset: segStart)
+      case 0xDA:  // Start of Scan — everything from here is scan data + EOI.
+        guard hasFrameHeader else {
+          throw JPEGError.malformedSegment(marker: marker, offset: segStart)
         }
+        let scanEnd = try segmentEnd(data, markerIndex: markerIdx, marker: marker, start: segStart)
+        try validateScanHeader(
+          data, markerIndex: markerIdx, endIndex: scanEnd,
+          frameComponentIDs: frameComponentIDs, start: segStart)
+        guard
+          hasCompleteScansAndEOI(
+            data, from: scanEnd, frameComponentIDs: frameComponentIDs)
+        else {
+          throw JPEGError.malformedSegment(marker: marker, offset: segStart)
+        }
+        let scanAndEOI = Array(data[segStart...])
         return JPEGStructure(
           segments: segments,
           scanAndEOI: scanAndEOI,
@@ -104,31 +117,34 @@ public enum JPEGParser {
           originalLength: data.count)
       default:
         // Length-bearing marker.
-        if markerIdx + 2 >= data.count {
-          throw JPEGError.truncated
-        }
-        let len = (Int(data[markerIdx + 1]) << 8) | Int(data[markerIdx + 2])
-        if len < 2 { throw JPEGError.malformedSegment(marker: marker, offset: segStart) }
-        let payloadEnd = markerIdx + 1 + len
-        if payloadEnd > data.count { throw JPEGError.truncated }
+        let payloadEnd = try segmentEnd(
+          data, markerIndex: markerIdx, marker: marker, start: segStart)
         let payload = Array(data[markerIdx + 1..<payloadEnd])
+        if isStartOfFrame(marker) {
+          frameComponentIDs = try validateFrameHeader(
+            data, markerIndex: markerIdx, endIndex: payloadEnd, start: segStart)
+          hasFrameHeader = true
+        }
         let seg = JPEGSegment(marker: marker, offset: segStart, payload: payload)
         segments.append(seg)
         // Classify metadata-bearing segments.
         if marker == 0xE1, payload.count >= 6,
-           payload[2] == 0x68, payload[3] == 0x74, payload[4] == 0x74, payload[5] == 0x70 {
+          payload[2] == 0x68, payload[3] == 0x74, payload[4] == 0x74, payload[5] == 0x70
+        {
           // "http://ns.adobe.com/xap/1.0/" XMP marker.
           if xmp == nil { xmp = seg } else { unknown.append(seg) }
-        } else if marker == 0xE1, payload.count >= 6,
-                  payload[2] == 0x45, payload[3] == 0x78, payload[4] == 0x69,
-                  payload[5] == 0x66, payload[6] == 0x00 {
-          // "Exif\0" marker.
+        } else if marker == 0xE1, payload.count >= 8,
+          payload[2] == 0x45, payload[3] == 0x78, payload[4] == 0x69,
+          payload[5] == 0x66, payload[6] == 0x00, payload[7] == 0x00
+        {
+          // "Exif\0\0" marker (six-byte identifier after the length field).
           if exif == nil { exif = seg } else { unknown.append(seg) }
         } else if marker == 0xE2, payload.count >= 13,
-                  payload[2] == 0x49, payload[3] == 0x43, payload[4] == 0x43,
-                  payload[5] == 0x5F, payload[6] == 0x50, payload[7] == 0x52,
-                  payload[8] == 0x4F, payload[9] == 0x46, payload[10] == 0x49,
-                  payload[11] == 0x4C, payload[12] == 0x45 {
+          payload[2] == 0x49, payload[3] == 0x43, payload[4] == 0x43,
+          payload[5] == 0x5F, payload[6] == 0x50, payload[7] == 0x52,
+          payload[8] == 0x4F, payload[9] == 0x46, payload[10] == 0x49,
+          payload[11] == 0x4C, payload[12] == 0x45
+        {
           // "ICC_PROFILE" marker (possibly chunked).
           icc.append(seg)
         } else if (0xE0...0xEF).contains(marker) {
@@ -138,6 +154,122 @@ public enum JPEGParser {
       }
     }
     throw JPEGError.truncated
+  }
+
+  private static func segmentEnd(
+    _ data: [UInt8], markerIndex: Int, marker: UInt8, start: Int
+  ) throws -> Int {
+    guard markerIndex + 2 < data.count else { throw JPEGError.truncated }
+    let length = (Int(data[markerIndex + 1]) << 8) | Int(data[markerIndex + 2])
+    guard length >= 2 else { throw JPEGError.malformedSegment(marker: marker, offset: start) }
+    let end = markerIndex + 1 + length
+    guard end <= data.count else { throw JPEGError.truncated }
+    return end
+  }
+
+  private static func isStartOfFrame(_ marker: UInt8) -> Bool {
+    switch marker {
+    case 0xC0...0xC3, 0xC5...0xC7, 0xC9...0xCB, 0xCD...0xCF: true
+    default: false
+    }
+  }
+
+  private static func validateFrameHeader(
+    _ data: [UInt8], markerIndex: Int, endIndex: Int, start: Int
+  ) throws -> Set<UInt8> {
+    let marker = data[markerIndex]
+    guard markerIndex + 8 < endIndex else {
+      throw JPEGError.malformedSegment(marker: marker, offset: start)
+    }
+    let precision = data[markerIndex + 3]
+    let height = (Int(data[markerIndex + 4]) << 8) | Int(data[markerIndex + 5])
+    let width = (Int(data[markerIndex + 6]) << 8) | Int(data[markerIndex + 7])
+    let componentCount = Int(data[markerIndex + 8])
+    let expectedLength = 8 + 3 * componentCount
+    let actualLength = endIndex - markerIndex - 1
+    guard precision > 0, width > 0, height > 0, componentCount > 0,
+      actualLength == expectedLength
+    else { throw JPEGError.malformedSegment(marker: marker, offset: start) }
+    var componentIDs: Set<UInt8> = []
+    for component in 0..<componentCount {
+      let offset = markerIndex + 9 + component * 3
+      guard componentIDs.insert(data[offset]).inserted,
+        data[offset + 1] >> 4 > 0, data[offset + 1] & 0x0F > 0
+      else { throw JPEGError.malformedSegment(marker: marker, offset: start) }
+    }
+    return componentIDs
+  }
+
+  private static func validateScanHeader(
+    _ data: [UInt8], markerIndex: Int, endIndex: Int,
+    frameComponentIDs: Set<UInt8>, start: Int
+  ) throws {
+    guard markerIndex + 3 < endIndex else {
+      throw JPEGError.malformedSegment(marker: 0xDA, offset: start)
+    }
+    let length = (Int(data[markerIndex + 1]) << 8) | Int(data[markerIndex + 2])
+    let scanComponentCount = Int(data[markerIndex + 3])
+    guard scanComponentCount > 0, length == 6 + 2 * scanComponentCount,
+      markerIndex + 4 + 2 * scanComponentCount < endIndex
+    else { throw JPEGError.malformedSegment(marker: 0xDA, offset: start) }
+    var selectedIDs: Set<UInt8> = []
+    for component in 0..<scanComponentCount {
+      let id = data[markerIndex + 4 + component * 2]
+      guard frameComponentIDs.contains(id), selectedIDs.insert(id).inserted else {
+        throw JPEGError.malformedSegment(marker: 0xDA, offset: start)
+      }
+    }
+  }
+
+  /// Walks entropy bytes, stuffed 0xFF values, restart markers, and any
+  /// inter-scan table/metadata segments. Every scan must contain data and EOI
+  /// must be the final marker in the source payload.
+  private static func hasCompleteScansAndEOI(
+    _ data: [UInt8], from start: Int, frameComponentIDs: Set<UInt8>
+  ) -> Bool {
+    var index = start
+    var entropyBytes = 0
+    while index < data.count {
+      guard data[index] == 0xFF else {
+        entropyBytes += 1
+        index += 1
+        continue
+      }
+      var markerIndex = index + 1
+      while markerIndex < data.count && data[markerIndex] == 0xFF { markerIndex += 1 }
+      guard markerIndex < data.count else { return false }
+      let marker = data[markerIndex]
+      switch marker {
+      case 0x00:
+        entropyBytes += markerIndex - index
+        index = markerIndex + 1
+      case 0xD0...0xD7:
+        index = markerIndex + 1
+      case 0xD9:
+        return entropyBytes > 0 && markerIndex == data.count - 1
+      case 0xDA:
+        guard entropyBytes > 0,
+          let end = try? segmentEnd(data, markerIndex: markerIndex, marker: marker, start: index)
+        else { return false }
+        guard
+          (try? validateScanHeader(
+            data, markerIndex: markerIndex, endIndex: end,
+            frameComponentIDs: frameComponentIDs, start: index)) != nil
+        else { return false }
+        entropyBytes = 0
+        index = end
+      case 0xD8:
+        return false
+      case 0x01:
+        index = markerIndex + 1
+      default:
+        guard
+          let end = try? segmentEnd(data, markerIndex: markerIndex, marker: marker, start: index)
+        else { return false }
+        index = end
+      }
+    }
+    return false
   }
 }
 

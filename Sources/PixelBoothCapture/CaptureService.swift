@@ -3,9 +3,9 @@
 // actor. Frames carry a configuration generation tag; queued frames from an
 // old configuration cannot become photographs in a new mode.
 
-import Foundation
 import AVFoundation
 import CoreMedia
+import Foundation
 import PixelBoothCore
 
 /// A delivered sample with the provenance we can honestly attach.
@@ -16,29 +16,125 @@ public struct DeliveredFrame: @unchecked Sendable {
   public var sampleBuffer: CMSampleBuffer
   public var generation: Int
   public var deviceUniqueID: String
+  /// Codec FourCC at the capture boundary. For an H.264 frame decoded by
+  /// VideoToolbox, `fourCC` describes the reconstructed pixel buffer while
+  /// this field keeps the compressed source identity for provenance.
+  public var sourceFourCC: UInt32
+  /// Original compressed sample for metadata/provenance when `sampleBuffer`
+  /// contains the VideoToolbox reconstructed image.
+  public var sourceSampleBuffer: CMSampleBuffer?
   public var fourCC: UInt32
   public var width: Int
   public var height: Int
   public var timestampNanos: UInt64
+  /// Host monotonic clock reading (`DispatchTime.uptimeNanoseconds`) taken on
+  /// the capture queue at the same observation point as `hostWallClockISO`.
+  /// Freshness age is measured against this reading, never against the media
+  /// timestamp, whose clock domain is not the host's.
+  public var hostMonotonicNanos: UInt64
   public var hostWallClockISO: String
 
-  public init(sampleBuffer: CMSampleBuffer, generation: Int, deviceUniqueID: String,
-              fourCC: UInt32, width: Int, height: Int, timestampNanos: UInt64,
-              hostWallClockISO: String) {
+  public init(
+    sampleBuffer: CMSampleBuffer, generation: Int, deviceUniqueID: String,
+    fourCC: UInt32, width: Int, height: Int, timestampNanos: UInt64,
+    hostMonotonicNanos: UInt64, hostWallClockISO: String,
+    sourceFourCC: UInt32? = nil, sourceSampleBuffer: CMSampleBuffer? = nil
+  ) {
     self.sampleBuffer = sampleBuffer
     self.generation = generation
     self.deviceUniqueID = deviceUniqueID
+    self.sourceFourCC = sourceFourCC ?? fourCC
+    self.sourceSampleBuffer = sourceSampleBuffer
     self.fourCC = fourCC
     self.width = width
     self.height = height
     self.timestampNanos = timestampNanos
+    self.hostMonotonicNanos = hostMonotonicNanos
     self.hostWallClockISO = hostWallClockISO
+  }
+
+  /// Build the frame snapshot from a delivered sample buffer. Shared by the
+  /// AVFoundation and CMIO backends so both tag frames identically: media
+  /// presentation time, and host monotonic + wall-clock observations taken at
+  /// the same instant on the calling (capture) queue.
+  static func make(
+    sampleBuffer: CMSampleBuffer, deviceUniqueID: String,
+    generation: Int
+  ) -> DeliveredFrame? {
+    guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) else { return nil }
+    let fourCC = CMFormatDescriptionGetMediaSubType(formatDesc)
+    let dims = CMVideoFormatDescriptionGetDimensions(formatDesc)
+    let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    let nanos: UInt64
+    if pts.isNumeric {
+      let seconds = CMTimeGetSeconds(pts)
+      nanos = seconds > 0 ? UInt64(seconds * 1_000_000_000) : 0
+    } else {
+      nanos = 0
+    }
+    // Host observation of this delivery: monotonic (authoritative for
+    // freshness age) and wall clock (provenance/anchor), taken together on
+    // the capture queue so they are correlated with each other.
+    let monotonicNanos = DispatchTime.now().uptimeNanoseconds
+    let stamp: String = {
+      let f = ISO8601DateFormatter()
+      f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+      f.timeZone = .current
+      return f.string(from: Date())
+    }()
+    return DeliveredFrame(
+      sampleBuffer: sampleBuffer,
+      generation: generation,
+      deviceUniqueID: deviceUniqueID,
+      fourCC: fourCC,
+      width: Int(dims.width),
+      height: Int(dims.height),
+      timestampNanos: nanos,
+      hostMonotonicNanos: monotonicNanos,
+      hostWallClockISO: stamp)
   }
 }
 
-/// Receives frames on a background queue.
-public protocol FrameSink: AnyObject {
+/// Why sample delivery stopped.
+public enum StreamStopReason: Sendable, Equatable {
+  /// The owner stopped the stream (window close, mode change, explicit stop).
+  case stopped
+  /// The capture device this stream was configured for disconnected.
+  case deviceDisconnected
+  /// AVFoundation reported a session runtime error.
+  case runtimeError(String)
+}
+
+/// A stream ending: why, and which configured stream it was. Sinks use the
+/// identity to avoid invalidating a replacement stream that started after the
+/// stop was reported.
+public struct StreamStop: Sendable, Equatable {
+  public var reason: StreamStopReason
+  public var deviceUniqueID: String?
+  public var generation: Int?
+
+  public init(reason: StreamStopReason, deviceUniqueID: String?, generation: Int?) {
+    self.reason = reason
+    self.deviceUniqueID = deviceUniqueID
+    self.generation = generation
+  }
+}
+
+/// Receives frames on a background queue, and stop notifications when the
+/// stream that delivered them ends. Sinks are called from dispatch queues, so
+/// conforming types must be safe to reference from other threads.
+public protocol FrameSink: AnyObject, Sendable {
   func receive(_ frame: DeliveredFrame)
+  /// Delivery stopped, the device disconnected, or a runtime error ended the
+  /// stream. Sinks must invalidate retained frames: a frame from the stopped
+  /// stream must never satisfy a later shutter. Delivery may resume with a new
+  /// generation after explicit reconfiguration.
+  func streamStopped(_ stop: StreamStop)
+}
+
+extension FrameSink {
+  /// Default no-op for sinks that do not retain frames.
+  public func streamStopped(_ stop: StreamStop) {}
 }
 
 /// Per-capture-queue delegate. Narrow, documented exception: this class holds
@@ -46,21 +142,25 @@ public protocol FrameSink: AnyObject {
 /// to a single capture queue.
 final class CaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
   weak var service: CaptureService?
-  weak var device: AVCaptureDevice?
+  let deviceUniqueID: String
+  let generation: Int
 
-  init(service: CaptureService, device: AVCaptureDevice?) {
+  init(service: CaptureService, deviceUniqueID: String, generation: Int) {
     self.service = service
-    self.device = device
+    self.deviceUniqueID = deviceUniqueID
+    self.generation = generation
     super.init()
   }
 
-  func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
-                     from connection: AVCaptureConnection) {
+  func captureOutput(
+    _ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
+    from connection: AVCaptureConnection
+  ) {
     guard let service else { return }
     // The actor hop copies the retained reference, not the buffer contents.
     // The buffer stays alive for the duration of forwarding; sinks that want
     // to keep it call CMSampleBufferInvalidate-free retention via storing it.
-    service.forwardBuffer(sampleBuffer, device: device)
+    service.forwardBuffer(sampleBuffer, deviceUniqueID: deviceUniqueID, generation: generation)
   }
 }
 
@@ -72,17 +172,20 @@ final class SinkRegistry: @unchecked Sendable {
   private var entries: [ObjectIdentifier: (sink: FrameSink, queue: DispatchQueue)] = [:]
 
   func set(_ sink: FrameSink, queue: DispatchQueue) {
-    lock.lock(); defer { lock.unlock() }
+    lock.lock()
+    defer { lock.unlock() }
     entries[ObjectIdentifier(sink)] = (sink, queue)
   }
 
   func remove(_ sink: FrameSink) {
-    lock.lock(); defer { lock.unlock() }
+    lock.lock()
+    defer { lock.unlock() }
     entries.removeValue(forKey: ObjectIdentifier(sink))
   }
 
   func snapshot() -> [(sink: FrameSink, queue: DispatchQueue)] {
-    lock.lock(); defer { lock.unlock() }
+    lock.lock()
+    defer { lock.unlock() }
     return Array(entries.values)
   }
 }
@@ -96,91 +199,125 @@ public actor CaptureService {
   private var generation: Int = 0
   private let sinkRegistry = SinkRegistry()
   private var delegate: CaptureDelegate?
+  private var captureQueue: DispatchQueue?
+  private var stopObservers: [NSObjectProtocol] = []
   private var isStreaming = false
+  public private(set) var configuredFrameRate: Double?
 
   public init() {}
 
-  /// Configure a fresh capture session for the device with the given unique
-  /// ID and mode. The actor resolves the device itself, keeping non-Sendable
-  /// AVFoundation objects actor-confined. videoSettings: an explicitly EMPTY
-  /// (non-nil) dictionary, requesting native-format delivery per TN3121 —
-  /// verified against the installed SDK (see docs/TN3121_VERIFICATION.md).
-  public func configure(deviceUniqueID: String, mode: CameraMode) throws {
+  /// Configure the (long-lived) capture session for the device with the
+  /// given unique ID and mode. The session is created once and reconfigured
+  /// in place so the preview layer's attachment survives mode changes.
+  /// videoSettings: an explicitly EMPTY (non-nil) dictionary, requesting
+  /// native-format delivery per TN3121 — verified against the installed SDK
+  /// (see docs/TN3121_VERIFICATION.md; the SDK normalizes the empty
+  /// dictionary to nil, so delivered buffers are the classification
+  /// evidence, never the configuration alone).
+  public func configure(
+    deviceUniqueID: String, mode: CameraMode,
+    requestedFrameRate: Double? = nil, generation requestedGeneration: Int? = nil
+  ) throws -> Int {
     guard let device = AVCaptureDevice(uniqueID: deviceUniqueID) else {
       throw CaptureServiceError.cannotAddInput
     }
-    generation += 1
-    if let oldSession = session {
-      oldSession.beginConfiguration()
-      if let input = currentInput { oldSession.removeInput(input) }
-      if let output = videoDataOutput { oldSession.removeOutput(output) }
-      oldSession.commitConfiguration()
+    // Detach and drain any callbacks before replacing their immutable mode
+    // context. Old queued buffers retain the prior generation and are rejected.
+    detachDelivery()
+    generation = requestedGeneration ?? (generation + 1)
+
+    // One long-lived session: recreate-per-mode-change broke the preview
+    // (black) because start() refused to run the new session.
+    let target = session ?? AVCaptureSession()
+    if session == nil { session = target }
+
+    target.stopRunning()
+    target.beginConfiguration()
+    // Note: .inputPriority preset is unavailable on macOS; the device's
+    // activeFormat (set below) governs geometry.
+    if let oldInput = currentInput, target.inputs.contains(oldInput) {
+      target.removeInput(oldInput)
     }
-
-    let newSession = AVCaptureSession()
-    newSession.beginConfiguration()
     let input = try AVCaptureDeviceInput(device: device)
-    guard newSession.canAddInput(input) else { throw CaptureServiceError.cannotAddInput }
-    newSession.addInput(input)
+    guard target.canAddInput(input) else {
+      target.commitConfiguration()
+      throw CaptureServiceError.cannotAddInput
+    }
+    target.addInput(input)
 
-    let output = AVCaptureVideoDataOutput()
-    output.videoSettings = [:]  // explicitly empty: native format delivery
-    output.alwaysDiscardsLateVideoFrames = false
-    guard newSession.canAddOutput(output) else { throw CaptureServiceError.cannotAddOutput }
-    newSession.addOutput(output)
-    newSession.commitConfiguration()
+    // Create the video data output once; keep it (and its delegate) across
+    // mode changes. An explicitly EMPTY dictionary requests native-format
+    // delivery (TN3121; normalized to nil by the installed SDK — documented).
+    if videoDataOutput == nil {
+      let output = AVCaptureVideoDataOutput()
+      output.videoSettings = [:]
+      output.alwaysDiscardsLateVideoFrames = false
+      guard target.canAddOutput(output) else {
+        target.commitConfiguration()
+        throw CaptureServiceError.cannotAddOutput
+      }
+      target.addOutput(output)
+      videoDataOutput = output
+    }
+    target.commitConfiguration()
 
-    session = newSession
     currentDevice = device
     currentInput = input
-    videoDataOutput = output
 
-    // Request the highest supported frame rate within the selected mode,
-    // respecting the advertised interval. Never silently lower resolution,
-    // precision, or chroma sampling to increase frame rate.
-    //
-    // Verified against the installed SDK (macOS 27.0, Build 26A428): an
-    // EMPTY (non-nil) videoSettings dictionary is normalized to nil, which
-    // selects the default uncompressed output (a documented conversion
-    // relative to what some UVC cameras advertise natively). The
-    // acquisition-fidelity classification therefore derives from the actual
-    // delivered sample buffers, not the configuration alone.
+    // Setting activeFormat requires the device not to be actively running
+    // in a session; stop first, configure, then restart below.
+    // Verified on macOS 27.0 Build 26A428 (docs/TN3121_VERIFICATION.md,
+    // finding 3): on this OS build the session ignores both session presets
+    // and activeFormat for built-in cameras and delivers only the camera's
+    // default stream. The format below is still requested — and on other
+    // cameras/OS versions it may govern — but delivered sample buffers,
+    // not this configuration, are the acquisition-fidelity evidence.
     do {
       try device.lockForConfiguration()
       defer { device.unlockForConfiguration() }
       // Lock the negotiated format to the selected mode.
-      let matchedFormat = device.formats.first(where: { fmt in
-        let d = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
-        return Int(d.width) == mode.dimensions.width &&
-               Int(d.height) == mode.dimensions.height &&
-               CMFormatDescriptionGetMediaSubType(fmt.formatDescription) == mode.mediaSubType
-      })
-      if let matchedFormat {
-        device.activeFormat = matchedFormat
-      }
-      // Request the highest supported frame rate, respecting the advertised
-      // intervals exactly. Cameras enforce discrete intervals (e.g. 60/50/30
-      // fps); snap to the highest advertised rate and record requested vs
-      // measured separately. Never silently lower resolution, precision, or
-      // chroma sampling to increase frame rate.
-      if mode.maxFrameRate > 0 {
-        let ranges = matchedFormat?.videoSupportedFrameRateRanges ?? []
-        let target = mode.maxFrameRate
-        let chosen = ranges.min { a, b in
-          // Prefer the range whose max frame rate is closest to (and not
-          // below) the requested rate; fall back to the overall highest.
-          let aMax = 1.0 / a.minFrameDuration.seconds
-          let bMax = 1.0 / b.minFrameDuration.seconds
-          if aMax <= target && bMax <= target { return aMax < bMax }
-          if aMax >= target && bMax >= target { return aMax < bMax }
-          return aMax > bMax
-        } ?? ranges.first
-        if let chosen {
-          device.activeVideoMinFrameDuration = chosen.minFrameDuration
-          device.activeVideoMaxFrameDuration = chosen.maxFrameDuration
+      let matchingFormat: AVCaptureDevice.Format? = {
+        if let formatID = mode.formatID, let index = Int(formatID),
+          device.formats.indices.contains(index)
+        {
+          return device.formats[index]
         }
+        guard mode.formatID == nil else { return nil }
+        return device.formats.first(where: { fmt in
+          let d = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
+          return Int(d.width) == mode.dimensions.width && Int(d.height) == mode.dimensions.height
+            && CMFormatDescriptionGetMediaSubType(fmt.formatDescription) == mode.mediaSubType
+        })
+      }()
+      guard let matchedFormat = matchingFormat else { throw CaptureServiceError.modeUnavailable }
+      let matchedDimensions = CMVideoFormatDescriptionGetDimensions(matchedFormat.formatDescription)
+      guard Int(matchedDimensions.width) == mode.dimensions.width,
+        Int(matchedDimensions.height) == mode.dimensions.height,
+        CMFormatDescriptionGetMediaSubType(matchedFormat.formatDescription) == mode.mediaSubType
+      else {
+        throw CaptureServiceError.modeUnavailable
+      }
+      device.activeFormat = matchedFormat
+      let supportedRanges = matchedFormat.videoSupportedFrameRateRanges.map {
+        SupportedFrameRateRange(
+          minimum: 1.0 / $0.maxFrameDuration.seconds,
+          maximum: 1.0 / $0.minFrameDuration.seconds)
+      }
+      let ceiling = requestedFrameRate ?? (mode.maxFrameRate > 0 ? mode.maxFrameRate : nil)
+      configuredFrameRate = FrameRateSelection.highestSupported(
+        in: supportedRanges, ceiling: ceiling)
+      if configuredFrameRate == nil, ceiling != nil {
+        throw CaptureServiceError.frameRateUnavailable
+      }
+      if let rate = configuredFrameRate {
+        let duration = CMTime(seconds: 1.0 / rate, preferredTimescale: 60_000)
+        device.activeVideoMinFrameDuration = duration
+        device.activeVideoMaxFrameDuration = duration
       }
     }
+    // Restart delivery in the final selected mode (warm-up in final mode;
+    // no restart at the shutter).
+    return generation
   }
 
   /// Attach an advanced lower-frame-rate override (explicit user request).
@@ -188,32 +325,128 @@ public actor CaptureService {
     guard let device = currentDevice, fps > 0 else { return }
     try device.lockForConfiguration()
     defer { device.unlockForConfiguration() }
-    let duration = CMTime(value: 1, timescale: CMTimeScale(fps))
+    let duration = CMTime(seconds: 1.0 / fps, preferredTimescale: 60_000)
     device.activeVideoMinFrameDuration = duration
     device.activeVideoMaxFrameDuration = duration
+    configuredFrameRate = fps
   }
 
-  /// Start continuous streaming.
+  /// Ensure continuous delivery. Idempotent; the delegate is attached once
+  /// per output lifetime.
   public func start() throws {
     guard let session, let output = videoDataOutput, let device = currentDevice else {
       throw CaptureServiceError.notConfigured
     }
-    guard !isStreaming else { return }
-    SessionBox.shared.session = session
-    let queue = DispatchQueue(label: "app.pixelbooth.capture.video", qos: .userInteractive)
-    let delegate = CaptureDelegate(service: self, device: device)
-    output.setSampleBufferDelegate(delegate, queue: queue)
-    self.delegate = delegate
-    session.startRunning()
-    isStreaming = true
+    if delegate == nil {
+      SessionBox.shared.session = session
+      let queue = DispatchQueue(label: "app.pixelbooth.capture.video", qos: .userInteractive)
+      captureQueue = queue
+      let delegate = CaptureDelegate(
+        service: self, deviceUniqueID: device.uniqueID, generation: generation)
+      output.setSampleBufferDelegate(delegate, queue: queue)
+      self.delegate = delegate
+    }
+    if !session.isRunning {
+      session.startRunning()
+    }
+    isStreaming = session.isRunning
+    installStopObservers()
   }
 
-  /// Stop camera use (also on window close / disconnection).
+  /// Stop camera use (also on window close). Sinks are told delivery stopped
+  /// so they can invalidate retained frames instead of treating the last frame
+  /// as current.
   public func stop() {
     guard let session else { return }
+    let deviceID = currentDevice?.uniqueID
+    let observedGeneration = generation
+    detachDelivery()
     session.stopRunning()
-    isStreaming = false
+    notifyStreamStopped(
+      reason: .stopped,
+      deviceID: deviceID, observedGeneration: observedGeneration)
+  }
+
+  /// Detach the sample-buffer delegate and drain the capture queue so no
+  /// further frames enter the sink pipeline. Does not notify sinks; callers
+  /// that end a user-visible stream must do so explicitly.
+  private func detachDelivery() {
+    if let output = videoDataOutput {
+      output.setSampleBufferDelegate(nil, queue: nil)
+      if let captureQueue { captureQueue.sync {} }
+    }
     delegate = nil
+    isStreaming = false
+    removeStopObservers()
+  }
+
+  /// A device disconnect or session runtime error ends delivery outside any
+  /// app-initiated stop. The identity captured when the observers were
+  /// installed must still be current, so an event for a stream that has since
+  /// been replaced cannot tear down the replacement. Report honestly; never
+  /// auto-activate another camera.
+  private func handleExternalStreamStop(
+    _ reason: StreamStopReason, deviceID: String, observedGeneration: Int
+  ) {
+    guard deviceID == currentDevice?.uniqueID, observedGeneration == generation else { return }
+    guard isStreaming || delegate != nil || session?.isRunning == true else { return }
+    detachDelivery()
+    session?.stopRunning()
+    notifyStreamStopped(
+      reason: reason,
+      deviceID: deviceID, observedGeneration: observedGeneration)
+  }
+
+  private func notifyStreamStopped(
+    reason: StreamStopReason, deviceID: String?, observedGeneration: Int?
+  ) {
+    let stop = StreamStop(
+      reason: reason,
+      deviceUniqueID: deviceID,
+      generation: observedGeneration)
+    for entry in sinkRegistry.snapshot() {
+      entry.queue.async { entry.sink.streamStopped(stop) }
+    }
+  }
+
+  private func installStopObservers() {
+    removeStopObservers()
+    guard let session, let device = currentDevice else { return }
+    let deviceID = device.uniqueID
+    let observedGeneration = generation
+    let center = NotificationCenter.default
+    stopObservers.append(
+      center.addObserver(
+        forName: AVCaptureDevice.wasDisconnectedNotification,
+        object: device,
+        queue: nil
+      ) { [weak self] _ in
+        Task {
+          await self?.handleExternalStreamStop(
+            .deviceDisconnected, deviceID: deviceID, observedGeneration: observedGeneration)
+        }
+      })
+    stopObservers.append(
+      center.addObserver(
+        forName: AVCaptureSession.runtimeErrorNotification,
+        object: session,
+        queue: nil
+      ) { [weak self] note in
+        let error = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
+        let message = error?.localizedDescription ?? "unknown runtime error"
+        Task {
+          await self?.handleExternalStreamStop(
+            .runtimeError(message), deviceID: deviceID, observedGeneration: observedGeneration)
+        }
+      })
+  }
+
+  private func removeStopObservers() {
+    let observers = stopObservers
+    stopObservers.removeAll()
+    for observer in observers {
+      NotificationCenter.default.removeObserver(observer)
+    }
   }
 
   public func addSink(_ sink: FrameSink, queue: DispatchQueue) {
@@ -225,7 +458,9 @@ public actor CaptureService {
   }
 
   /// Read-only session handle for the preview layer (display only).
-  public nonisolated func sessionForPreview() -> AVCaptureSession? {
+  /// Nonisolated + cheap (lock + return) so the preview can re-attach on
+  /// every SwiftUI update without spawning tasks or hopping actors.
+  public nonisolated static func previewSession() -> AVCaptureSession? {
     let box = SessionBox.shared
     box.lock.lock()
     defer { box.lock.unlock() }
@@ -234,33 +469,13 @@ public actor CaptureService {
 
   /// Called from the capture queue's delegate. Nonisolated so it can run
   /// directly on the capture queue without hopping to the actor executor.
-  public nonisolated func forwardBuffer(_ buffer: CMSampleBuffer, device: AVCaptureDevice?) {
-    // Extract format info and build the frame snapshot on the capture queue.
-    guard let formatDesc = CMSampleBufferGetFormatDescription(buffer) else { return }
-    let fourCC = CMFormatDescriptionGetMediaSubType(formatDesc)
-    let dims = CMVideoFormatDescriptionGetDimensions(formatDesc)
-    let pts = CMSampleBufferGetPresentationTimeStamp(buffer)
-    let nanos: UInt64
-    if pts.isNumeric {
-      let seconds = CMTimeGetSeconds(pts)
-      nanos = seconds > 0 ? UInt64(seconds * 1_000_000_000) : 0
-    } else {
-      nanos = 0
-    }
-    let stamp: String = {
-      let f = ISO8601DateFormatter()
-      f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-      return f.string(from: Date())
-    }()
-    let frame = DeliveredFrame(
-      sampleBuffer: buffer,
-      generation: GenerationBox.current(for: device?.uniqueID ?? ""),
-      deviceUniqueID: device?.uniqueID ?? "",
-      fourCC: fourCC,
-      width: Int(dims.width),
-      height: Int(dims.height),
-      timestampNanos: nanos,
-      hostWallClockISO: stamp)
+  public nonisolated func forwardBuffer(
+    _ buffer: CMSampleBuffer, deviceUniqueID: String, generation: Int
+  ) {
+    guard
+      let frame = DeliveredFrame.make(
+        sampleBuffer: buffer, deviceUniqueID: deviceUniqueID, generation: generation)
+    else { return }
     for entry in sinkRegistry.snapshot() {
       entry.queue.async { entry.sink.receive(frame) }
     }
@@ -272,39 +487,13 @@ public enum CaptureServiceError: Error {
   case cannotAddInput
   case cannotAddOutput
   case notConfigured
+  case modeUnavailable
+  case frameRateUnavailable
 }
 
 /// Thread-safe accessors bridging the actor's state to the capture queue.
 /// The boxes are written on the actor and read from the capture queue via
 /// locks; they hold only immutable snapshots.
-final class GenerationBox: @unchecked Sendable {
-  private static let shared = GenerationBox()
-  private let lock = NSLock()
-  private var generations: [String: Int] = [:]
-
-  private init() {}
-
-  static func update(deviceID: String, generation: Int) {
-    shared.lock.lock()
-    defer { shared.lock.unlock() }
-    shared.generations[deviceID] = generation
-  }
-
-  static func current(for deviceID: String) -> Int {
-    shared.lock.lock()
-    defer { shared.lock.unlock() }
-    return shared.generations[deviceID] ?? 0
-  }
-}
-
-extension CaptureService {
-  /// Publish the generation so the capture queue can tag frames correctly.
-  public func publishGeneration() {
-    guard let device = currentDevice else { return }
-    GenerationBox.update(deviceID: device.uniqueID, generation: generation)
-  }
-}
-
 /// Process-wide session holder for preview attachment. Written on the actor
 /// when a session starts; read by the preview view. Documented narrow
 /// exception: an AVCaptureSession must be referenced directly by CALayer.

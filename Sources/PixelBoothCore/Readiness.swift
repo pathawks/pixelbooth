@@ -58,8 +58,9 @@ public struct ReadinessStateMachine {
   public func currentState(monotonicNanos: UInt64, adjusting: Bool) -> ReadinessState {
     guard let start = validStartNanos else { return .noStream }
     let msSince = Int((monotonicNanos &- start) / 1_000_000)
-    if freshValidFrameCount < heuristic.minimumFreshFrames ||
-        msSince < heuristic.minimumMillisecondsSinceValidStart {
+    if freshValidFrameCount < heuristic.minimumFreshFrames
+      || msSince < heuristic.minimumMillisecondsSinceValidStart
+    {
       return .warmingUp(
         framesNeeded: max(0, heuristic.minimumFreshFrames - freshValidFrameCount),
         msSinceStart: msSince,
@@ -78,24 +79,25 @@ public struct ReadinessStateMachine {
   }
 
   public var isReady: Bool {
-    if let start = validStartNanos, freshValidFrameCount >= heuristic.minimumFreshFrames {
-      return freshValidFrameCount >= heuristic.minimumFreshFrames
-    }
-    return false
+    validStartNanos != nil && freshValidFrameCount >= heuristic.minimumFreshFrames
   }
 }
 
-/// Frame freshness: derived from timestamps and frame rate, not callback counts.
+/// Frame freshness: the host-observed age of the frame at evaluation time,
+/// derived from the monotonic delivery timestamp and the frame rate — not
+/// callback counts, and not a comparison against whichever frame happened to
+/// arrive last. A stopped stream must go stale as wall time elapses; comparing
+/// frames only with the newest delivered frame can never do that because the
+/// newest frame stays equal to itself forever.
 public enum FrameFreshness {
-  /// The frame is fresh if its timestamp is within one frame-interval plus a
-  /// small allowance of the newest observed timestamp.
+  /// The frame is fresh if the host observed it within one frame-interval plus
+  /// a small allowance of `nowNanos`.
   public static func isFresh(
-    frameNanos: UInt64, newestObservedNanos: UInt64, frameIntervalNanos: UInt64
+    frameObservedNanos: UInt64, nowNanos: UInt64, frameIntervalNanos: UInt64
   ) -> Bool {
     // 1.5× the frame interval covers scheduling jitter without accepting
     // genuinely stale content.
     let allowance = frameIntervalNanos + frameIntervalNanos / 2
-    return newestObservedNanos >= frameNanos &&
-           (newestObservedNanos &- frameNanos) <= allowance
+    return nowNanos >= frameObservedNanos && (nowNanos &- frameObservedNanos) <= allowance
   }
 }

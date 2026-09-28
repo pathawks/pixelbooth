@@ -10,6 +10,16 @@
   but macOS actually delivered NV12 (`420v`) — classified truthfully as
   `macDeliveredConverted`, never `nativePreserved`. See
   `docs/TN3121_VERIFICATION.md` for the raw probe log.
+- **Mode selection not honored on macOS 27.0 Build 26A428** (built-in
+  FaceTime HD Camera): the session delivers only the camera's default
+  1920×1080 `420v` stream regardless of `device.activeFormat` or session
+  preset; `.inputPriority` is unavailable on macOS. Mode-selection control
+  is therefore unestablishable on this OS build and delivered buffers are
+  classified honestly as macOS-delivered. See `docs/TN3121_VERIFICATION.md`
+  (verified finding 3). The app now prefers the CoreMediaIO HAL backend
+  (verified finding 4), which selects the device's advertised stream format
+  directly; AVFoundation remains as a fallback when the CMIO path is
+  unestablishable for a device or mode.
 - **Lossless AVIF archival** from the delivered NV12 planes: encoded in-process
   with pinned libavif 1.3.0 + libaom 3.13.1 (quality 100, speed 0), decoded
   back, and compared in native channels exactly (Y/U/V planes, not RGB
@@ -21,28 +31,55 @@
   frame rates (60/50/30/20/10 fps only); the service snaps to the highest
   advertised rate and records requested vs measured separately.
 
-## Automated tests
+## Automated tests and implementation acceptance
 
-- 35 tests pass (`PixelBoothTestRunner`): selection/timing, image fidelity
+- **86 tests pass, 0 fail; 1 test is explicitly `NOT RUN`** (`PixelBoothTestRunner`): selection/timing, image fidelity
   (random + edge-value fixtures, supported depths/layouts, odd dims, padded
   strides, packed/bi-planar adapters, high-bit-depth packing, alpha, full and
   limited range with superblack/superwhite — exact native-sample comparison
   after AVIF decode), JPEG preservation (segments, scan payload, unknown
   segments, MakerNotes verbatim, malformed rejection), metadata/preview
-  isolation, and persistence policy.
+  isolation, persistence policy, and host-monotonic frame freshness (a stopped
+  stream goes stale; invalidation drops retained frames; resumed delivery
+  within the shutter timeout is accepted; frames outside the explicitly active
+  device/generation are rejected before storage; selection follows the newest
+  eligible presentation timestamp within that configuration). Mode identity is
+  device-qualified: two cameras exposing the same descriptive mode label are
+  distinct modes, so a camera switch can never be mistaken for a mode that is
+  already selected.
 - Hardware-dependent checks are reported "Not run", never counted as passed.
+  Device-disconnect behavior (unplug mid-stream) is in that set; the
+  store-level age/invalidation path is covered by the Freshness suite.
 
 ## Not verified in this environment (explicitly "Not run")
 
 - **Photos import round-trip**: requires the TCC prompt to be answered by the
   user at run time; the pipeline preserves recoverable data and exposes the
   uncertainty honestly (stage remains `addingToPhotos` until confirmed).
-- **Interactive/assistive UI checks** (mirror preview persistence, VoiceOver,
-  countdown): the SwiftUI interface builds and the app launches as a process
-  (verified), but interactive verification needs a human at the machine.
-- **H.264 input**: no H.264 mode was exposed by the available cameras; the
-  VideoToolbox decode path is implemented and pipeline-tested but not
-  exercised end-to-end with an encoded camera stream.
+- **Interactive/assistive UI checks** (minimum-size layout, mirror preview,
+  VoiceOver, keyboard focus, countdown, light/dark and reduced motion): the
+  updated SwiftUI interface builds, but live visual/accessibility verification
+  was unavailable because Accessibility and Screen Recording access was not
+  enabled. Source changes are not presented as runtime UI evidence.
+- **Live camera switching between two connected cameras**: the selection path
+  is source-verified (a camera change always reconfigures for the new device,
+  independent of the mode-selection observer, and an unconfigurable selection
+  tears the previous stream down) and mode identity is device-qualified and
+  unit-tested; no live switch was performed in this environment.
+- **H.264 input**: the decoder and encoded-fixture pipeline are implemented,
+  but the fixture acceptance test cannot create a VideoToolbox session on this
+  host (`kVTVideoDecoderMalfunctionErr`, `-12911`). The encoded fixture and
+  CoreMedia format/sample description are valid; no decoded output or
+  decoder-to-AVIF round trip was observed. A host with a functioning VideoToolbox
+  decoder is required before this capability can be called verified. No H.264
+  mode was exposed by the available cameras.
+- **BGR24 live delivery**: the production packed-RGB adapter, snapshot, and
+  exact AVIF round trip pass with a padded-stride fixture. CoreVideo refused a
+  synthetic 24BG buffer in the local test setup (`-6680`), and no physical
+  camera was used to verify that format arriving as a `CVPixelBuffer`.
+- **Additional packed/high-depth layouts**: `v210` is packed 10-bit 4:2:2 and
+  has no current archival adapter; `x422`, `xf22`, `x444`, `xf44`, and `y420`
+  are classified but not routed to archival adapters. See the capability matrix.
 
 ## Toolchain notes
 
@@ -53,7 +90,8 @@
 - No hand-authored `.xcodeproj`: the Swift package is the buildable unit
   (Xcode opens it with implicit shared schemes). A hand-written pbxproj cannot
   be validated here and would risk committing a broken project; fresh-checkout
-  builds go through `scripts/build.sh`.
+  validation goes through `scripts/validate.sh`, while `.app` assembly is a
+  separate step through `scripts/build_app.sh`.
 
 ## Explicitly out of scope (settled)
 

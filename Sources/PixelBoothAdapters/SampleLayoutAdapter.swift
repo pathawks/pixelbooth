@@ -51,10 +51,12 @@ public struct PlanarImage {
   /// Owned backing storage, if any (adapters that must deinterleave).
   public var ownedStorage: [UnsafeMutableRawPointer?]
 
-  public init(width: Int, height: Int, bitsPerChannel: Int, planes: [UnsafeRawPointer],
-              bytesPerRow: [Int], rowCount: [Int], bytesPerSample: Int,
-              chromaWidth: Int, chromaHeight: Int,
-              ownedStorage: [UnsafeMutableRawPointer?] = []) {
+  public init(
+    width: Int, height: Int, bitsPerChannel: Int, planes: [UnsafeRawPointer],
+    bytesPerRow: [Int], rowCount: [Int], bytesPerSample: Int,
+    chromaWidth: Int, chromaHeight: Int,
+    ownedStorage: [UnsafeMutableRawPointer?] = []
+  ) {
     self.width = width
     self.height = height
     self.bitsPerChannel = bitsPerChannel
@@ -86,16 +88,18 @@ public enum SampleLayoutAdapter {
   public static func adaptYUY2(
     data: UnsafeRawPointer, bytesPerRow: Int, width: Int, height: Int
   ) throws -> PlanarImage {
-    try adaptPacked422(data: data, bytesPerRow: bytesPerRow, width: width, height: height,
-                       yFirst: true)
+    try adaptPacked422(
+      data: data, bytesPerRow: bytesPerRow, width: width, height: height,
+      yFirst: true)
   }
 
   /// UYVY (a.k.a. "yuvs"): packed 4:2:2 8-bit, U Y0 V Y1 per 4 bytes.
   public static func adaptUYVY(
     data: UnsafeRawPointer, bytesPerRow: Int, width: Int, height: Int
   ) throws -> PlanarImage {
-    try adaptPacked422(data: data, bytesPerRow: bytesPerRow, width: width, height: height,
-                       yFirst: false)
+    try adaptPacked422(
+      data: data, bytesPerRow: bytesPerRow, width: width, height: height,
+      yFirst: false)
   }
 
   /// Deinterleave a packed 4:2:2 8-bit buffer into Y, U, V planes.
@@ -117,7 +121,7 @@ public enum SampleLayoutAdapter {
       throw AdapterError.insufficientData(expected: rowBytesNeeded, actual: bytesPerRow)
     }
     let totalNeeded = bytesPerRow * height
-    _ = totalNeeded // caller is responsible for the buffer being at least this big
+    _ = totalNeeded  // caller is responsible for the buffer being at least this big
 
     // Allocate three planes.
     let yCount = width * height
@@ -128,7 +132,9 @@ public enum SampleLayoutAdapter {
     defer {
       // Copy completed; planes reference owned storage which the caller owns
       // via `ownedStorage`, so no deallocation here.
-      _ = yBuf; _ = uBuf; _ = vBuf
+      _ = yBuf
+      _ = uBuf
+      _ = vBuf
     }
     let yPtr = yBuf.assumingMemoryBound(to: UInt8.self)
     let uPtr = uBuf.assumingMemoryBound(to: UInt8.self)
@@ -145,8 +151,10 @@ public enum SampleLayoutAdapter {
         let y1 = yFirst ? bytes[2 * x + 2] : bytes[2 * x + 3]
         let u = yFirst ? bytes[2 * x + 1] : bytes[2 * x]
         let v = yFirst ? bytes[2 * x + 3] : bytes[2 * x + 2]
-        yPtr[yIdx] = y0; yIdx += 1
-        yPtr[yIdx] = y1; yIdx += 1
+        yPtr[yIdx] = y0
+        yIdx += 1
+        yPtr[yIdx] = y1
+        yIdx += 1
         uPtr[cIdx] = u
         vPtr[cIdx] = v
         cIdx += 1
@@ -171,7 +179,7 @@ public enum SampleLayoutAdapter {
     chromaPlane: UnsafeRawPointer, chromaBytesPerRow: Int,
     width: Int, height: Int
   ) throws -> PlanarImage {
-    guard width > 0, height > 0 else {
+    guard width > 0, height > 0, width % 2 == 0 else {
       throw AdapterError.invalidDimensions(width: width, height: height)
     }
     let yRowNeeded = width
@@ -283,20 +291,30 @@ public enum SampleLayoutAdapter {
       for x in 0..<width {
         switch channelOrder {
         case .rgb:
-          rPtr[idx] = bytes[3 * x]; gPtr[idx] = bytes[3 * x + 1]; bPtr[idx] = bytes[3 * x + 2]
+          rPtr[idx] = bytes[3 * x]
+          gPtr[idx] = bytes[3 * x + 1]
+          bPtr[idx] = bytes[3 * x + 2]
         case .bgr:
-          bPtr[idx] = bytes[3 * x]; gPtr[idx] = bytes[3 * x + 1]; rPtr[idx] = bytes[3 * x + 2]
+          bPtr[idx] = bytes[3 * x]
+          gPtr[idx] = bytes[3 * x + 1]
+          rPtr[idx] = bytes[3 * x + 2]
         case .bgra:
-          bPtr[idx] = bytes[4 * x]; gPtr[idx] = bytes[4 * x + 1]
-          rPtr[idx] = bytes[4 * x + 2]; aPtr![idx] = bytes[4 * x + 3]
+          bPtr[idx] = bytes[4 * x]
+          gPtr[idx] = bytes[4 * x + 1]
+          rPtr[idx] = bytes[4 * x + 2]
+          aPtr![idx] = bytes[4 * x + 3]
         case .rgba:
-          rPtr[idx] = bytes[4 * x]; gPtr[idx] = bytes[4 * x + 1]
-          bPtr[idx] = bytes[4 * x + 2]; aPtr![idx] = bytes[4 * x + 3]
+          rPtr[idx] = bytes[4 * x]
+          gPtr[idx] = bytes[4 * x + 1]
+          bPtr[idx] = bytes[4 * x + 2]
+          aPtr![idx] = bytes[4 * x + 3]
         }
         idx += 1
       }
     }
-    var planes: [UnsafeRawPointer] = [UnsafeRawPointer(gBuf), UnsafeRawPointer(bBuf), UnsafeRawPointer(rBuf)]
+    var planes: [UnsafeRawPointer] = [
+      UnsafeRawPointer(gBuf), UnsafeRawPointer(bBuf), UnsafeRawPointer(rBuf),
+    ]
     var bpr: [Int] = [width, width, width]
     var rows: [Int] = [height, height, height]
     var owned: [UnsafeMutableRawPointer?] = [gBuf, bBuf, rBuf]
@@ -334,28 +352,41 @@ public enum SampleLayoutAdapter {
     guard chromaBytesPerRow >= chromaRowBytesNeeded else {
       throw AdapterError.insufficientData(expected: chromaRowBytesNeeded, actual: chromaBytesPerRow)
     }
+    let yCount = width * height
     let cCount = (width / 2) * (height / 2)
+    let yBuf = UnsafeMutableRawPointer.allocate(byteCount: yCount * 2, alignment: 16)
     let uBuf = UnsafeMutableRawPointer.allocate(byteCount: cCount * 2, alignment: 16)
     let vBuf = UnsafeMutableRawPointer.allocate(byteCount: cCount * 2, alignment: 16)
+    let yPtr = yBuf.assumingMemoryBound(to: UInt16.self)
     let uPtr = uBuf.assumingMemoryBound(to: UInt16.self)
     let vPtr = vBuf.assumingMemoryBound(to: UInt16.self)
+    for row in 0..<height {
+      let rowBase = yPlane.advanced(by: row * yBytesPerRow)
+      let samples = rowBase.assumingMemoryBound(to: UInt16.self)
+      for x in 0..<width {
+        // CoreVideo's 10-bit bi-planar samples occupy the high bits of a
+        // little-endian 16-bit word. The canonical encoder expects values
+        // packed into the low 10 bits.
+        yPtr[row * width + x] = UInt16(littleEndian: samples[x]) >> 6
+      }
+    }
     var idx = 0
     for row in 0..<(height / 2) {
       let rowBase = chromaPlane.advanced(by: row * chromaBytesPerRow)
       let bytes = rowBase.assumingMemoryBound(to: UInt16.self)
       for x in 0..<(width / 2) {
-        uPtr[idx] = bytes[2 * x]
-        vPtr[idx] = bytes[2 * x + 1]
+        uPtr[idx] = UInt16(littleEndian: bytes[2 * x]) >> 6
+        vPtr[idx] = UInt16(littleEndian: bytes[2 * x + 1]) >> 6
         idx += 1
       }
     }
     return PlanarImage(
       width: width, height: height, bitsPerChannel: 10,
-      planes: [yPlane, UnsafeRawPointer(uBuf), UnsafeRawPointer(vBuf)],
-      bytesPerRow: [yBytesPerRow, width * 2, width * 2],
+      planes: [UnsafeRawPointer(yBuf), UnsafeRawPointer(uBuf), UnsafeRawPointer(vBuf)],
+      bytesPerRow: [width * 2, width, width],
       rowCount: [height, height / 2, height / 2],
       bytesPerSample: 2,
       chromaWidth: width / 2, chromaHeight: height / 2,
-      ownedStorage: [nil, uBuf, vBuf])
+      ownedStorage: [yBuf, uBuf, vBuf])
   }
 }

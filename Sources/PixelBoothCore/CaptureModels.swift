@@ -36,10 +36,12 @@ public struct CaptureFormat: Hashable, Sendable, Codable {
     case left, center, topLeft, top, topRight, bottomLeft, bottom, bottomRight
   }
 
-  public init(width: Int, height: Int, fourCC: UInt32,
-              bitsPerChannel: Int? = nil, chromaSampling: ChromaSampling? = nil,
-              yuvRange: YUVRange? = nil, chromaLocation: ChromaLocation? = nil,
-              hasAlpha: Bool = false, maxFrameRate: Double = 30) {
+  public init(
+    width: Int, height: Int, fourCC: UInt32,
+    bitsPerChannel: Int? = nil, chromaSampling: ChromaSampling? = nil,
+    yuvRange: YUVRange? = nil, chromaLocation: ChromaLocation? = nil,
+    hasAlpha: Bool = false, maxFrameRate: Double = 30
+  ) {
     self.width = width
     self.height = height
     self.fourCC = fourCC
@@ -54,33 +56,33 @@ public struct CaptureFormat: Hashable, Sendable, Codable {
 
 /// High-level codec family of a mode. Drives the archival pipeline.
 public enum CaptureCodecFamily: String, Hashable, Sendable, Codable {
-  case nativeJPEG       // MJPEG stream: full JPEG passthrough path
+  case nativeJPEG  // MJPEG stream: full JPEG passthrough path
   case uncompressedRGB  // RGB/BGR/BGRA/BGRAP and friends
   case uncompressedYUV  // YUY2/UYVY/NV12/420v/420f/444f/Y210 etc.
-  case h264             // H.264 encoded stream; decoded via VideoToolbox
+  case h264  // H.264 encoded stream; decoded via VideoToolbox
   case unknown
 }
 
 /// Acquisition-fidelity classification of a selected camera/format combination.
 /// This is honest, evidence-driven; it is never presented as "sensor RAW".
 public enum AcquisitionFidelity: Hashable, Sendable, Codable {
-  /// Camera and AVFoundation both deliver the native representation: we have
-  /// evidence (matching format FourCC plus a non-empty, confirmed-delivery
-  /// videoSettings dictionary) that no conversion occurred upstream of us.
+  /// A separately established delivery contract proves the negotiated format
+  /// reached the archival boundary without conversion. Matching FourCC values
+  /// alone are not sufficient evidence.
   case nativePreserved
   /// We know macOS performed a conversion (delivered format ≠ camera format).
   /// The delivered representation is still preserved exactly after macOS.
   case macDeliveredConverted
-  /// Upstream behavior could not be established. Requires explicit user
-  /// acknowledgment before use; never silently substituted for native.
+  /// Upstream behavior could not be established. This is informational and
+  /// remains distinct from proof of native delivery.
   case macDeliveredUnknownUpstream
 }
 
 /// Where the image-coding data originates, for provenance reporting.
 public enum DataSource: Hashable, Sendable, Codable {
-  case cameraNative        // e.g. MJPEG payload straight from camera
-  case macDecoded          // e.g. H.264 decoded via VideoToolbox
-  case macDelivered        // uncompressed YUV/RGB as macOS handed it to us
+  case cameraNative  // e.g. MJPEG payload straight from camera
+  case macDecoded  // e.g. H.264 decoded via VideoToolbox
+  case macDelivered  // uncompressed YUV/RGB as macOS handed it to us
   case unknown
 }
 
@@ -88,6 +90,8 @@ public enum DataSource: Hashable, Sendable, Codable {
 /// codec/FourCC, known bit depth and chroma sampling; unknown shown honestly.
 extension CaptureFormat {
   public static func fourCCString(_ v: UInt32) -> String {
+    if v == PixelFormatFourCC.rgb24 { return "24RGB" }
+    if v == PixelFormatFourCC.bgr24 { return "24BG" }
     let bytes = [
       UInt8(truncatingIfNeeded: v >> 24),
       UInt8(truncatingIfNeeded: v >> 16),
@@ -112,21 +116,21 @@ extension CaptureFormat {
     } else if yuvRange != nil || chromaLocation != nil {
       parts.append("unknown chroma")
     }
-    parts.append(String(format: "%.1f fps max", maxFrameRate))
+    // Unknown is reported as unknown, never as zero (spec).
+    if maxFrameRate > 0 {
+      parts.append(String(format: "%.1f fps max", maxFrameRate))
+    } else {
+      parts.append("rate unknown")
+    }
     return parts.joined(separator: " · ")
   }
 }
 
 /// Codec family classification from a delivered FourCC. Only what we can
 /// honestly know from the FourCC plus optionally-reported format description.
-public extension CaptureFormat {
-  var codecFamily: CaptureCodecFamily {
-    switch fourCC {
-    case 0x4d4a5047: return .nativeJPEG       // "MJPG"
-    case 0x61766331: return .h264             // "avc1"
-    case 0x42475241, 0x52474241: return .uncompressedRGB  // "BGRA", "RGBA"
-    default: return .uncompressedYUV          // YUY2/UYVY/NV12/420v/420f/v210 etc.
-    }
+extension CaptureFormat {
+  public var codecFamily: CaptureCodecFamily {
+    PixelFormatFourCC.codecFamily(fourCC)
   }
 }
 
@@ -134,12 +138,12 @@ public extension CaptureFormat {
 public struct CameraMode: Sendable, Identifiable, Hashable, Equatable {
   public var deviceID: String
   public var formatID: String?
-  public var mediaSubType: UInt32       // CMFormatDescription media subtype (FourCC)
+  public var mediaSubType: UInt32  // CMFormatDescription media subtype (FourCC)
   public var dimensionsWidth: Int
   public var dimensionsHeight: Int
   public var minFrameRate: Double
   public var maxFrameRate: Double
-  public var pixelFormat: UInt32        // FourCC the data output delivers
+  public var pixelFormat: UInt32  // FourCC the data output delivers
   public var isHighestFrameRate: Bool
   /// Bits per channel we actually know for this mode; nil = unknown.
   public var bitsPerChannel: Int?
@@ -148,13 +152,15 @@ public struct CameraMode: Sendable, Identifiable, Hashable, Equatable {
   /// YUV range we actually know; nil = unknown or not applicable.
   public var yuvRange: CaptureFormat.YUVRange?
 
-  public init(deviceID: String, formatID: String?, mediaSubType: UInt32,
-              dimensions: (width: Int, height: Int), minFrameRate: Double,
-              maxFrameRate: Double, pixelFormat: UInt32,
-              isHighestFrameRate: Bool = false,
-              bitsPerChannel: Int? = nil,
-              chromaSampling: CaptureFormat.ChromaSampling? = nil,
-              yuvRange: CaptureFormat.YUVRange? = nil) {
+  public init(
+    deviceID: String, formatID: String?, mediaSubType: UInt32,
+    dimensions: (width: Int, height: Int), minFrameRate: Double,
+    maxFrameRate: Double, pixelFormat: UInt32,
+    isHighestFrameRate: Bool = false,
+    bitsPerChannel: Int? = nil,
+    chromaSampling: CaptureFormat.ChromaSampling? = nil,
+    yuvRange: CaptureFormat.YUVRange? = nil
+  ) {
     self.deviceID = deviceID
     self.formatID = formatID
     self.mediaSubType = mediaSubType
@@ -184,7 +190,8 @@ public struct CameraMode: Sendable, Identifiable, Hashable, Equatable {
       width: dimensions.width, height: dimensions.height, fourCC: pixelFormat,
       bitsPerChannel: bitsPerChannel, chromaSampling: chromaSampling,
       yuvRange: yuvRange, chromaLocation: nil, hasAlpha: false,
-      maxFrameRate: maxFrameRate).codecFamily
+      maxFrameRate: maxFrameRate
+    ).codecFamily
   }
 
   public var asCaptureFormat: CaptureFormat {
@@ -210,9 +217,11 @@ public struct ProvenanceRecord: Hashable, Sendable, Codable {
   public var source: DataSource
   public var configurationGeneration: Int
 
-  public init(deviceReportedFormat: CaptureFormat?, deliveredFormat: CaptureFormat,
-              knownConversions: [String], fidelity: AcquisitionFidelity,
-              source: DataSource, configurationGeneration: Int) {
+  public init(
+    deviceReportedFormat: CaptureFormat?, deliveredFormat: CaptureFormat,
+    knownConversions: [String], fidelity: AcquisitionFidelity,
+    source: DataSource, configurationGeneration: Int
+  ) {
     self.deviceReportedFormat = deviceReportedFormat
     self.deliveredFormat = deliveredFormat
     self.knownConversions = knownConversions
@@ -237,15 +246,51 @@ public struct ReadinessHeuristic: Hashable, Sendable, Codable {
   public var minimumMillisecondsSinceValidStart: Int
   public var maximumAdjustingWaitMilliseconds: Int
 
-  public init(minimumFreshFrames: Int = 8,
-              minimumMillisecondsSinceValidStart: Int = 500,
-              maximumAdjustingWaitMilliseconds: Int = 5000) {
+  public init(
+    minimumFreshFrames: Int = 8,
+    minimumMillisecondsSinceValidStart: Int = 500,
+    maximumAdjustingWaitMilliseconds: Int = 5000
+  ) {
     self.minimumFreshFrames = minimumFreshFrames
     self.minimumMillisecondsSinceValidStart = minimumMillisecondsSinceValidStart
     self.maximumAdjustingWaitMilliseconds = maximumAdjustingWaitMilliseconds
   }
 
   public static let `default` = ReadinessHeuristic()
+}
+
+/// A continuous or discrete frame-rate range reported by a capture backend.
+public struct SupportedFrameRateRange: Hashable, Sendable {
+  public var minimum: Double
+  public var maximum: Double
+
+  public init(minimum: Double, maximum: Double) {
+    self.minimum = minimum
+    self.maximum = maximum
+  }
+}
+
+/// Chooses the greatest supported rate no higher than the requested ceiling.
+/// A continuous range may satisfy the exact ceiling; discrete ranges choose
+/// their greatest advertised value under it.
+public enum FrameRateSelection {
+  public static func highestSupported(
+    in ranges: [SupportedFrameRateRange], ceiling: Double?
+  ) -> Double? {
+    let valid = ranges.filter {
+      $0.minimum.isFinite && $0.maximum.isFinite && $0.minimum > 0
+        && $0.maximum >= $0.minimum
+    }
+    guard !valid.isEmpty else { return nil }
+    let limit =
+      ceiling.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+      ?? valid.map(\.maximum).max()!
+    let candidates = valid.compactMap { range -> Double? in
+      if range.minimum <= limit { return min(range.maximum, limit) }
+      return nil
+    }
+    return candidates.max()
+  }
 }
 
 /// Frame tag carrying the configuration generation at capture time.

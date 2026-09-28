@@ -1,8 +1,8 @@
 // PixelBoothCAvif — Swift wrapper around the pinned libavif 1.3.0 C API.
 // Only what the AVIF encoder/decoder core needs; no automatic codec substitution.
 
-@_exported import PixelBoothCAvifShim
 import Foundation
+@_exported import PixelBoothCAvifShim
 
 public enum PixelBoothLibAvif {
   /// Pinned libavif version string, e.g. "1.3.0".
