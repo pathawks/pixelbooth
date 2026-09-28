@@ -1,0 +1,26 @@
+# CI pipeline for PixelBooth.
+# Runs on Apple Silicon macOS runners with the macOS 27.0 SDK (Xcode 27 toolchain).
+# Distinguishes toolchain unavailability from a successful run; hardware-dependent
+# checks are reported as "Not run", never as passed.
+
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: macos-15  # arm64 macOS runner; requires Xcode 27 toolchain for macosx27.0 SDK
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          swift --version
+      - name: Install toolchain prerequisites
+        run: brew install cmake ninja nasm
+      - name: Build + test
+        run: scripts/build.sh
+      - name: Assemble app bundle
+        run: scripts/build_app.sh

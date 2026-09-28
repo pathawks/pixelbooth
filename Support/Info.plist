@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>PixelBooth</string>
+	<key>CFBundleIdentifier</key>
+	<string>app.pixelbooth.PixelBooth</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>PixelBooth</string>
+	<key>CFBundleDisplayName</key>
+	<string>PixelBooth</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>27.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.photography</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSCameraUsageDescription</key>
+	<string>PixelBooth uses the camera to capture photographs. Captures preserve the camera-delivered image data without recompression.</string>
+	<key>NSLocationUsageDescription</key>
+	<string>PixelBooth can add the Mac's current location to the capture metadata when the Include Location preference is enabled.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>PixelBooth saves completed photographs into the System Photo Library.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Used only when you enable the optional integration check that compares the imported original against the finalized file; routine captures never require library-browsing access.</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 PixelBooth contributors.</string>
+</dict>
+</plist>

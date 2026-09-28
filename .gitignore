@@ -1,0 +1,10 @@
+.build/
+.build
+.DS_Store
+build/
+.vendor-cache/
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+.build/out/
+DerivedData/

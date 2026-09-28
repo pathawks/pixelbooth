@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.device.camera</key>
+	<true/>
+	<key>com.apple.security.personal-information.location</key>
+	<true/>
+	<!-- Add-only access is the minimum PhotoKit authorization for
+	     Photos-first saving. Library *browsing* is requested only for the
+	     optional integration check, and never required for routine captures. -->
+	<key>com.apple.security.photos.add</key>
+	<true/>
+	<!-- User-selected files: used for the explicit Save Original…
+	     folder destination and security-scoped retry paths. -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+	<key>com.apple.security.network.client</key>
+	<false/>
+	<key>com.apple.security.network.server</key>
+	<false/>
+</dict>
+</plist>
