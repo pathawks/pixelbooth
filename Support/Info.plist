@@ -30,7 +30,7 @@
 	<string>NSApplication</string>
 	<key>NSCameraUsageDescription</key>
 	<string>PixelBooth uses the camera to capture photographs. Captures preserve the camera-delivered image data without recompression.</string>
-	<key>NSLocationUsageDescription</key>
+	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>PixelBooth can add the Mac's current location to the capture metadata when the Include Location preference is enabled.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>PixelBooth saves completed photographs into the System Photo Library.</string>

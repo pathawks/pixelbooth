@@ -29,6 +29,10 @@ final class FrameIngest: FrameSink, @unchecked Sendable {
   // immediately.
   private weak var weakVM: CaptureViewModel?
   private let store = FrameStore()
+  private let latestFrameMailbox = FrameAdmissionMailbox<DeliveredFrame>(
+    policy: .latest(maximumBytes: 128 * 1024 * 1024))
+  private let dependentFrameMailbox = FrameAdmissionMailbox<DeliveredFrame>(
+    policy: .dependencyPreserving(maximumFrames: 16, maximumBytes: 64 * 1024 * 1024))
   private let processingQueue = DispatchQueue(
     label: "app.pixelbooth.frame-ingest", qos: .userInteractive)
   private let h264Decoder = H264VideoToolboxStreamDecoder()
@@ -56,25 +60,59 @@ final class FrameIngest: FrameSink, @unchecked Sendable {
   }
 
   func receive(_ frame: DeliveredFrame) {
-    processingQueue.async { [weak self] in
-      guard let self else { return }
-      if frame.sourceFourCC == PixelFormatFourCC.avc1,
-        CMSampleBufferGetImageBuffer(frame.sampleBuffer) == nil
-      {
-        do {
-          for output in try h264Decoder.decode(frame) {
-            guard let decodedFrame = makeDecodedFrame(output) else {
-              publishDecodeError(frame, "VideoToolbox returned an invalid image buffer")
-              continue
-            }
-            processSerially(decodedFrame)
-          }
-        } catch {
-          publishDecodeError(frame, error.localizedDescription)
+    if frame.sourceFourCC != PixelFormatFourCC.avc1 {
+      let result = latestFrameMailbox.offer(frame, byteCount: frame.retainedByteCount)
+      if result.shouldScheduleDrain {
+        processingQueue.async { [weak self] in
+          self?.drainLatestFrames()
         }
-      } else {
-        processSerially(frame)
       }
+      return
+    }
+    if CMSampleBufferGetImageBuffer(frame.sampleBuffer) != nil {
+      processSerially(frame)
+      return
+    }
+    let result = dependentFrameMailbox.offer(
+      frame, byteCount: frame.retainedByteCount,
+      isRandomAccessFrame: frame.isRandomAccessFrame)
+    if result.shouldScheduleDrain {
+      processingQueue.async { [weak self] in self?.drainDependentFrames() }
+    }
+  }
+
+  /// Processes only the latest pending independently decodable frame. Every
+  /// frame still enters the store and readiness policy with its original
+  /// buffer; only frames superseded before processing are discarded.
+  private func drainLatestFrames() {
+    while let delivery = latestFrameMailbox.takeNext() {
+      processSerially(delivery.value)
+    }
+  }
+
+  private func drainDependentFrames() {
+    while let delivery = dependentFrameMailbox.takeNext() {
+      var frame = delivery.value
+      frame.requiresDecoderReset = frame.requiresDecoderReset || delivery.requiresDecoderReset
+      guard isCurrent(frame) else { continue }
+      if frame.requiresDecoderReset { h264Decoder.invalidate() }
+      do {
+        for output in try h264Decoder.decode(frame) {
+          guard let decodedFrame = makeDecodedFrame(output) else {
+            publishDecodeError(frame, "VideoToolbox returned an invalid image buffer")
+            continue
+          }
+          processSerially(decodedFrame)
+        }
+      } catch {
+        publishDecodeError(frame, error.localizedDescription)
+      }
+    }
+  }
+
+  private func isCurrent(_ frame: DeliveredFrame) -> Bool {
+    coalescer.withLock { state in
+      state.generation == frame.generation && state.deviceID == frame.deviceUniqueID
     }
   }
 
@@ -114,7 +152,7 @@ final class FrameIngest: FrameSink, @unchecked Sendable {
       let seconds = CMTimeGetSeconds(pts)
       return seconds >= 0 ? UInt64(seconds * 1_000_000_000) : source.timestampNanos
     }()
-    return DeliveredFrame(
+    let decodedFrame = DeliveredFrame(
       sampleBuffer: sample, generation: source.generation,
       deviceUniqueID: source.deviceUniqueID,
       fourCC: CVPixelBufferGetPixelFormatType(output.pixelBuffer),
@@ -125,6 +163,8 @@ final class FrameIngest: FrameSink, @unchecked Sendable {
       hostWallClockISO: source.hostWallClockISO,
       sourceFourCC: source.sourceFourCC,
       sourceSampleBuffer: source.sourceSampleBuffer ?? source.sampleBuffer)
+    CMIOFrameBox.shared.store(output.pixelBuffer, from: source)
+    return decodedFrame
   }
 
   private func publishDecodeError(_ frame: DeliveredFrame, _ message: String) {
@@ -144,7 +184,6 @@ final class FrameIngest: FrameSink, @unchecked Sendable {
   }
 
   private func process(_ frame: DeliveredFrame) async {
-    guard await store.store(frame) else { return }
     let configuration = coalescer.withLock { state -> (Int, String, CaptureFormat)? in
       guard let generation = state.generation, let deviceID = state.deviceID,
         let expected = state.expectedFormat
@@ -154,6 +193,14 @@ final class FrameIngest: FrameSink, @unchecked Sendable {
       return (generation, deviceID, expected)
     }
     guard let configuration else { return }
+    do {
+      try FrameExtraction.validateProgressiveFrame(
+        sampleBuffer: frame.sampleBuffer, sourceSampleBuffer: frame.sourceSampleBuffer)
+    } catch {
+      publishFieldMetadataFailure(frame, message: error.localizedDescription)
+      return
+    }
+    guard await store.store(frame) else { return }
     let formatError: String? = {
       var deliveredFourCC = frame.fourCC
       var width = frame.width
@@ -221,6 +268,22 @@ final class FrameIngest: FrameSink, @unchecked Sendable {
       formatError: shouldPublish!.formatError)
   }
 
+  private func publishFieldMetadataFailure(_ frame: DeliveredFrame, message: String) {
+    let target = coalescer.withLock { state -> CaptureViewModel? in
+      guard state.generation == frame.generation, state.deviceID == frame.deviceUniqueID else {
+        return nil
+      }
+      state.lastFormatError = message
+      state.lastFresh = false
+      state.lastPublishNanos = DispatchTime.now().uptimeNanoseconds
+      return weakVM
+    }
+    guard let target else { return }
+    Task { @MainActor [weak target] in
+      target?.frameFormatRejected(frame: frame, message: message)
+    }
+  }
+
   func newestFreshFrame(timeoutNanos: UInt64) async -> DeliveredFrame? {
     await store.newestFreshFrame(timeoutNanos: timeoutNanos)
   }
@@ -254,6 +317,8 @@ final class FrameIngest: FrameSink, @unchecked Sendable {
   ) async {
     resetPublishing(
       generation: generation, deviceID: deviceID, expectedFormat: expectedFormat)
+    latestFrameMailbox.reset()
+    dependentFrameMailbox.reset()
     processingQueue.async { [h264Decoder] in h264Decoder.invalidate() }
     await store.beginConfiguration(
       deviceID: deviceID, generation: generation,
@@ -265,6 +330,8 @@ final class FrameIngest: FrameSink, @unchecked Sendable {
   /// old stream cannot enter (or republish state for) the replacement.
   func invalidateConfiguration() async {
     resetPublishing(generation: nil)
+    latestFrameMailbox.reset()
+    dependentFrameMailbox.reset()
     processingQueue.async { [h264Decoder] in h264Decoder.invalidate() }
     await store.invalidate()
   }
@@ -280,6 +347,8 @@ final class FrameIngest: FrameSink, @unchecked Sendable {
           deviceID: stop.deviceUniqueID, generation: stop.generation)
       else { return }
       ingest.resetPublishing(generation: nil)
+      ingest.latestFrameMailbox.reset()
+      ingest.dependentFrameMailbox.reset()
       ingest.processingQueue.async { [h264Decoder = ingest.h264Decoder] in
         h264Decoder.invalidate()
       }
@@ -301,30 +370,68 @@ final class FrameIngest: FrameSink, @unchecked Sendable {
 }
 
 @MainActor
-final class CaptureViewModel: ObservableObject {
-  @Published var cameras: [CameraDevice] = []
-  @Published var availableModes: [CameraMode] = []
+final class CaptureCommandMenuState: ObservableObject {
+  static let shared = CaptureCommandMenuState()
+
+  @Published private(set) var cameras: [CameraDevice] = []
+  @Published private(set) var availableModes: [CameraMode] = []
   @Published private(set) var cameraAccessDenied = false
+  @Published private(set) var selectedCameraID: String?
+  @Published private(set) var selectedModeID: String?
+  @Published private(set) var shutterEnabled = false
+
+  func update(from viewModel: CaptureViewModel) {
+    cameras = viewModel.cameras
+    availableModes = viewModel.availableModes
+    cameraAccessDenied = viewModel.cameraAccessDenied
+    selectedCameraID = viewModel.selectedCameraID
+    selectedModeID = viewModel.selectedModeID
+    shutterEnabled = viewModel.shutterEnabled
+  }
+
+  func updateShutterEnabled(_ enabled: Bool) {
+    guard shutterEnabled != enabled else { return }
+    shutterEnabled = enabled
+  }
+}
+
+@MainActor
+final class CaptureViewModel: ObservableObject {
+  static let shared = CaptureViewModel()
+
+  @Published var cameras: [CameraDevice] = [] {
+    didSet { updateCommandMenuState() }
+  }
+  @Published var availableModes: [CameraMode] = [] {
+    didSet { updateCommandMenuState() }
+  }
+  @Published private(set) var cameraAccessDenied = false {
+    didSet { updateCommandMenuState() }
+  }
   @Published private(set) var cameraWindowStatus: CaptureWindowStatus = .connecting
   @Published var acquisitionStatus = "Acquisition fidelity unknown"
   @Published var selectedCameraID: String? {
     didSet {
       guard oldValue != selectedCameraID else { return }
+      updateCommandMenuState()
       if let oldValue, let selectedModeID {
         UserDefaults.standard.set(selectedModeID, forKey: Self.rememberedModeKey(for: oldValue))
       }
       invalidateActiveMode()
+      guard windowActive, !suppressSelectionReconfiguration else { return }
       Task { await cameraSelectionChanged() }
     }
   }
   @Published var selectedModeID: String? {
     didSet {
       guard oldValue != selectedModeID else { return }
+      updateCommandMenuState()
       if let selectedCameraID, let selectedModeID {
         UserDefaults.standard.set(
           selectedModeID, forKey: Self.rememberedModeKey(for: selectedCameraID))
       }
       invalidateActiveMode()
+      guard windowActive, !suppressSelectionReconfiguration else { return }
       Task { await modeSelectionChanged() }
     }
   }
@@ -332,7 +439,12 @@ final class CaptureViewModel: ObservableObject {
   @Published var pendingSaveText: String = "No pending captures"
   @Published private(set) var configuredFrameRate: Double?
   @Published var lastResultText: String?
-  @Published var shutterEnabled = false
+  @Published var shutterEnabled = false {
+    didSet {
+      guard oldValue != shutterEnabled else { return }
+      CaptureCommandMenuState.shared.updateShutterEnabled(shutterEnabled)
+    }
+  }
   @Published private(set) var captureEligibility: CaptureEligibilityDecision =
     .waitingForReadiness(.noStream)
   @Published private(set) var countdownRemaining: Int?
@@ -341,9 +453,12 @@ final class CaptureViewModel: ObservableObject {
   /// CoreMediaIO backend: full mode selection without AVFoundation's stream
   /// pinning (macOS 27 pins device streams to their default; TN3121 finding 4).
   private let cmioService = CMIOCaptureService()
+  private let cmioPreviewSink = CMIOFrameBoxSink()
   /// AVFoundation backend, used when the CMIO path is unestablishable.
   private var service = CaptureService()
   private var discovery = CaptureDiscovery()
+  private let backendOperationGate = CaptureBackendOperationGate()
+  private let configurationToken = CaptureConfigurationToken()
   enum Backend: String { case cmio, avfoundation }
   private(set) var activeBackend: Backend?
   private var activeMode: CaptureFormat?
@@ -353,7 +468,9 @@ final class CaptureViewModel: ObservableObject {
   /// status line. Informational only — it never gates the shutter.
   @Published private(set) var currentEvidence: AcquisitionEvidence?
   private var configurationRevision = 0
+  private var cameraEnumerationRevision = 0
   private var windowActive = false
+  private var suppressSelectionReconfiguration = false
   private var readinessState: ReadinessState = .noStream
   private var latestFrameIsFresh = false
   private var latestFormatIsValid = false
@@ -365,9 +482,15 @@ final class CaptureViewModel: ObservableObject {
   private var frameRatePreferencesObserver: NSObjectProtocol?
 
   private func invalidateActiveMode() {
-    configurationRevision += 1
+    _ = advanceConfigurationRevision()
     clearActiveConfigurationState()
     acquisitionStatus = "Waiting for selected mode"
+  }
+
+  private func advanceConfigurationRevision() -> Int {
+    configurationRevision += 1
+    configurationToken.publish(configurationRevision)
+    return configurationRevision
   }
 
   private func clearActiveConfigurationState() {
@@ -425,6 +548,11 @@ final class CaptureViewModel: ObservableObject {
   init() {
     ingest.bind(self)
     installPreferenceObservers()
+    updateCommandMenuState()
+  }
+
+  private func updateCommandMenuState() {
+    CaptureCommandMenuState.shared.update(from: self)
   }
 
   private func installPreferenceObservers() {
@@ -470,6 +598,7 @@ final class CaptureViewModel: ObservableObject {
   }
 
   func activate() {
+    guard !windowActive else { return }
     windowActive = true
     cameraWindowStatus = .connecting
     installPreferenceObservers()
@@ -501,30 +630,45 @@ final class CaptureViewModel: ObservableObject {
       applyReadinessPreferences()
       await discover()
       guard windowActive else { return }
-      await service.addSink(ingest, queue: DispatchQueue(label: "app.pixelbooth.framesink"))
-      await cmioService.addSink(
-        ingest, queue: DispatchQueue(label: "app.pixelbooth.cmio.framesink"))
-      await cmioService.addSink(
-        CMIOFrameBoxSink(),
-        queue: DispatchQueue(label: "app.pixelbooth.cmio.preview"))
-      await startStreaming()
-      guard windowActive else {
-        await stopBothBackends()
-        return
+      await backendOperationGate.withExclusive {
+        // Discovering the first camera can advance configurationRevision when
+        // it selects the default device. Sink registration is independent of
+        // that selection revision: skipping it leaves a running stream with no
+        // frame or preview recipients.
+        guard self.windowActive else { return }
+        await self.service.addSink(
+          self.ingest, queue: DispatchQueue(label: "app.pixelbooth.framesink"))
+        guard self.windowActive else { return }
+        await self.cmioService.addSink(
+          self.ingest, queue: DispatchQueue(label: "app.pixelbooth.cmio.framesink"))
+        guard self.windowActive else { return }
+        await self.cmioService.addSink(
+          self.cmioPreviewSink,
+          queue: DispatchQueue(label: "app.pixelbooth.cmio.preview"))
       }
+      await cameraSelectionChanged()
+      guard windowActive else { return }
     }
   }
 
   func deactivate() {
     windowActive = false
+    cameraEnumerationRevision += 1
     cancelCountdown()
     removePreferenceObservers()
     invalidateActiveMode()
+    let stopRevision = configurationRevision
     locationProvider.setEnabled(false, maximumAgeSeconds: locationMaximumAgePreference)
     Task {
-      await service.removeSink(ingest)
-      await cmioService.removeSink(ingest)
-      await stopBothBackends()
+      await backendOperationGate.withExclusive {
+        guard self.configurationRevision == stopRevision else { return }
+        await self.service.removeSink(self.ingest)
+        await self.cmioService.removeSink(self.ingest)
+        await self.service.removeSink(self.cmioPreviewSink)
+        await self.cmioService.removeSink(self.cmioPreviewSink)
+        await self.service.stop()
+        await self.cmioService.stop()
+      }
     }
   }
 
@@ -597,7 +741,9 @@ final class CaptureViewModel: ObservableObject {
       cameraWindowStatus = .connecting
     }
     if selectedCameraID == nil {
-      selectedCameraID = cameras.first?.uniqueID
+      updateSelectionWithoutReconfiguring {
+        selectedCameraID = cameras.first?.uniqueID
+      }
     }
   }
 
@@ -606,12 +752,15 @@ final class CaptureViewModel: ObservableObject {
   }
 
   func cameraSelectionChanged() async {
+    cameraEnumerationRevision += 1
+    let request: CameraEnumerationRequest
     guard let id = selectedCameraID else {
       // No device selected: never leave the previous camera's stream attached
       // under a picker that no longer shows it.
       await reconfigure()
       return
     }
+    request = CameraEnumerationRequest(deviceID: id, revision: cameraEnumerationRevision)
     guard let device = AVCaptureDevice(uniqueID: id) else {
       // A remembered camera that disappeared: explain and require selection.
       readinessText = "Camera unavailable — select another camera"
@@ -626,26 +775,57 @@ final class CaptureViewModel: ObservableObject {
     let cmioModes = await Task.detached(priority: .userInitiated) {
       CMIOCaptureDiscovery.modes(deviceUID: id)
     }.value
+    guard
+      request.mayPublish(
+        selectedDeviceID: selectedCameraID,
+        currentRevision: cameraEnumerationRevision,
+        windowActive: windowActive,
+        deviceConnected: device.isConnected)
+    else {
+      if selectedCameraID == id, windowActive, !device.isConnected {
+        availableModes = []
+        updateSelectionWithoutReconfiguring { selectedModeID = nil }
+        readinessText = "Camera unavailable — select another camera"
+        await reconfigure()
+      }
+      return
+    }
     let modes = cmioModes.isEmpty ? deviceModes(device) : cmioModes
     availableModes = modes
-    if let rememberedModeID = UserDefaults.standard.string(
-      forKey: Self.rememberedModeKey(for: id))
-    {
-      if availableModes.contains(where: { $0.id == rememberedModeID }) {
-        selectedModeID = rememberedModeID
-      } else {
-        selectedModeID = nil
-        readinessText = "Remembered mode is unavailable — choose a mode again"
+    updateSelectionWithoutReconfiguring {
+      if let rememberedModeID = UserDefaults.standard.string(
+        forKey: Self.rememberedModeKey(for: id))
+      {
+        if let rememberedMode = ModeSelector.rememberedMode(
+          id: rememberedModeID, in: availableModes)
+        {
+          selectedModeID = rememberedMode.id
+          if rememberedMode.id != rememberedModeID {
+            UserDefaults.standard.set(
+              rememberedMode.id, forKey: Self.rememberedModeKey(for: id))
+          }
+        } else {
+          selectedModeID = nil
+          readinessText = "Remembered mode is unavailable — choose a mode again"
+        }
+      } else if selectedModeID == nil
+        || !availableModes.contains(where: { $0.id == selectedModeID })
+      {
+        selectedModeID = ModeSelector.preferredMode(modes)?.id
       }
-    } else if selectedModeID == nil || !availableModes.contains(where: { $0.id == selectedModeID })
-    {
-      selectedModeID = ModeSelector.preferredMode(modes)?.id
     }
     // A camera change always reconfigures: the new device is configured
     // independently of the mode-selection observer, so a mode identity that
     // happens to match across devices — or the absence of a selectable mode —
     // can never leave the capture session on the previous camera.
     await reconfigure()
+  }
+
+  private func updateSelectionWithoutReconfiguring(_ update: () -> Void) {
+    let wasSuppressed = suppressSelectionReconfiguration
+    suppressSelectionReconfiguration = true
+    defer { suppressSelectionReconfiguration = wasSuppressed }
+    update()
   }
 
   func modeSelectionChanged() async {
@@ -678,8 +858,7 @@ final class CaptureViewModel: ObservableObject {
 
   func reconfigure() async {
     guard windowActive else { return }
-    configurationRevision += 1
-    let revision = configurationRevision
+    let revision = advanceConfigurationRevision()
     clearActiveConfigurationState()
     cameraWindowStatus = .connecting
     readinessText = "Starting camera"
@@ -692,74 +871,89 @@ final class CaptureViewModel: ObservableObject {
     guard let id = selectedCameraID, AVCaptureDevice(uniqueID: id) != nil else {
       // Nothing configurable is selected: tear the previous stream down
       // instead of leaving a camera running that the picker no longer shows.
-      await stopBothBackends()
+      await stopBothBackends(expectedRevision: revision)
+      guard revision == configurationRevision else { return }
       cameraWindowStatus = cameras.isEmpty ? .noCamera : .disconnected
       return
     }
     guard let label = selectedModeID,
       let cameraMode = availableModes.first(where: { $0.id == label })
     else {
-      await stopBothBackends()
+      await stopBothBackends(expectedRevision: revision)
+      guard revision == configurationRevision else { return }
       cameraWindowStatus = .noSupportedMode
+      readinessText =
+        availableModes.isEmpty
+        ? "This camera has no available capture modes"
+        : "Choose an available camera mode from the Mode menu"
       return
     }
     do {
       shutterEnabled = false
-      // No frame may be treated as active until the replacement stream's
-      // generation is installed after `configure` succeeds.
-      // Stop whichever backend holds a stream first: the CMIO renegotiation
-      // runs its own short AVFoundation configuration session, and two
-      // clients reconfiguring the same device would fight.
-      await stopBothBackends()
-      // CMIO-first: full mode selection via device renegotiation (verified
-      // TN3121 finding 4 recipe). If the CMIO path is unestablishable for
-      // this device/mode, fall back to AVFoundation — never both at once.
       let rateOverride = UserDefaults.standard.double(forKey: "frameRateOverride")
       let requestedFrameRate =
         rateOverride > 0
         ? rateOverride : cameraMode.maxFrameRate > 0 ? cameraMode.maxFrameRate : nil
       let configurationGeneration = revision
-      var selectedFrameRate: Double?
-      do {
-        _ = try await cmioService.configure(
-          deviceUniqueID: id, mode: cameraMode,
-          requestedFrameRate: requestedFrameRate, generation: configurationGeneration)
-        activeBackend = .cmio
-        selectedFrameRate = await cmioService.configuredFrameRate
-      } catch {
-        readinessText = "CMIO unavailable for this mode — using AVFoundation fallback"
-        _ = try await service.configure(
-          deviceUniqueID: id, mode: cameraMode,
-          requestedFrameRate: requestedFrameRate, generation: configurationGeneration)
-        activeBackend = .avfoundation
-        selectedFrameRate = await service.configuredFrameRate
+      try await backendOperationGate.withExclusive {
+        guard self.windowActive, revision == self.configurationRevision else { return }
+        // Two clients reconfiguring the same device would fight. Keep stop,
+        // negotiation, fallback and start in one serialized operation.
+        await self.stopBothBackendsUnlocked()
+        guard self.windowActive, revision == self.configurationRevision else { return }
+
+        let backend: Backend
+        let selectedFrameRate: Double?
+        do {
+          _ = try await self.cmioService.configure(
+            deviceUniqueID: id, mode: cameraMode,
+            requestedFrameRate: requestedFrameRate, generation: configurationGeneration,
+            operationToken: self.configurationToken)
+          guard self.windowActive, revision == self.configurationRevision else { return }
+          selectedFrameRate = await self.cmioService.configuredFrameRate
+          guard self.windowActive, revision == self.configurationRevision else { return }
+          backend = .cmio
+        } catch {
+          guard self.windowActive, revision == self.configurationRevision else { return }
+          self.readinessText = "CMIO unavailable for this mode — using AVFoundation fallback"
+          _ = try await self.service.configure(
+            deviceUniqueID: id, mode: cameraMode,
+            requestedFrameRate: requestedFrameRate, generation: configurationGeneration,
+            operationToken: self.configurationToken)
+          guard self.windowActive, revision == self.configurationRevision else { return }
+          selectedFrameRate = await self.service.configuredFrameRate
+          guard self.windowActive, revision == self.configurationRevision else { return }
+          backend = .avfoundation
+        }
+
+        guard self.windowActive, revision == self.configurationRevision else { return }
+        self.activeBackend = backend
+        self.configuredFrameRate = selectedFrameRate
+        self.activeMode = cameraMode.asCaptureFormat
+        self.activeGeneration = configurationGeneration
+        self.activeDeviceID = id
+        CMIOFrameBox.shared.beginConfiguration(
+          deviceID: id, generation: configurationGeneration)
+        let frameIntervalNanos = selectedFrameRate.map { UInt64(1_000_000_000.0 / $0) } ?? 0
+        await self.ingest.beginConfiguration(
+          deviceID: id, generation: configurationGeneration,
+          frameIntervalNanos: frameIntervalNanos,
+          expectedFormat: cameraMode.asCaptureFormat)
+        guard self.windowActive, revision == self.configurationRevision else { return }
+        switch backend {
+        case .cmio:
+          try await self.cmioService.start(
+            expectedGeneration: configurationGeneration,
+            operationToken: self.configurationToken)
+        case .avfoundation:
+          try await self.service.start(
+            expectedGeneration: configurationGeneration,
+            operationToken: self.configurationToken)
+        }
+        guard self.windowActive, revision == self.configurationRevision else { return }
       }
-      guard revision == configurationRevision else { return }
-      configuredFrameRate = selectedFrameRate
-      activeMode = cameraMode.asCaptureFormat
-      activeGeneration = configurationGeneration
-      activeDeviceID = id
-      let frameIntervalNanos: UInt64 =
-        selectedFrameRate.map { UInt64(1_000_000_000.0 / $0) } ?? 0
-      await ingest.beginConfiguration(
-        deviceID: id, generation: configurationGeneration,
-        frameIntervalNanos: frameIntervalNanos,
-        expectedFormat: cameraMode.asCaptureFormat)
-      guard revision == configurationRevision else { return }
-      switch activeBackend {
-      case .cmio:
-        try await cmioService.start()
-      case .avfoundation:
-        try await service.start()
-      case nil:
-        break
-      }
-      if !windowActive {
-        await stopBothBackends()
-        return
-      }
-      guard revision == configurationRevision else { return }
     } catch {
+      guard revision == configurationRevision else { return }
       // Configuration failed after the previous stream was detached. Capture
       // is already gated on freshness and frame identity (frames must match
       // the active device and generation), so no retained frame from the old
@@ -771,7 +965,16 @@ final class CaptureViewModel: ObservableObject {
   }
 
   /// Stop whichever backends may hold a stream. Safe to call always.
-  private func stopBothBackends() async {
+  private func stopBothBackends(expectedRevision: Int? = nil) async {
+    await backendOperationGate.withExclusive {
+      guard expectedRevision == nil || expectedRevision == self.configurationRevision else {
+        return
+      }
+      await self.stopBothBackendsUnlocked()
+    }
+  }
+
+  private func stopBothBackendsUnlocked() async {
     await service.stop()
     await cmioService.stop()
   }
@@ -888,13 +1091,15 @@ final class CaptureViewModel: ObservableObject {
     }
     let shutterEvidence: AcquisitionEvidence
     do {
+      try FrameExtraction.validateProgressiveFrame(
+        sampleBuffer: frame.sampleBuffer, sourceSampleBuffer: frame.sourceSampleBuffer)
       shutterEvidence = try evaluate(
         frame: frame, selected: activeMode,
         deviceID: activeDeviceID, generation: activeGeneration)
     } catch {
       latestFormatIsValid = false
       updateCaptureEligibility()
-      lastResultText = "Capture rejected: selected and delivered formats differ (\(error))"
+      lastResultText = "Capture rejected: \(error.localizedDescription)"
       return
     }
     let shutterScope = eligibilityScopeKey(for: shutterEvidence)
@@ -954,7 +1159,9 @@ final class CaptureViewModel: ObservableObject {
     saveQueueHolder.trackCaptureEnqueue(capture.uuid)
     do {
       try await saveQueueHolder.queue.enqueue(capture)
-      lastResultText = "Capture stored safely (\(capture.uuid.uuidString.prefix(8)))"
+      // The main window's saving indicator reports this queued capture. Keep
+      // the footer's single status line from growing when a save begins.
+      lastResultText = nil
     } catch {
       saveQueueHolder.captureEnqueueFailed(capture.uuid)
       lastResultText = "Capture refused: \(error.localizedDescription)"
@@ -1010,6 +1217,18 @@ final class CaptureViewModel: ObservableObject {
     cameraWindowStatus = .failed(message)
     readinessText = "H.264 decoding failed"
     acquisitionStatus = "Cannot preserve this H.264 frame: \(message)"
+    updateCaptureEligibility()
+  }
+
+  func frameFormatRejected(frame: DeliveredFrame, message: String) {
+    guard frame.deviceUniqueID == activeDeviceID, frame.generation == activeGeneration else {
+      return
+    }
+    latestFrameIsFresh = false
+    latestFormatIsValid = false
+    currentEvidence = nil
+    readinessText = "Frame rejected: \(message)"
+    acquisitionStatus = "Cannot preserve this frame: \(message)"
     updateCaptureEligibility()
   }
 

@@ -1,7 +1,7 @@
 // Shared singletons: the save queue actor is process-wide so journal
 // reconciliation works across window lifetimes. Captures are enqueued by the
 // shutter and complete through the queue's encode/validate/import pipeline.
-// The window's progress drawer observes the durable journal for status and
+// The Capture Status window observes the durable journal for status and
 // exposes its supported recovery actions.
 
 import Foundation
@@ -46,13 +46,7 @@ struct CaptureProgressItem: Identifiable, Equatable {
   var isComplete: Bool { stage == .saved }
 
   var needsAttention: Bool {
-    switch stage {
-    case .failedEncoding, .failedValidating, .failedAddingToPhotos, .failedDiskFull,
-      .failedUnsupportedColorDescriptor, .ambiguousImport:
-      return true
-    default:
-      return false
-    }
+    stage.canDismissFromProgress
   }
 
   var needsDuplicateConfirmation: Bool { stage == .ambiguousImport }
@@ -113,7 +107,10 @@ final class SaveQueueHolder: ObservableObject {
   }
 
   func reconcileAndRefresh() async {
-    do { try await queue.reconcileOnLaunch() } catch {
+    do {
+      try await queue.reconcileOnLaunch()
+      recoveryError = nil
+    } catch {
       recoveryError = error.localizedDescription
       logger.error("Save recovery on launch failed: \(error.localizedDescription)")
     }
@@ -162,6 +159,10 @@ final class SaveQueueHolder: ObservableObject {
 
   func dismissCapacityError() {
     capacityError = nil
+  }
+
+  func dismissRecoveryError() {
+    recoveryError = nil
   }
 
   func captureEnqueueFailed(_ uuid: UUID) {

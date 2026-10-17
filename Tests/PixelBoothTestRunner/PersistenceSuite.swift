@@ -47,6 +47,41 @@ func runPersistenceSuite() async {
       !FileManager.default.fileExists(atPath: root.appendingPathComponent("journal.json").path),
       "capacity refusal does not add a journal entry")
   }
+
+  await test("completedJournalHistoryDoesNotExhaustCaptureCapacity") {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "pb-completed-capacity-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let entries: [[String: Any]] = (0..<200).map { index in
+      [
+        "uuid": UUID().uuidString,
+        "stage": index.isMultiple(of: 2) ? "saved" : "exportedOriginal",
+        "stagingPath": root.appendingPathComponent("staging/unused").path,
+        "createdAt": 0,
+        "updatedAt": 0,
+      ]
+    }
+    try JSONSerialization.data(withJSONObject: ["version": 1, "entries": entries])
+      .write(to: root.appendingPathComponent("journal.json"))
+    let capture = CapturedCapture.makeTestCapture(
+      fourCC: 0x4d4a_5047, width: 4, height: 4, payload: .jpegBytes(jpegFixture()))
+    let queue = SaveQueueActor(
+      stagingRoot: root.appendingPathComponent("staging"),
+      importer: { _, _ in .failed("simulated failure") })
+    try await queue.enqueue(capture)
+    for _ in 0..<100 {
+      let retained = try await queue.entries()
+      if retained.first?.stage == .failedAddingToPhotos {
+        try requireRecovery(
+          retained.count == 1, "completed history is pruned before capacity check")
+        try requireRecovery(retained.first?.uuid == capture.uuid, "new capture accepted")
+        return
+      }
+      try await Task.sleep(nanoseconds: 50_000_000)
+    }
+    throw RecoveryTestError.assertion("new capture did not reach the importer")
+  }
 }
 
 func requireRecovery(_ condition: Bool, _ message: String) throws {

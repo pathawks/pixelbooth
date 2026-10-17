@@ -23,11 +23,12 @@ is shown; samples are never silently converted)
 | `yuvs` (YUY2) | packed 4:2:2 8-bit | 8 | deinterleave → lossless AVIF | ✅ adapter tests pass |
 | `BGRA` | 32-bit with meaningful alpha | 8 | G,B,R planes + alpha plane → lossless AVIF | ✅ adapter tests pass |
 | `24BG` (BGR24), `24RGB` | packed 24-bit RGB | 8 | identity-RGB 4:4:4 → lossless AVIF | ✅ production packed adapter, persisted snapshot, and exact AVIF channels tested; live pixel-buffer delivery not run |
-| `x420`, `xf20` | bi-planar YUV 4:2:0 | 10 | MSB-aligned unpack → lossless AVIF | ✅ padded multirow adapter, JSON persistence, and exact native-channel AVIF round trip |
+| `x420`, `xf20` | bi-planar YUV 4:2:0 | 10 | MSB-aligned unpack → lossless AVIF | ✅ production CoreVideo buffer path, padded multirow adapter, both actual ranges, JSON persistence, and exact native-channel AVIF round trip |
 | `v210` | packed 10-bit YUV 4:2:2 | 10 | no current archival adapter | ❌ explicitly unarchivable; not bi-planar and not tested as supported |
 | `x422`, `xf22`, `x444`, `xf44`, `y420` | other YUV layouts | varies | no current archival adapter | ❌ classified for selection/fidelity facts, but not routed to the archival path |
-| `avc1` (H.264) | encoded stream | — | VideoToolbox decode → reconstructed native-plane snapshot → lossless AVIF; compressed source is not archived | 🧪 implementation and encoded fixture exist; this host returns `kVTVideoDecoderMalfunctionErr (-12911)` while creating the VideoToolbox session, so end-to-end acceptance is not verified |
-| Unknown/interlaced/Bayer/FP layouts | — | — | rejected with explicit error | ❌ by contract |
+| `avc1` (H.264) | encoded stream | fixture: 8 | VideoToolbox decode → reconstructed native-plane snapshot → lossless AVIF; compressed source is not archived | 🧪 synthetic 8-bit fixture passes on macOS 27.0.1; live delivery and other source precision/sampling/range remain unverified |
+| Unknown/Bayer/FP layouts | — | — | rejected with explicit error | ❌ by contract |
+| Interlaced delivery using an otherwise supported FourCC | varies | varies | must be rejected; field markers currently ignored | unresolved defect reproduced in the October 12 code review |
 
 ## Readiness heuristic (product defaults, not camera claims)
 
@@ -41,7 +42,7 @@ is shown; samples are never silently converted)
 
 | Class | Meaning | Evidence required |
 |-------|---------|-------------------|
-| `nativePreserved` | Camera and AVFoundation both deliver the native representation | matching format FourCC + non-empty confirmed-delivery videoSettings + inspected sample buffers |
+| `nativePreserved` | Native acquisition established by evidence | inspected delivery plus affirmative evidence that no upstream conversion occurred; matching FourCCs alone do not establish this |
 | `macDeliveredConverted` | macOS performed a known conversion | delivered format ≠ camera format |
 | `macDeliveredUnknownUpstream` | upstream unestablishable | recorded as unknown provenance; never labeled native; does not block capture |
 
@@ -56,3 +57,6 @@ is shown; samples are never silently converted)
 - Live-camera and Photos integration rows remain "Not run" until executed on
   hardware with the required TCC permissions; see `docs/MANUAL_TEST_PLAN.md`.
   They are never counted as passed.
+- JPEG completeness and XMP handling, interlaced samples, and selected-MJPEG
+  conversion remain unresolved input cases. Passing fixtures do not establish
+  acceptance of those cases.

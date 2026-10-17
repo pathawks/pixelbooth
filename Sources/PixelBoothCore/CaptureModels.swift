@@ -113,12 +113,25 @@ extension CaptureFormat {
     }
     if let cs = chromaSampling {
       parts.append(cs.rawValue.uppercased())
-    } else if yuvRange != nil || chromaLocation != nil {
+    } else if codecFamily == .uncompressedRGB {
+      parts.append("RGB")
+    } else {
       parts.append("unknown chroma")
     }
-    // Unknown is reported as unknown, never as zero (spec).
-    if maxFrameRate > 0 {
-      parts.append(String(format: "%.1f fps max", maxFrameRate))
+    // Unknown and non-finite values stay unknown. Preserve fractional frame
+    // rates such as 29.97 rather than rounding them to a misleading 30.0.
+    if maxFrameRate.isFinite, maxFrameRate > 0 {
+      let nearestInteger = maxFrameRate.rounded()
+      if nearestInteger >= 1, abs(maxFrameRate - nearestInteger) < 0.0005,
+        nearestInteger < Double(Int.max)
+      {
+        parts.append("\(Int(nearestInteger)) fps max")
+      } else {
+        var rate = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), maxFrameRate)
+        while rate.last == "0" { rate.removeLast() }
+        if rate.last == "." { rate.removeLast() }
+        parts.append("\(rate) fps max")
+      }
     } else {
       parts.append("rate unknown")
     }
@@ -180,10 +193,51 @@ public struct CameraMode: Sendable, Identifiable, Hashable, Equatable {
   }
 
   public var id: String {
-    "\(deviceID)#\(formatID ?? "-")#\(pixelFormat)#\(dimensions.width)x\(dimensions.height)#\(String(format: "%.2f", maxFrameRate))"
+    "\(representationID)#\(bitsPerChannel.map { String($0) } ?? "unknown")#\(chromaSampling?.rawValue ?? "unknown")#\(yuvRange?.rawValue ?? "unknown")"
   }
 
   public var stableID: String { id }
+
+  /// The representation identity used by releases before frame-rate reporting
+  /// was removed from mode IDs. Kept to migrate remembered choices safely.
+  public var legacyRateBasedIDPrefix: String {
+    "\(deviceID)#\(formatID ?? "-")#\(pixelFormat)#\(dimensions.width)x\(dimensions.height)"
+  }
+
+  /// Stable identity for a representation. Frame rate is intentionally absent:
+  /// CMIO only reports the rate for the current format, so including it made a
+  /// selected mode appear to vanish as soon as that rate became known.
+  private var representationID: String {
+    "\(deviceID)#\(formatID ?? "-")#\(pixelFormat)#\(dimensions.width)x\(dimensions.height)"
+  }
+
+  public func matchesLegacyRateBasedID(_ value: String) -> Bool {
+    guard let separator = value.lastIndex(of: "#") else { return false }
+    let prefix = String(value[..<separator])
+    if prefix == legacyRateBasedIDPrefix || prefix == legacyUnqualifiedRateBasedIDPrefix {
+      return true
+    }
+
+    // Older releases could store AVFoundation's array index as formatID, while
+    // current CMIO enumeration uses a stable format-description identity. A
+    // legacy ID does not contain enough information to choose between duplicate
+    // representations, so ModeSelector will only accept this weaker match when
+    // it identifies one current mode in the complete list.
+    let rate = String(value[value.index(after: separator)...])
+    guard let parsedRate = Double(rate), parsedRate.isFinite, parsedRate >= 0 else { return false }
+    let fields = prefix.split(separator: "#", omittingEmptySubsequences: false)
+    guard fields.count >= 4,
+      let storedPixelFormat = UInt32(fields[fields.count - 2]),
+      storedPixelFormat == pixelFormat,
+      String(fields[fields.count - 1]) == "\(dimensions.width)x\(dimensions.height)"
+    else { return false }
+    let storedDeviceID = fields.dropLast(3).joined(separator: "#")
+    return storedDeviceID == deviceID
+  }
+
+  private var legacyUnqualifiedRateBasedIDPrefix: String {
+    "\(deviceID)#-#\(pixelFormat)#\(dimensions.width)x\(dimensions.height)"
+  }
 
   public var codecFamily: CaptureCodecFamily {
     CaptureFormat(
@@ -204,7 +258,27 @@ public struct CameraMode: Sendable, Identifiable, Hashable, Equatable {
 
   /// Human-readable description including what we do/don't know.
   public var descriptiveLabel: String {
-    "\(dimensions.width)×\(dimensions.height) · \(Int(maxFrameRate)) fps max · \(CaptureFormat.fourCCString(pixelFormat))"
+    asCaptureFormat.descriptiveLabel
+  }
+}
+
+/// Identity of an asynchronous mode-enumeration request. Revisions distinguish
+/// A→B→A selection changes even though the selected device ID ends at A again.
+public struct CameraEnumerationRequest: Hashable, Sendable {
+  public let deviceID: String
+  public let revision: Int
+
+  public init(deviceID: String, revision: Int) {
+    self.deviceID = deviceID
+    self.revision = revision
+  }
+
+  public func mayPublish(
+    selectedDeviceID: String?, currentRevision: Int,
+    windowActive: Bool, deviceConnected: Bool
+  ) -> Bool {
+    windowActive && deviceConnected && selectedDeviceID == deviceID
+      && currentRevision == revision
   }
 }
 

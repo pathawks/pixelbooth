@@ -35,6 +35,21 @@ when you first save; if access was previously denied, the app explains how to
 enable it in System Settings. Default saving destination is the System Photo
 Library.
 
+After rebuilding, quit any running copy and reopen `build/PixelBooth.app` so
+macOS uses the updated app permission configuration. Failed and retained
+captures have Dismiss controls; dismissal keeps their local recovery data.
+Restore, Retry, and Save Original… remain available where the capture's
+representation supports them.
+
+You can take another photo while an earlier capture is encoding or saving.
+Waiting captures are stored privately on disk and shown as **Captured locally**;
+one save pipeline processes them in order. The queue keeps waiting identifiers
+in memory and loads each source when its turn arrives. Staging is bounded to
+512 MiB, including reservations for final images and temporary files, and 200
+unfinished or retained captures. When capacity is exhausted, new captures are
+refused with an explanation. Quitting finishes the active save and leaves waiting
+captures recoverable for the next launch.
+
 ## Build and test commands
 
 | Command | Purpose |
@@ -60,10 +75,10 @@ that file only when `DEVELOPER_DIR` is not already set in the environment.
 - Uncompressed RGB/YUV input → every meaningful channel sample is preserved at
   its original bit depth and chroma sampling (AVIF lossless, verified by exact
   round-trip, not visual similarity).
-- H.264 input has a VideoToolbox decode-to-snapshot path, but it is not yet a
-  verified capability: the current host's VideoToolbox returns `-12911` while
-  creating a decoder session for the synthetic encoded acceptance fixture.
-  The compressed source is never stored as an image archive.
+- H.264 input has a VideoToolbox decode-to-snapshot path. The synthetic 8-bit
+  acceptance fixture passes on macOS 27.0.1; live-camera behavior and
+  preservation of other H.264 precisions, sampling and ranges remain
+  unverified. The compressed source is never stored as an image archive.
 - No resizing, cropping, mirroring, rotation, denoise, sharpen, tone-mapping,
   deinterlacing, or YUV-through-RGB on the archival path. Ever.
 - Unsupported representations are rejected with an explicit error, not

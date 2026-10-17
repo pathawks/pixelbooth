@@ -81,7 +81,9 @@ private func makeCapture(
     CMVideoFormatDescriptionCreateForImageBuffer(
       allocator: kCFAllocatorDefault, imageBuffer: pb,
       formatDescriptionOut: &description) == noErr, let description
-  else { throw CaptureFidelityTestError.setup("format description") }
+  else {
+    throw CaptureFidelityTestError.setup("format description")
+  }
   var timing = CMSampleTimingInfo(
     duration: .invalid, presentationTimeStamp: CMTime(value: 1, timescale: 30),
     decodeTimeStamp: .invalid)
@@ -101,6 +103,73 @@ private func makeCapture(
   let metadata = FrameMetadataSnapshot(
     mediaTimeNanos: 1, wallClockAnchorISO: "2026-09-22T12:00:00Z", generation: 1)
   return try CapturedCapture(from: frame, metadata: metadata)
+}
+
+private func makeFormatDescription(
+  _ pb: CVPixelBuffer, extensions: [CFString: Any]
+) throws -> CMVideoFormatDescription {
+  var description: CMVideoFormatDescription?
+  let status = CMVideoFormatDescriptionCreate(
+    allocator: kCFAllocatorDefault,
+    codecType: CVPixelBufferGetPixelFormatType(pb),
+    width: Int32(CVPixelBufferGetWidth(pb)),
+    height: Int32(CVPixelBufferGetHeight(pb)),
+    extensions: extensions as CFDictionary,
+    formatDescriptionOut: &description)
+  guard status == noErr, let description else {
+    throw CaptureFidelityTestError.setup("field-marker format description")
+  }
+  return description
+}
+
+private func makeTenBitBiPlanar(fullRange: Bool) throws -> CVPixelBuffer {
+  var output: CVPixelBuffer?
+  let format = fullRange ? PixelFormatFourCC.xf20 : PixelFormatFourCC.x420
+  let status = CVPixelBufferCreate(
+    kCFAllocatorDefault, fixtureWidth, fixtureHeight, format, nil, &output)
+  guard status == kCVReturnSuccess, let pb = output else {
+    throw CaptureFidelityTestError.setup("10-bit CVPixelBufferCreate: \(status)")
+  }
+  guard CVPixelBufferLockBaseAddress(pb, []) == kCVReturnSuccess else {
+    throw CaptureFidelityTestError.setup("10-bit pixel buffer lock")
+  }
+  defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+  for plane in 0..<2 {
+    guard let base = CVPixelBufferGetBaseAddressOfPlane(pb, plane) else {
+      throw CaptureFidelityTestError.setup("missing 10-bit plane")
+    }
+    let stride = CVPixelBufferGetBytesPerRowOfPlane(pb, plane)
+    guard stride > fixtureWidth * 2 else {
+      throw CaptureFidelityTestError.setup("10-bit fixture did not receive padded strides")
+    }
+    let rows = plane == 0 ? fixtureHeight : fixtureHeight / 2
+    memset(base, 0xA5, stride * rows)
+    for row in 0..<rows {
+      for column in 0..<fixtureWidth {
+        let value: UInt16 =
+          plane == 0
+          ? [0, 1, 63, 64, 65, 939, 940, 941, 1022, 1023][(row + column) % 10]
+          : UInt16((row * 271 + column * 83) % 1024)
+        // Unused low storage bits and row padding must never become samples.
+        let stored = ((value << 6) | UInt16(column % 64)).littleEndian
+        base.storeBytes(of: stored, toByteOffset: row * stride + column * 2, as: UInt16.self)
+      }
+    }
+  }
+  CVBufferSetAttachment(
+    pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+  CVBufferSetAttachment(
+    pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2,
+    .shouldPropagate)
+  CVBufferSetAttachment(
+    pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
+  return pb
+}
+
+private func compactTenBitSamples(_ samples: [UInt16]) -> [UInt8] {
+  samples.flatMap { sample in
+    [UInt8(truncatingIfNeeded: sample), UInt8(truncatingIfNeeded: sample >> 8)]
+  }
 }
 
 private func makeBGRA() throws -> CVPixelBuffer {
@@ -135,6 +204,95 @@ private func makeBGRA() throws -> CVPixelBuffer {
 
 func runCaptureFidelitySuite() async {
   suite("CaptureSnapshotAndColor")
+  await test("progressiveFrameFieldMarkersRemainAcceptable") {
+    let pb = try makeNV12(fullRange: false)
+    var fieldCount: Int32 = 1
+    let count = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &fieldCount)!
+    CVBufferSetAttachment(pb, kCVImageBufferFieldCountKey, count, .shouldPropagate)
+    let capture = try makeCapture(pb)
+    guard case .planes = capture.payload else {
+      throw CaptureFidelityTestError.assertion("progressive input remains a plane snapshot")
+    }
+  }
+  await test("interlacedPixelBufferCannotBecomePhotograph") {
+    let pb = try makeNV12(fullRange: false)
+    var fieldCount: Int32 = 2
+    let count = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &fieldCount)!
+    CVBufferSetAttachment(pb, kCVImageBufferFieldCountKey, count, .shouldPropagate)
+    CVBufferSetAttachment(
+      pb, kCVImageBufferFieldDetailKey, kCVImageBufferFieldDetailTemporalTopFirst,
+      .shouldPropagate)
+    do {
+      _ = try makeCapture(pb)
+      throw CaptureFidelityTestError.assertion("interlaced input became an archival capture")
+    } catch let error as FrameExtraction.FieldMetadataError {
+      try require(
+        error == .interlacedFieldCount(2), "field-count rejection is explicit and actionable")
+    }
+  }
+  await test("temporalFieldDetailAloneIsRejected") {
+    let pb = try makeNV12(fullRange: false)
+    CVBufferSetAttachment(
+      pb, kCVImageBufferFieldDetailKey, kCVImageBufferFieldDetailTemporalBottomFirst,
+      .shouldPropagate)
+    do {
+      _ = try makeCapture(pb)
+      throw CaptureFidelityTestError.assertion("temporal field detail was ignored")
+    } catch let error as FrameExtraction.FieldMetadataError {
+      try require(
+        error == .fieldDetailPresent("temporal bottom first"),
+        "temporal field order is rejected")
+    }
+  }
+  await test("formatOnlyFieldMarkersAndContradictionsAreRejected") {
+    var formatFieldCount: Int32 = 2
+    let formatCount = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &formatFieldCount)!
+    let formatDetail = kCMFormatDescriptionFieldDetail_TemporalTopFirst
+    let formatOnly = try makeNV12(fullRange: false)
+    let formatDescription = try makeFormatDescription(
+      formatOnly,
+      extensions: [
+        kCMFormatDescriptionExtension_FieldCount: formatCount,
+        kCMFormatDescriptionExtension_FieldDetail: formatDetail,
+      ])
+    do {
+      try FrameExtraction.validateProgressive(
+        pixelBuffer: formatOnly, formatDescriptions: [formatDescription])
+      throw CaptureFidelityTestError.assertion("format-only interlace markers were ignored")
+    } catch let error as FrameExtraction.FieldMetadataError {
+      try require(error == .interlacedFieldCount(2), "format-only count is checked")
+    }
+
+    let conflicting = try makeNV12(fullRange: false)
+    var pixelCount: Int32 = 1
+    let pixelCountNumber = CFNumberCreate(kCFAllocatorDefault, .sInt32Type, &pixelCount)!
+    CVBufferSetAttachment(
+      conflicting, kCVImageBufferFieldCountKey, pixelCountNumber, .shouldPropagate)
+    let conflictingDescription = try makeFormatDescription(
+      conflicting, extensions: [kCMFormatDescriptionExtension_FieldCount: formatCount])
+    do {
+      try FrameExtraction.validateProgressive(
+        pixelBuffer: conflicting, formatDescriptions: [conflictingDescription])
+      throw CaptureFidelityTestError.assertion("conflicting field counts were ignored")
+    } catch let error as FrameExtraction.FieldMetadataError {
+      try require(
+        error == .conflictingFieldMetadata("field count"),
+        "pixel-buffer and format-description evidence must agree")
+    }
+  }
+  await test("malformedFieldMetadataIsRejected") {
+    let pb = try makeNV12(fullRange: false)
+    CVBufferSetAttachment(
+      pb, kCVImageBufferFieldCountKey, "two" as CFString, .shouldPropagate)
+    do {
+      _ = try makeCapture(pb)
+      throw CaptureFidelityTestError.assertion("malformed field count was ignored")
+    } catch let error as FrameExtraction.FieldMetadataError {
+      try require(
+        error == .malformedFieldMetadata("field count"),
+        "malformed count types are rejected")
+    }
+  }
   await test("paddedNV12JSONProductionEncodePreservesRangeAndSamples") {
     for fullRange in [false, true] {
       let pb = try makeNV12(fullRange: fullRange)
@@ -248,6 +406,41 @@ func runCaptureFidelitySuite() async {
       decoded.planes == restoredSnapshot.contiguous,
       "encoded AVIF decodes to the exact unpacked Y/U/V samples")
     try require(yValues.contains(0) && yValues.contains(1023), "fixture covers ten-bit endpoints")
+  }
+  await test("tenBitCoreVideoCapturePreservesRangeAndNativeSamples") {
+    for fullRange in [false, true] {
+      let capture = try makeCapture(makeTenBitBiPlanar(fullRange: fullRange))
+      try require(
+        capture.color?.yuvRange == (fullRange ? .full : .limited),
+        "range comes from the actual delivered 10-bit pixel buffer")
+      let expectedY = compactTenBitSamples(
+        (0..<fixtureHeight).flatMap { row in
+          (0..<fixtureWidth).map { column in
+            UInt16([0, 1, 63, 64, 65, 939, 940, 941, 1022, 1023][(row + column) % 10])
+          }
+        })
+      let expectedU = compactTenBitSamples(
+        (0..<(fixtureHeight / 2)).flatMap { row in
+          (0..<(fixtureWidth / 2)).map { column in
+            UInt16((row * 271 + 2 * column * 83) % 1024)
+          }
+        })
+      let expectedV = compactTenBitSamples(
+        (0..<(fixtureHeight / 2)).flatMap { row in
+          (0..<(fixtureWidth / 2)).map { column in
+            UInt16((row * 271 + (2 * column + 1) * 83) % 1024)
+          }
+        })
+      let restored = try JSONDecoder().decode(
+        CapturedCapture.self, from: JSONEncoder().encode(capture))
+      let encoded = try restored.encodeAVIF()
+      let decoded = try LosslessAVIF.decode(encoded: encoded.data)
+      try require(decoded.depth == 10, "all ten meaningful bits are encoded")
+      try require(decoded.range == (fullRange ? 1 : 0), "actual 10-bit range is encoded")
+      try require(
+        decoded.planes == [expectedY, expectedU, expectedV],
+        "every reconstructed 10-bit channel sample is preserved")
+    }
   }
   await test("malformedSnapshotAndLegacyUnknownRangeRefused") {
     let pb = try makeNV12(fullRange: false)

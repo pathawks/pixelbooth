@@ -10,6 +10,7 @@ public enum JPEGError: Error, Equatable, Sendable {
   case notAJPEG
   case truncated
   case malformedSegment(marker: UInt8, offset: Int)
+  case unsupportedCodingProcess(marker: UInt8)
   case metadataInsertionFailed(String)
 }
 
@@ -60,6 +61,7 @@ public struct JPEGStructure: Equatable, Sendable {
 /// incomplete input instead of silently repairing it.
 public enum JPEGParser {
   public static func parse(_ data: [UInt8]) throws -> JPEGStructure {
+    try JPEGStructuralValidator.validate(data)
     guard data.count >= 4, data[0] == 0xFF, data[1] == 0xD8 else {
       throw JPEGError.notAJPEG
     }
@@ -296,25 +298,49 @@ public enum JPEGMetadataWriter {
     additionalExif: [UInt8]? = nil
   ) throws -> [UInt8] {
     let structure = try JPEGParser.parse(original)
+    let xmpOutput: JPEGXMPPacket.Output?
+    if let additionalXMP {
+      xmpOutput = try JPEGXMPPacket.makeOutput(
+        sourcePackets: JPEGXMPPacket.sourcePackets(from: structure.segments),
+        additionalPacket: additionalXMP)
+    } else {
+      xmpOutput = nil
+    }
     var newSegments: [JPEGSegment] = []
-    // Insert new APP1 segments immediately after existing APP0/APP1 header
-    // cluster (or right after SOI if none), never after scan data.
-    var inserted = false
+    // Replace every recognized source XMP packet with one merged standard or
+    // extended packet. Other APP1 data, including Exif and MakerNotes, stays
+    // byte-identical.
+    var insertedAtMetadataCluster = false
+    var insertedXMP = false
+    var insertedExif = false
     for seg in structure.segments {
-      if !inserted, additionalXMP != nil || additionalExif != nil, seg.marker != 0xE0 {
-        if let xmp = additionalXMP {
-          newSegments.append(makeXMPSegment(xmp))
+      if !insertedAtMetadataCluster,
+        xmpOutput != nil || additionalExif != nil, seg.marker != 0xE0
+      {
+        if let xmpOutput {
+          newSegments.append(contentsOf: xmpOutput.segments)
+          insertedXMP = true
         }
-        if let exif = additionalExif {
-          newSegments.append(makeExifSegment(exif))
+        if let additionalExif {
+          newSegments.append(try makeExifSegment(additionalExif))
+          insertedExif = true
         }
-        inserted = true
+        insertedAtMetadataCluster = true
+      }
+      if xmpOutput != nil, JPEGXMPPacket.isXMPApp1(seg) {
+        if !insertedXMP, let xmpOutput {
+          newSegments.append(contentsOf: xmpOutput.segments)
+          insertedXMP = true
+        }
+        continue
       }
       newSegments.append(seg)
     }
-    if !inserted {
-      if let xmp = additionalXMP { newSegments.append(makeXMPSegment(xmp)) }
-      if let exif = additionalExif { newSegments.append(makeExifSegment(exif)) }
+    if !insertedXMP, let xmpOutput {
+      newSegments.append(contentsOf: xmpOutput.segments)
+    }
+    if !insertedExif, let additionalExif {
+      newSegments.append(try makeExifSegment(additionalExif))
     }
     var out: [UInt8] = [0xFF, 0xD8]
     for seg in newSegments {
@@ -326,20 +352,12 @@ public enum JPEGMetadataWriter {
     return out
   }
 
-  static func makeXMPSegment(_ xmp: [UInt8]) -> JPEGSegment {
-    let header: [UInt8] = Array("http://ns.adobe.com/xap/1.0/".utf8) + [0x00]
-    let payloadLen = header.count + xmp.count + 2
-    precondition(payloadLen <= 0xFFFF, "XMP payload too long for JPEG APP1")
-    let lenBytes: [UInt8] = [
-      UInt8((payloadLen >> 8) & 0xFF), UInt8(payloadLen & 0xFF),
-    ]
-    return JPEGSegment(marker: 0xE1, offset: 0, payload: lenBytes + header + xmp)
-  }
-
-  static func makeExifSegment(_ tiff: [UInt8]) -> JPEGSegment {
+  private static func makeExifSegment(_ tiff: [UInt8]) throws -> JPEGSegment {
     let header: [UInt8] = Array("Exif\0".utf8) + [0x00]
     let payloadLen = header.count + tiff.count + 2
-    precondition(payloadLen <= 0xFFFF, "Exif payload too long for JPEG APP1")
+    guard payloadLen <= 0xFFFF else {
+      throw JPEGError.metadataInsertionFailed("Exif metadata exceeds the JPEG APP1 size limit.")
+    }
     let lenBytes: [UInt8] = [
       UInt8((payloadLen >> 8) & 0xFF), UInt8(payloadLen & 0xFF),
     ]

@@ -59,9 +59,10 @@ Expected: lossless round-trip verified; no invented settings.
 
 ## 5. H.264 input
 
-The automated encoded-fixture-to-AVIF acceptance test must pass before this
-manual test can establish support. It is currently `NOT RUN` after VideoToolbox
-session creation returned `-12911` on the implementation host.
+The automated 8-bit encoded-fixture-to-AVIF acceptance test passed on macOS
+27.0.1 on October 12, 2026. This supersedes the older session-creation failure
+(`-12911`) for that fixture. Live input and other source representations still
+require separate fidelity acceptance.
 
 1. Select an H.264 mode.
 2. Confirm warm-up pictures excluded from eligibility do not break decoder
@@ -70,6 +71,11 @@ session creation returned `-12911` on the implementation host.
 4. Confirm the saved file contains no H.264 source stream.
 
 ## 6. Photos-first saving
+
+Quit any older app copy and reopen the newly assembled `build/PixelBooth.app`.
+Confirm first authorization offers add-only access. If previously denied,
+check the app's recovery message and the Photos privacy entry in System
+Settings; record whether the rebuilt app appears and prompts correctly.
 
 1. With Photos add-only authorization, capture and confirm the asset appears
    in the System Photo Library with creation date matching the resolved
@@ -91,6 +97,10 @@ session creation returned `-12911` on the implementation host.
 3. Crash at each stage (Capturing/Encoding/Validating/Adding), relaunch, and
    confirm the journal reconciles without blind duplicates; ambiguous cases
    exposed with explicit retry.
+4. Dismiss each failed stage and an existing retained capture. Confirm they
+   leave the active lists and remain under Dismissed captures after relaunch.
+   Restore one, then Retry or Save Original where supported. An ambiguous
+   retry must still require duplicate confirmation.
 
 ## 8. Disconnect / sleep / mode changes / stalled delivery
 
@@ -116,3 +126,24 @@ session creation returned `-12911` on the implementation host.
 3. Countdown Off/3s/10s; completion is the shutter event.
 4. VoiceOver labels on shutter/dropdowns/status; keyboard navigation works.
 5. 100% inspection shows uncropped pixels; fit shows the full frame.
+6. At the minimum window size, populate several failed and retained captures.
+   Confirm the status area scrolls and every recovery action remains reachable.
+
+## 10. Captures waiting for encoding
+
+1. Select a supported uncompressed mode and capture several individual photos
+   while the first is still encoding. Confirm the shutter remains available
+   when the camera has fresh eligible frames, each new capture appears as
+   Captured locally, and one save pipeline advances them in order.
+2. Confirm preview mirroring, camera/mode changes and later frames do not alter
+   accepted captures' samples or shutter-time metadata.
+3. Quit with waiting captures, then relaunch. Confirm waiting captures resume
+   and an interrupted Photos import still requires explicit duplicate
+   confirmation. Quitting may finish the active save; it need not finish the
+   entire backlog.
+4. Fill staging to its capacity limit. Confirm a refused shutter does not add
+   a capture row or an orphan UUID folder. Confirm successful saves or explicit
+   retained-capture deletion reclaim capacity.
+
+These are manual checks. Synthetic queue tests use temporary staging and an
+injected importer; they do not establish live-camera or Photos acceptance.

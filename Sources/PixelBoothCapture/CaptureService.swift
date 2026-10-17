@@ -33,12 +33,16 @@ public struct DeliveredFrame: @unchecked Sendable {
   /// timestamp, whose clock domain is not the host's.
   public var hostMonotonicNanos: UInt64
   public var hostWallClockISO: String
+  /// Set by bounded H.264 admission when a dependency gap requires VideoToolbox
+  /// to reset before decoding the next random-access sample.
+  public var requiresDecoderReset: Bool
 
   public init(
     sampleBuffer: CMSampleBuffer, generation: Int, deviceUniqueID: String,
     fourCC: UInt32, width: Int, height: Int, timestampNanos: UInt64,
     hostMonotonicNanos: UInt64, hostWallClockISO: String,
-    sourceFourCC: UInt32? = nil, sourceSampleBuffer: CMSampleBuffer? = nil
+    sourceFourCC: UInt32? = nil, sourceSampleBuffer: CMSampleBuffer? = nil,
+    requiresDecoderReset: Bool = false
   ) {
     self.sampleBuffer = sampleBuffer
     self.generation = generation
@@ -51,6 +55,43 @@ public struct DeliveredFrame: @unchecked Sendable {
     self.timestampNanos = timestampNanos
     self.hostMonotonicNanos = hostMonotonicNanos
     self.hostWallClockISO = hostWallClockISO
+    self.requiresDecoderReset = requiresDecoderReset
+  }
+
+  public var retainedByteCount: Int {
+    if let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+      return CVPixelBufferGetDataSize(pixelBuffer)
+    }
+    let sampleSize = CMSampleBufferGetTotalSampleSize(sampleBuffer)
+    if sampleSize > 0 { return sampleSize }
+    if let block = CMSampleBufferGetDataBuffer(sampleBuffer) {
+      let blockLength = CMBlockBufferGetDataLength(block)
+      if blockLength > 0 { return blockLength }
+    }
+    let (pixelCount, pixelOverflow) = width.multipliedReportingOverflow(by: height)
+    let (estimatedSize, sizeOverflow) = pixelCount.multipliedReportingOverflow(by: 4)
+    return pixelOverflow || sizeOverflow ? Int.max : max(estimatedSize, 1)
+  }
+
+  public var isRandomAccessFrame: Bool {
+    guard sourceFourCC == PixelFormatFourCC.avc1 || fourCC == PixelFormatFourCC.avc1,
+      let attachments = CMSampleBufferGetSampleAttachmentsArray(
+        sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
+      let first = attachments.first
+    else { return true }
+    return (first[kCMSampleAttachmentKey_NotSync] as? Bool) != true
+  }
+
+  public var previewRoute: PreviewFrameRoute {
+    if CMSampleBufferGetImageBuffer(sampleBuffer) != nil { return .pixelBuffer }
+    if sourceFourCC == PixelFormatFourCC.avc1 || fourCC == PixelFormatFourCC.avc1 {
+      return .decodeH264
+    }
+    if CaptureFormat(width: width, height: height, fourCC: sourceFourCC).codecFamily == .nativeJPEG
+    {
+      return .decodeJPEG
+    }
+    return .unavailable
   }
 
   /// Build the frame snapshot from a delivered sample buffer. Shared by the
@@ -93,6 +134,13 @@ public struct DeliveredFrame: @unchecked Sendable {
       hostMonotonicNanos: monotonicNanos,
       hostWallClockISO: stamp)
   }
+}
+
+public enum PreviewFrameRoute: Sendable, Equatable {
+  case pixelBuffer
+  case decodeJPEG
+  case decodeH264
+  case unavailable
 }
 
 /// Why sample delivery stopped.
@@ -169,24 +217,75 @@ final class CaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
 /// exception: the lock protects a plain dictionary used only for forwarding.
 final class SinkRegistry: @unchecked Sendable {
   private let lock = NSLock()
-  private var entries: [ObjectIdentifier: (sink: FrameSink, queue: DispatchQueue)] = [:]
+  private var entries: [ObjectIdentifier: BoundedFrameSinkDelivery] = [:]
 
   func set(_ sink: FrameSink, queue: DispatchQueue) {
     lock.lock()
     defer { lock.unlock() }
-    entries[ObjectIdentifier(sink)] = (sink, queue)
+    entries[ObjectIdentifier(sink)] = BoundedFrameSinkDelivery(sink: sink, queue: queue)
   }
 
   func remove(_ sink: FrameSink) {
     lock.lock()
     defer { lock.unlock() }
-    entries.removeValue(forKey: ObjectIdentifier(sink))
+    entries.removeValue(forKey: ObjectIdentifier(sink))?.reset()
   }
 
-  func snapshot() -> [(sink: FrameSink, queue: DispatchQueue)] {
+  func snapshot() -> [BoundedFrameSinkDelivery] {
     lock.lock()
     defer { lock.unlock() }
     return Array(entries.values)
+  }
+}
+
+/// A per-sink dispatch boundary with fixed retained-frame limits. It schedules
+/// at most one drain task per independent-image slot or H.264 dependency queue.
+final class BoundedFrameSinkDelivery: @unchecked Sendable {
+  private static let maximumIndependentBytes = 128 * 1024 * 1024
+  private static let maximumH264Frames = 16
+  private static let maximumH264Bytes = 64 * 1024 * 1024
+
+  private let sink: FrameSink
+  private let queue: DispatchQueue
+  private let independentFrames = FrameAdmissionMailbox<DeliveredFrame>(
+    policy: .latest(maximumBytes: maximumIndependentBytes))
+  private let dependentFrames = FrameAdmissionMailbox<DeliveredFrame>(
+    policy: .dependencyPreserving(
+      maximumFrames: maximumH264Frames, maximumBytes: maximumH264Bytes))
+
+  init(sink: FrameSink, queue: DispatchQueue) {
+    self.sink = sink
+    self.queue = queue
+  }
+
+  func offer(_ frame: DeliveredFrame) {
+    if frame.sourceFourCC == PixelFormatFourCC.avc1 {
+      let result = dependentFrames.offer(
+        frame, byteCount: frame.retainedByteCount,
+        isRandomAccessFrame: frame.isRandomAccessFrame)
+      if result.shouldScheduleDrain { queue.async { [self] in drain(dependentFrames) } }
+    } else {
+      let result = independentFrames.offer(frame, byteCount: frame.retainedByteCount)
+      if result.shouldScheduleDrain { queue.async { [self] in drain(independentFrames) } }
+    }
+  }
+
+  func streamStopped(_ stop: StreamStop) {
+    reset()
+    queue.async { [sink] in sink.streamStopped(stop) }
+  }
+
+  func reset() {
+    independentFrames.reset()
+    dependentFrames.reset()
+  }
+
+  private func drain(_ mailbox: FrameAdmissionMailbox<DeliveredFrame>) {
+    while let delivery = mailbox.takeNext() {
+      var frame = delivery.value
+      frame.requiresDecoderReset = delivery.requiresDecoderReset
+      sink.receive(frame)
+    }
   }
 }
 
@@ -216,8 +315,14 @@ public actor CaptureService {
   /// evidence, never the configuration alone).
   public func configure(
     deviceUniqueID: String, mode: CameraMode,
-    requestedFrameRate: Double? = nil, generation requestedGeneration: Int? = nil
+    requestedFrameRate: Double? = nil, generation requestedGeneration: Int? = nil,
+    operationToken: CaptureConfigurationToken? = nil
   ) throws -> Int {
+    if let requestedGeneration, let operationToken,
+      !operationToken.isCurrent(requestedGeneration)
+    {
+      throw CaptureServiceError.configurationSuperseded
+    }
     guard let device = AVCaptureDevice(uniqueID: deviceUniqueID) else {
       throw CaptureServiceError.cannotAddInput
     }
@@ -282,6 +387,16 @@ public actor CaptureService {
         {
           return device.formats[index]
         }
+        if let formatID = mode.formatID, formatID.hasPrefix("cmio-") {
+          return device.formats.first(where: { format in
+            let description = format.formatDescription
+            let dimensions = CMVideoFormatDescriptionGetDimensions(description)
+            return CMIOCaptureDiscovery.formatIdentity(description) == formatID
+              && Int(dimensions.width) == mode.dimensions.width
+              && Int(dimensions.height) == mode.dimensions.height
+              && CMFormatDescriptionGetMediaSubType(description) == mode.mediaSubType
+          })
+        }
         guard mode.formatID == nil else { return nil }
         return device.formats.first(where: { fmt in
           let d = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
@@ -296,6 +411,11 @@ public actor CaptureService {
         CMFormatDescriptionGetMediaSubType(matchedFormat.formatDescription) == mode.mediaSubType
       else {
         throw CaptureServiceError.modeUnavailable
+      }
+      if let requestedGeneration, let operationToken,
+        !operationToken.isCurrent(requestedGeneration)
+      {
+        throw CaptureServiceError.configurationSuperseded
       }
       device.activeFormat = matchedFormat
       let supportedRanges = matchedFormat.videoSupportedFrameRateRanges.map {
@@ -333,12 +453,22 @@ public actor CaptureService {
 
   /// Ensure continuous delivery. Idempotent; the delegate is attached once
   /// per output lifetime.
-  public func start() throws {
+  public func start(
+    expectedGeneration: Int? = nil, operationToken: CaptureConfigurationToken? = nil
+  ) throws {
+    if let expectedGeneration, expectedGeneration != generation {
+      throw CaptureServiceError.configurationSuperseded
+    }
+    if let expectedGeneration, let operationToken,
+      !operationToken.isCurrent(expectedGeneration)
+    {
+      throw CaptureServiceError.configurationSuperseded
+    }
     guard let session, let output = videoDataOutput, let device = currentDevice else {
       throw CaptureServiceError.notConfigured
     }
     if delegate == nil {
-      SessionBox.shared.session = session
+      PreviewSessionHolder.shared.install(session)
       let queue = DispatchQueue(label: "app.pixelbooth.capture.video", qos: .userInteractive)
       captureQueue = queue
       let delegate = CaptureDelegate(
@@ -356,12 +486,14 @@ public actor CaptureService {
   /// Stop camera use (also on window close). Sinks are told delivery stopped
   /// so they can invalidate retained frames instead of treating the last frame
   /// as current.
-  public func stop() {
+  public func stop(expectedGeneration: Int? = nil) {
     guard let session else { return }
+    if let expectedGeneration, expectedGeneration != generation { return }
     let deviceID = currentDevice?.uniqueID
     let observedGeneration = generation
     detachDelivery()
     session.stopRunning()
+    PreviewSessionHolder.shared.clear(ifMatching: session)
     notifyStreamStopped(
       reason: .stopped,
       deviceID: deviceID, observedGeneration: observedGeneration)
@@ -378,6 +510,7 @@ public actor CaptureService {
     delegate = nil
     isStreaming = false
     removeStopObservers()
+    if let session { PreviewSessionHolder.shared.clear(ifMatching: session) }
   }
 
   /// A device disconnect or session runtime error ends delivery outside any
@@ -404,9 +537,7 @@ public actor CaptureService {
       reason: reason,
       deviceUniqueID: deviceID,
       generation: observedGeneration)
-    for entry in sinkRegistry.snapshot() {
-      entry.queue.async { entry.sink.streamStopped(stop) }
-    }
+    for entry in sinkRegistry.snapshot() { entry.streamStopped(stop) }
   }
 
   private func installStopObservers() {
@@ -461,10 +592,7 @@ public actor CaptureService {
   /// Nonisolated + cheap (lock + return) so the preview can re-attach on
   /// every SwiftUI update without spawning tasks or hopping actors.
   public nonisolated static func previewSession() -> AVCaptureSession? {
-    let box = SessionBox.shared
-    box.lock.lock()
-    defer { box.lock.unlock() }
-    return box.session
+    PreviewSessionHolder.shared.current()
   }
 
   /// Called from the capture queue's delegate. Nonisolated so it can run
@@ -476,9 +604,7 @@ public actor CaptureService {
       let frame = DeliveredFrame.make(
         sampleBuffer: buffer, deviceUniqueID: deviceUniqueID, generation: generation)
     else { return }
-    for entry in sinkRegistry.snapshot() {
-      entry.queue.async { entry.sink.receive(frame) }
-    }
+    for entry in sinkRegistry.snapshot() { entry.offer(frame) }
   }
 
 }
@@ -489,6 +615,7 @@ public enum CaptureServiceError: Error {
   case notConfigured
   case modeUnavailable
   case frameRateUnavailable
+  case configurationSuperseded
 }
 
 /// Thread-safe accessors bridging the actor's state to the capture queue.
@@ -497,8 +624,28 @@ public enum CaptureServiceError: Error {
 /// Process-wide session holder for preview attachment. Written on the actor
 /// when a session starts; read by the preview view. Documented narrow
 /// exception: an AVCaptureSession must be referenced directly by CALayer.
-final class SessionBox: @unchecked Sendable {
-  static let shared = SessionBox()
-  let lock = NSLock()
-  var session: AVCaptureSession?
+public final class PreviewSessionHolder: @unchecked Sendable {
+  public static let shared = PreviewSessionHolder()
+  private let lock = NSLock()
+  private var session: AVCaptureSession?
+
+  public init() {}
+
+  public func install(_ session: AVCaptureSession) {
+    lock.lock()
+    self.session = session
+    lock.unlock()
+  }
+
+  public func current() -> AVCaptureSession? {
+    lock.lock()
+    defer { lock.unlock() }
+    return session
+  }
+
+  public func clear(ifMatching session: AVCaptureSession) {
+    lock.lock()
+    if self.session === session { self.session = nil }
+    lock.unlock()
+  }
 }

@@ -19,6 +19,7 @@ public final class H264VideoToolboxStreamDecoder: @unchecked Sendable {
     case decode(OSStatus)
     case outputUnavailable
     case unsupportedOutput(UInt32)
+    case unsupportedSource(H264SourceRepresentation.Error)
     case invalidDimensions
 
     public var errorDescription: String? {
@@ -32,6 +33,7 @@ public final class H264VideoToolboxStreamDecoder: @unchecked Sendable {
       case .unsupportedOutput(let fourCC):
         return
           "VideoToolbox delivered unsupported pixel format \(CaptureFormat.fourCCString(fourCC))."
+      case .unsupportedSource(let error): return error.localizedDescription
       case .invalidDimensions: return "VideoToolbox returned invalid image dimensions."
       }
     }
@@ -128,11 +130,18 @@ public final class H264VideoToolboxStreamDecoder: @unchecked Sendable {
     guard CMFormatDescriptionGetMediaSubType(format) == PixelFormatFourCC.avc1 else {
       throw DecodeError.wrongCodec
     }
+    let sourceRepresentation: H264SourceRepresentation
+    do {
+      sourceRepresentation = try H264SourceRepresentation.inspect(formatDescription: format)
+      try sourceRepresentation.validateForArchival()
+    } catch let error as H264SourceRepresentation.Error {
+      throw DecodeError.unsupportedSource(error)
+    }
     let dimensions = CMVideoFormatDescriptionGetDimensions(format)
     guard dimensions.width > 0, dimensions.height > 0 else {
       throw DecodeError.invalidDimensions
     }
-    try ensureSession(format: format)
+    try ensureSession(format: format, sourceRepresentation: sourceRepresentation)
 
     let frameKey = frame.timestampNanos > 0 ? frame.timestampNanos : frame.hostMonotonicNanos
     pendingFrames[frameKey] = frame
@@ -150,8 +159,26 @@ public final class H264VideoToolboxStreamDecoder: @unchecked Sendable {
       pendingOrder.removeAll { $0 == frameKey }
       throw DecodeError.decode(status)
     }
+    return try makeOutputs(from: outputBox.takeEvents(), dimensions: dimensions)
+  }
+
+  /// Flushes display-order frames delayed for reference or reordering
+  /// dependencies. Call after the final compressed sample in a finite stream.
+  public func finishDelayedFrames() throws -> [DecodedOutput] {
+    guard let session else { return [] }
+    outputBox.reset()
+    let status = VTDecompressionSessionFinishDelayedFrames(session)
+    guard status == noErr else { throw DecodeError.decode(status) }
+    guard let formatDescription else { throw DecodeError.formatUnavailable }
+    let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
+    return try makeOutputs(from: outputBox.takeEvents(), dimensions: dimensions)
+  }
+
+  private func makeOutputs(
+    from events: [OutputEvent], dimensions: CMVideoDimensions
+  ) throws -> [DecodedOutput] {
     var decoded: [DecodedOutput] = []
-    for event in outputBox.takeEvents() {
+    for event in events {
       guard event.status == noErr else { throw DecodeError.decode(event.status) }
       guard let pixelBuffer = event.pixelBuffer else { throw DecodeError.outputUnavailable }
       guard CVPixelBufferGetWidth(pixelBuffer) == Int(dimensions.width),
@@ -159,6 +186,9 @@ public final class H264VideoToolboxStreamDecoder: @unchecked Sendable {
       else { throw DecodeError.invalidDimensions }
       let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
       guard FrameExtraction.supportedPixelFormats.contains(pixelFormat) else {
+        throw DecodeError.unsupportedOutput(pixelFormat)
+      }
+      guard pixelFormat == expectedOutputPixelFormat else {
         throw DecodeError.unsupportedOutput(pixelFormat)
       }
 
@@ -177,10 +207,18 @@ public final class H264VideoToolboxStreamDecoder: @unchecked Sendable {
       invalidate()
       throw DecodeError.outputUnavailable
     }
+    decoded.sort {
+      CMTimeCompare($0.presentationTimeStamp, $1.presentationTimeStamp) < 0
+    }
     return decoded
   }
 
-  private func ensureSession(format: CMFormatDescription) throws {
+  private var expectedOutputPixelFormat: UInt32 = 0
+
+  private func ensureSession(
+    format: CMFormatDescription,
+    sourceRepresentation: H264SourceRepresentation
+  ) throws {
     if let active = formatDescription, CFEqual(active, format), session != nil { return }
     invalidate()
     var callback = VTDecompressionOutputCallbackRecord(
@@ -188,8 +226,7 @@ public final class H264VideoToolboxStreamDecoder: @unchecked Sendable {
       decompressionOutputRefCon: Unmanaged.passUnretained(outputBox).toOpaque())
     let outputAttributes: CFDictionary =
       [
-        kCVPixelBufferPixelFormatTypeKey as String:
-          kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        kCVPixelBufferPixelFormatTypeKey as String: sourceRepresentation.outputPixelFormat,
         kCVPixelBufferIOSurfacePropertiesKey as String: [:],
       ] as CFDictionary
     var createdSession: VTDecompressionSession?
@@ -221,6 +258,7 @@ public final class H264VideoToolboxStreamDecoder: @unchecked Sendable {
     guard status == noErr, let createdSession else { throw DecodeError.sessionCreation(status) }
     session = createdSession
     formatDescription = format
+    expectedOutputPixelFormat = sourceRepresentation.outputPixelFormat
   }
 
   private func sourceKey(for presentationTime: CMTime) -> UInt64? {

@@ -14,8 +14,10 @@
 // poller is a narrow, documented @unchecked Sendable exception.
 
 import AVFoundation
+import CoreFoundation
 import CoreMedia
 import CoreMediaIO
+import CryptoKit
 import Foundation
 import PixelBoothCore
 import os
@@ -238,6 +240,73 @@ public enum CMIOCaptureDiscovery {
     }
   }
 
+  /// Stable identity for an advertised CMIO representation. Its digest includes
+  /// stable format-description extensions but deliberately excludes the
+  /// transient current frame-rate range.
+  public static func formatIdentity(_ description: CMFormatDescription) -> String {
+    let dimensions = CMVideoFormatDescriptionGetDimensions(description)
+    let extensions = CMFormatDescriptionGetExtensions(description) as NSDictionary?
+    let extensionPairs = (extensions?.allKeys ?? []).compactMap { key -> (String, String)? in
+      guard let name = key as? String,
+        let value = extensions?.object(forKey: key),
+        let canonical = canonicalFormatValue(value)
+      else { return nil }
+      return (name, canonical)
+    }.sorted { $0.0 < $1.0 }
+    let descriptionText =
+      [
+        String(CMFormatDescriptionGetMediaSubType(description)),
+        "\(dimensions.width)x\(dimensions.height)",
+      ] + extensionPairs.map { "\($0.0)=\($0.1)" }
+    let digest = SHA256.hash(data: Data(descriptionText.joined(separator: "\n").utf8))
+    let hexadecimal = digest.map { String(format: "%02x", $0) }.joined()
+    return "cmio-\(hexadecimal)"
+  }
+
+  private static func canonicalFormatValue(_ value: Any) -> String? {
+    if let string = value as? String {
+      return "s:\(Data(string.utf8).base64EncodedString())"
+    }
+    if let data = value as? Data {
+      return "d:\(data.base64EncodedString())"
+    }
+    if let date = value as? Date {
+      return "t:\(String(format: "%.6f", date.timeIntervalSince1970))"
+    }
+    if let number = value as? NSNumber {
+      if CFGetTypeID(number) == CFBooleanGetTypeID() { return number.boolValue ? "b:1" : "b:0" }
+      return "n:\(number.stringValue)"
+    }
+    if let array = value as? [Any] {
+      let components = array.compactMap(canonicalFormatValue)
+      guard components.count == array.count else { return nil }
+      return "a:[\(components.map { "\($0.utf8.count):\($0)" }.joined())]"
+    }
+    if let dictionary = value as? [String: Any] {
+      let pairs = dictionary.keys.sorted().compactMap { key -> String? in
+        guard let item = dictionary[key], let canonical = canonicalFormatValue(item) else {
+          return nil
+        }
+        return "\(Data(key.utf8).base64EncodedString())=\(canonical)"
+      }
+      guard pairs.count == dictionary.count else { return nil }
+      return "m:{\(pairs.joined(separator: ";"))}"
+    }
+    if let dictionary = value as? NSDictionary {
+      let keys = dictionary.allKeys.compactMap { $0 as? String }.sorted()
+      guard keys.count == dictionary.count else { return nil }
+      let pairs = keys.compactMap { key -> String? in
+        guard let item = dictionary.object(forKey: key),
+          let canonical = canonicalFormatValue(item)
+        else { return nil }
+        return "\(Data(key.utf8).base64EncodedString())=\(canonical)"
+      }
+      guard pairs.count == keys.count else { return nil }
+      return "m:{\(pairs.joined(separator: ";"))}"
+    }
+    return nil
+  }
+
   /// CameraMode list from the CMIO stream's advertised formats, with depth,
   /// chroma, and range filled from the shared FourCC facts table. Frame rates
   /// are queried only for the format the stream is currently delivering (the
@@ -267,7 +336,7 @@ public enum CMIOCaptureDiscovery {
       }
       return CameraMode(
         deviceID: deviceUID,
-        formatID: nil,
+        formatID: formatIdentity(desc),
         mediaSubType: fourCC,
         dimensions: (Int(dims.width), Int(dims.height)),
         minFrameRate: minRate, maxFrameRate: maxRate,
@@ -303,7 +372,17 @@ public enum CMIOCaptureDiscovery {
 
   /// Find the advertised format matching a mode's dimensions and pixel format.
   public static func matchingFormat(_ located: Located, mode: CameraMode) -> CMFormatDescription? {
-    formats(located).first { desc in
+    let descriptions = formats(located)
+    if let formatID = mode.formatID, formatID.hasPrefix("cmio-") {
+      return descriptions.first { desc in
+        let dims = CMVideoFormatDescriptionGetDimensions(desc)
+        return formatIdentity(desc) == formatID
+          && Int(dims.width) == mode.dimensions.width
+          && Int(dims.height) == mode.dimensions.height
+          && CMFormatDescriptionGetMediaSubType(desc) == mode.mediaSubType
+      }
+    }
+    return descriptions.first { desc in
       let dims = CMVideoFormatDescriptionGetDimensions(desc)
       return Int(dims.width) == mode.dimensions.width && Int(dims.height) == mode.dimensions.height
         && CMFormatDescriptionGetMediaSubType(desc) == mode.mediaSubType
@@ -375,7 +454,7 @@ final class CMIOFramePoller: @unchecked Sendable {
           else { continue }
           lastDeliveryNanos = DispatchTime.now().uptimeNanoseconds
           for entry in registry.snapshot() {
-            entry.queue.async { entry.sink.receive(frame) }
+            entry.offer(frame)
           }
         }
       }
@@ -405,6 +484,7 @@ public enum CMIOCaptureError: Error, LocalizedError {
     requestedWidth: Int, requestedHeight: Int)
   case startFailed(OSStatus)
   case frameRateUnavailable
+  case configurationSuperseded
 
   public var errorDescription: String? {
     switch self {
@@ -426,6 +506,8 @@ public enum CMIOCaptureError: Error, LocalizedError {
       return "CMIO stream start failed (OSStatus \(status))"
     case .frameRateUnavailable:
       return "CMIO could not request the selected mode's highest frame rate"
+    case .configurationSuperseded:
+      return "Camera configuration was superseded by a newer selection"
     }
   }
 }
@@ -458,7 +540,13 @@ public actor CMIOCaptureService {
   /// running and session stop, the CMIO stream read and delivered
   /// 1552×1552. The direct CMIO format write, by contrast, crashes the
   /// camera plugin (TN3121 finding 4) and must not be used.
-  private func renegotiateViaAVFoundation(deviceUniqueID: String, mode: CameraMode) throws {
+  private func renegotiateViaAVFoundation(
+    deviceUniqueID: String, mode: CameraMode,
+    operationToken: CaptureConfigurationToken?, revision: Int?
+  ) throws {
+    if let revision, let operationToken, !operationToken.isCurrent(revision) {
+      throw CMIOCaptureError.configurationSuperseded
+    }
     guard let device = AVCaptureDevice(uniqueID: deviceUniqueID) else {
       throw CMIOCaptureError.deviceNotFound(deviceUniqueID)
     }
@@ -485,6 +573,9 @@ public actor CMIOCaptureService {
     defer { session.stopRunning() }
     try device.lockForConfiguration()
     defer { device.unlockForConfiguration() }
+    if let revision, let operationToken, !operationToken.isCurrent(revision) {
+      throw CMIOCaptureError.configurationSuperseded
+    }
     device.activeFormat = avfFormat
     // Give the device-side renegotiation a beat before the caller checks
     // the CMIO stream's current format.
@@ -493,8 +584,14 @@ public actor CMIOCaptureService {
 
   public func configure(
     deviceUniqueID: String, mode: CameraMode, requestedFrameRate: Double? = nil,
-    generation requestedGeneration: Int? = nil
+    generation requestedGeneration: Int? = nil,
+    operationToken: CaptureConfigurationToken? = nil
   ) async throws -> Int {
+    if let requestedGeneration, let operationToken,
+      !operationToken.isCurrent(requestedGeneration)
+    {
+      throw CMIOCaptureError.configurationSuperseded
+    }
     guard let located = CMIOCaptureDiscovery.locate(deviceUID: deviceUniqueID) else {
       throw CMIOCaptureError.deviceNotFound(deviceUniqueID)
     }
@@ -524,16 +621,28 @@ public actor CMIOCaptureService {
         "CMIO configure: stream already delivers \(targetDims.width)×\(targetDims.height); no switch needed"
       )
     } else {
-      try renegotiateViaAVFoundation(deviceUniqueID: deviceUniqueID, mode: mode)
+      try renegotiateViaAVFoundation(
+        deviceUniqueID: deviceUniqueID, mode: mode,
+        operationToken: operationToken, revision: requestedGeneration)
       // Poll briefly for the renegotiation to become visible at the CMIO
       // layer, then verify; refusal (with AVFoundation fallback) is honest.
       var matched = false
       for _ in 0..<10 {
+        if let requestedGeneration, let operationToken,
+          !operationToken.isCurrent(requestedGeneration)
+        {
+          throw CMIOCaptureError.configurationSuperseded
+        }
         if streamMatchesRequest() {
           matched = true
           break
         }
         try await Task.sleep(nanoseconds: 200_000_000)
+      }
+      if let requestedGeneration, let operationToken,
+        !operationToken.isCurrent(requestedGeneration)
+      {
+        throw CMIOCaptureError.configurationSuperseded
       }
       guard matched else {
         let current = CMIOCaptureDiscovery.currentFormat(located)
@@ -555,6 +664,11 @@ public actor CMIOCaptureService {
       } ?? []
     let rateCeiling = requestedFrameRate ?? (mode.maxFrameRate > 0 ? mode.maxFrameRate : nil)
     let chosenRate = FrameRateSelection.highestSupported(in: frameRanges, ceiling: rateCeiling)
+    if let requestedGeneration, let operationToken,
+      !operationToken.isCurrent(requestedGeneration)
+    {
+      throw CMIOCaptureError.configurationSuperseded
+    }
     if let chosenRate {
       let currentRate = CMIOProperty.doubleProperty(
         located.streamID, CMIOProperty.frameRateSelector)
@@ -580,6 +694,11 @@ public actor CMIOCaptureService {
       }
       configuredFrameRate = currentRate
     }
+    if let requestedGeneration, let operationToken,
+      !operationToken.isCurrent(requestedGeneration)
+    {
+      throw CMIOCaptureError.configurationSuperseded
+    }
     generation = requestedGeneration ?? (generation + 1)
     self.located = located
     deviceUID = deviceUniqueID
@@ -588,7 +707,17 @@ public actor CMIOCaptureService {
 
   /// Start streaming: attach a buffer queue, start the CMIO stream, and begin
   /// polling frames into the sinks. Idempotent.
-  public func start() throws {
+  public func start(
+    expectedGeneration: Int? = nil, operationToken: CaptureConfigurationToken? = nil
+  ) throws {
+    if let expectedGeneration, expectedGeneration != generation {
+      throw CMIOCaptureError.configurationSuperseded
+    }
+    if let expectedGeneration, let operationToken,
+      !operationToken.isCurrent(expectedGeneration)
+    {
+      throw CMIOCaptureError.configurationSuperseded
+    }
     guard let located, let deviceUID else {
       throw CMIOCaptureError.streamUnavailable(deviceUID ?? "")
     }
@@ -638,7 +767,8 @@ public actor CMIOCaptureService {
 
   /// Stop camera use (also on window close). Sinks are told delivery stopped
   /// so retained frames are invalidated rather than treated as current.
-  public func stop() {
+  public func stop(expectedGeneration: Int? = nil) {
+    if let expectedGeneration, expectedGeneration != generation { return }
     let uid = deviceUID
     let observedGeneration = generation
     detachDelivery()
@@ -682,9 +812,7 @@ public actor CMIOCaptureService {
     let stop = StreamStop(
       reason: reason, deviceUniqueID: deviceID,
       generation: observedGeneration)
-    for entry in sinkRegistry.snapshot() {
-      entry.queue.async { entry.sink.streamStopped(stop) }
-    }
+    for entry in sinkRegistry.snapshot() { entry.streamStopped(stop) }
   }
 
   public func addSink(_ sink: FrameSink, queue: DispatchQueue) {

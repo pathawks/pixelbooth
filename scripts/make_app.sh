@@ -29,6 +29,8 @@ cp "$BIN" "$APP/Contents/MacOS/PixelBooth"
 cp "Support/Info.plist" "$APP/Contents/Info.plist"
 mkdir -p "$APP/Contents/Resources/en.lproj"
 cp "Support/en.lproj/InfoPlist.strings" "$APP/Contents/Resources/en.lproj/"
+mkdir -p "$APP/Contents/Resources/ThirdPartyNotices"
+cp vendor/notices/* "$APP/Contents/Resources/ThirdPartyNotices/"
 
 # Sign: ad-hoc by default for local development; pass a Developer ID
 # identity to also sign for distribution.
@@ -36,6 +38,8 @@ codesign --force --sign "$IDENTITY" \
   --entitlements Support/PixelBooth.entitlements \
   --options runtime \
   "$APP"
+
+scripts/check_app_permissions.sh "$APP"
 
 echo "Built $APP"
 codesign -dv "$APP" 2>&1 | head -4 || true

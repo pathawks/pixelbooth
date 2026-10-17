@@ -45,6 +45,19 @@ private actor ImportGate {
   }
 }
 
+private actor FirstFailureThenImportGate {
+  private var calls = 0
+  private let gate: ImportGate
+
+  init(gate: ImportGate) { self.gate = gate }
+
+  func run() async -> SaveQueueActor.ImportResult {
+    calls += 1
+    if calls == 1 { return .failed("simulated Photos failure") }
+    return await gate.run()
+  }
+}
+
 private actor TerminationWaitSignal {
   private(set) var completed = false
 
@@ -89,6 +102,32 @@ private func waitForStage(_ queue: SaveQueueActor, id: UUID, _ stages: Set<SaveQ
   throw RecoveryAssertion.failed("timed out waiting for (id)")
 }
 
+private func waitForDeletionReady(_ queue: SaveQueueActor, id: UUID) async throws -> [String] {
+  for _ in 0..<100 {
+    do { return try await queue.retainedFilesForDeletion(uuid: id) } catch SaveQueueActor.QueueError
+      .busy
+    {
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+  }
+  throw RecoveryAssertion.failed("timed out waiting for retained capture processing to finish")
+}
+
+private func largeJPEGFixtureCapture() -> CapturedCapture {
+  var bytes = jpegFixture()
+  let payload = [UInt8](repeating: 0x41, count: 59_998)
+  let segmentLength = payload.count + 2
+  let segment: [UInt8] =
+    [
+      0xff, 0xe1, UInt8((segmentLength >> 8) & 0xff), UInt8(segmentLength & 0xff),
+    ] + payload
+  for _ in 0..<70 {
+    bytes.insert(contentsOf: segment, at: 2)
+  }
+  return CapturedCapture.makeTestCapture(
+    fourCC: 0x4d4a_5047, width: 4, height: 4, payload: .jpegBytes(bytes))
+}
+
 private func fixtureCapture() -> CapturedCapture {
   CapturedCapture.makeTestCapture(
     fourCC: 0x4d4a_5047, width: 4, height: 4,
@@ -107,6 +146,161 @@ private func fixtureCaptureWithStaleDimensions() -> CapturedCapture {
 
 func runRecoverySuite() async {
   suite("DurableSaveRecovery")
+
+  await test("confirmedRetainedDeleteIsSymlinkSafeAndIsolated") {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "pb-delete-retained-safe-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let capture = fixtureCapture()
+    let importer = ImportSequence(
+      results: [.failed("Photos unavailable")], root: root, captureID: capture.uuid)
+    let staging = root.appendingPathComponent("staging", isDirectory: true)
+    let queue = SaveQueueActor(
+      stagingRoot: staging,
+      importer: { file, _ in await importer.run(file) })
+    try await queue.enqueue(capture)
+    _ = try await waitForStage(queue, id: capture.uuid, [.failedAddingToPhotos])
+    try await queue.dismissFailedCaptureFromProgress(uuid: capture.uuid)
+    let stagedCapture = staging.appendingPathComponent(capture.uuid.uuidString, isDirectory: true)
+    let source = stagedCapture.appendingPathComponent("capture.json")
+    let unrelated = staging.appendingPathComponent("unrelated.txt")
+    try Data("keep".utf8).write(to: unrelated)
+    let symlink = stagedCapture.appendingPathComponent("unexpected-link")
+    try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: unrelated)
+
+    do {
+      _ = try await waitForDeletionReady(queue, id: capture.uuid)
+      try await queue.deleteRetainedCapture(uuid: capture.uuid)
+      throw RecoveryAssertion.failed("delete accepted a symbolic link in the capture directory")
+    } catch SaveQueueActor.QueueError.staging {}
+    try requireRecovery(FileManager.default.fileExists(atPath: source.path), "source is retained")
+    try requireRecovery(
+      FileManager.default.fileExists(atPath: unrelated.path), "sibling is retained")
+    let stillRetained = try await queue.entries().first(where: { $0.uuid == capture.uuid })
+    try requireRecovery(
+      stillRetained?.shouldDiscardOnTermination == false,
+      "failed path validation does not record a delete transition")
+
+    try FileManager.default.removeItem(at: symlink)
+    let interruptedTemporary = stagedCapture.appendingPathComponent(
+      ".capture.jpg.\(UUID().uuidString).tmp")
+    try Data([1, 2, 3]).write(to: interruptedTemporary)
+    let names = try await waitForDeletionReady(queue, id: capture.uuid)
+    try requireRecovery(names.contains("capture.json"), "confirmation names retained source")
+    try requireRecovery(
+      names.contains(interruptedTemporary.lastPathComponent),
+      "confirmation includes a known interrupted atomic-write temporary")
+    try await queue.deleteRetainedCapture(uuid: capture.uuid)
+    try requireRecovery(
+      try await queue.entries().allSatisfy({ $0.uuid != capture.uuid }),
+      "confirmed delete removes only the target journal row")
+    try requireRecovery(
+      !FileManager.default.fileExists(atPath: stagedCapture.path), "target removed")
+    try requireRecovery(
+      FileManager.default.fileExists(atPath: unrelated.path), "sibling is untouched")
+  }
+
+  await test("retainedDeleteRefusesActiveImport") {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "pb-delete-retained-busy-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let capture = fixtureCapture()
+    let gate = ImportGate()
+    let importer = FirstFailureThenImportGate(gate: gate)
+    let queue = SaveQueueActor(
+      stagingRoot: root.appendingPathComponent("staging"),
+      importer: { _, _ in await importer.run() })
+    try await queue.enqueue(capture)
+    _ = try await waitForStage(queue, id: capture.uuid, [.failedAddingToPhotos])
+    try await queue.dismissFailedCaptureFromProgress(uuid: capture.uuid)
+    _ = try await waitForDeletionReady(queue, id: capture.uuid)
+
+    try await queue.retry(uuid: capture.uuid)
+    _ = try await waitForStage(queue, id: capture.uuid, [.addingToPhotos])
+    do {
+      try await queue.deleteRetainedCapture(uuid: capture.uuid)
+      throw RecoveryAssertion.failed("delete was accepted during a pending Photos import")
+    } catch SaveQueueActor.QueueError.busy {}
+    try requireRecovery(
+      FileManager.default.fileExists(
+        atPath: root.appendingPathComponent("staging", isDirectory: true)
+          .appendingPathComponent(capture.uuid.uuidString, isDirectory: true).path),
+      "active capture files remain staged")
+    await gate.finish(.failed("simulated Photos failure"))
+    _ = try await waitForStage(queue, id: capture.uuid, [.failedAddingToPhotos])
+  }
+
+  await test("retainedDeleteReclaimsStagingCapacity") {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "pb-delete-capacity-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let first = largeJPEGFixtureCapture()
+    var second = first
+    second.uuid = UUID()
+    let importer = ImportSequence(
+      results: [.failed("Photos unavailable"), .failed("Photos unavailable")],
+      root: root, captureID: first.uuid)
+    // One large JPEG fits, but its retained source plus the conservative
+    // reservation for another capture exceeds this bound.
+    let queue = SaveQueueActor(
+      stagingRoot: root.appendingPathComponent("staging"),
+      importer: { file, _ in await importer.run(file) },
+      maximumStagedBytes: 40 * 1024 * 1024)
+    try await queue.enqueue(first)
+    _ = try await waitForStage(queue, id: first.uuid, [.failedAddingToPhotos])
+    try await queue.dismissFailedCaptureFromProgress(uuid: first.uuid)
+    _ = try await waitForDeletionReady(queue, id: first.uuid)
+    do {
+      try await queue.enqueue(second)
+      throw RecoveryAssertion.failed("capture was accepted while retained staging filled capacity")
+    } catch SaveQueueActor.QueueError.capacityExceeded {}
+
+    try await queue.deleteRetainedCapture(uuid: first.uuid)
+    try await queue.enqueue(second)
+    _ = try await waitForStage(queue, id: second.uuid, [.failedAddingToPhotos])
+    try requireRecovery(
+      try await queue.entries().contains(where: { $0.uuid == second.uuid }),
+      "a new capture fits after confirmed retained deletion")
+  }
+
+  await test("interruptedConfirmedDeleteFinishesOnRelaunch") {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "pb-delete-relaunch-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let capture = fixtureCapture()
+    let importer = ImportSequence(
+      results: [.failed("Photos unavailable")], root: root, captureID: capture.uuid)
+    let staging = root.appendingPathComponent("staging", isDirectory: true)
+    let queue = SaveQueueActor(
+      stagingRoot: staging,
+      importer: { file, _ in await importer.run(file) })
+    try await queue.enqueue(capture)
+    _ = try await waitForStage(queue, id: capture.uuid, [.failedAddingToPhotos])
+    try await queue.dismissFailedCaptureFromProgress(uuid: capture.uuid)
+    _ = try await waitForDeletionReady(queue, id: capture.uuid)
+    let sourceDirectory = staging.appendingPathComponent(capture.uuid.uuidString, isDirectory: true)
+
+    let journalURL = root.appendingPathComponent("journal.json")
+    var journal =
+      try JSONSerialization.jsonObject(with: Data(contentsOf: journalURL)) as! [String: Any]
+    var entries = journal["entries"] as! [[String: Any]]
+    entries[0]["discardOnTermination"] = true
+    journal["entries"] = entries
+    try JSONSerialization.data(withJSONObject: journal).write(to: journalURL)
+
+    let relaunchedImporter = ImportSequence(
+      results: [.saved], root: root, captureID: capture.uuid)
+    let relaunched = SaveQueueActor(
+      stagingRoot: staging,
+      importer: { file, _ in await relaunchedImporter.run(file) })
+    try await relaunched.reconcileOnLaunch()
+    try requireRecovery(
+      try await relaunched.entries().isEmpty, "delete intent removes its journal row")
+    try requireRecovery(
+      !FileManager.default.fileExists(atPath: sourceDirectory.path),
+      "delete intent removes target staging on relaunch")
+    try requireRecovery(await relaunchedImporter.calls == 0, "deleted capture is never imported")
+  }
 
   await test("stagingFailureRefusesEnqueueAndDoesNotInvokeImporter") {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -217,6 +411,81 @@ func runRecoverySuite() async {
     } catch SaveQueueActor.QueueError.originalUnavailable(_) {}
   }
 
+  await test("allFailedCapturesCanBeDismissedDurablyAndRetriedWithoutLosingData") {
+    let failureStages: [SaveQueueActor.Stage] = [
+      .failedEncoding, .failedValidating, .failedAddingToPhotos, .failedDiskFull,
+      .failedUnsupportedColorDescriptor, .ambiguousImport,
+    ]
+    for stage in failureStages {
+      let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "pb-dismiss-\(stage.rawValue)-\(UUID().uuidString)")
+      defer { try? FileManager.default.removeItem(at: root) }
+      let capture = fixtureCapture()
+      let importer = ImportSequence(
+        results: [.failed("simulated failure")], root: root,
+        captureID: capture.uuid)
+      let staging = root.appendingPathComponent("staging")
+      let queue = SaveQueueActor(
+        stagingRoot: staging,
+        importer: { file, _ in await importer.run(file) })
+      try await queue.enqueue(capture)
+      let failed = try await waitForStage(queue, id: capture.uuid, [.failedAddingToPhotos])
+      let source = URL(fileURLWithPath: failed.stagingPath).appendingPathComponent("capture.json")
+      let finalized = URL(fileURLWithPath: failed.stagingPath).appendingPathComponent("capture.jpg")
+      let sourceBytes = try Data(contentsOf: source)
+      let finalizedBytes = try Data(contentsOf: finalized)
+
+      let journalURL = root.appendingPathComponent("journal.json")
+      var journal =
+        try JSONSerialization.jsonObject(with: Data(contentsOf: journalURL))
+        as! [String: Any]
+      var entries = journal["entries"] as! [[String: Any]]
+      entries[0]["stage"] = stage.rawValue
+      journal["entries"] = entries
+      try JSONSerialization.data(withJSONObject: journal).write(to: journalURL)
+
+      try await queue.dismissFailedCaptureFromProgress(uuid: capture.uuid)
+      let dismissed = try await queue.entries().first(where: { $0.uuid == capture.uuid })
+      try requireRecovery(dismissed?.stage == stage, "dismissal preserves failure classification")
+      try requireRecovery(
+        dismissed?.isProgressDismissed == true && dismissed?.isRetainedDismissed == true,
+        "dismissal hides the capture while PixelBooth remains open")
+      try requireRecovery(try Data(contentsOf: source) == sourceBytes, "source bytes preserved")
+      try requireRecovery(
+        try Data(contentsOf: finalized) == finalizedBytes, "finalized bytes preserved")
+      try requireRecovery(await importer.calls == 1, "dismissal never imports")
+
+      if stage != .failedUnsupportedColorDescriptor {
+        try await queue.retry(uuid: capture.uuid, confirmingPossibleDuplicate: true)
+        let saved = try await waitForStage(queue, id: capture.uuid, [.saved])
+        try requireRecovery(
+          !saved.isProgressDismissed && !saved.isRetainedDismissed,
+          "explicit retry restores visible save progress")
+        try requireRecovery(await importer.calls == 2, "retry imports once")
+      }
+    }
+  }
+
+  await test("activeCaptureCannotBeDismissed") {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "pb-dismiss-active-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let capture = fixtureCapture()
+    let gate = ImportGate()
+    let queue = SaveQueueActor(
+      stagingRoot: root.appendingPathComponent("staging"),
+      importer: { _, _ in await gate.run() })
+    try await queue.enqueue(capture)
+    _ = try await waitForStage(queue, id: capture.uuid, [.addingToPhotos])
+    do {
+      try await queue.dismissFailedCaptureFromProgress(uuid: capture.uuid)
+      throw RecoveryAssertion.failed("active capture was dismissed")
+    } catch SaveQueueActor.QueueError.originalUnavailable(_) {}
+    await gate.finish(.failed("simulated failure"))
+    let failed = try await waitForStage(queue, id: capture.uuid, [.failedAddingToPhotos])
+    try requireRecovery(!failed.isProgressDismissed, "active capture remains visible")
+  }
+
   await test("staleLegacyPlaneDimensionsCanRetryAndExport") {
     let exportRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
       "pb-stale-export-\(UUID().uuidString)")
@@ -273,7 +542,7 @@ func runRecoverySuite() async {
       throw RecoveryAssertion.failed("known permanent color-metadata failure was retryable")
     } catch SaveQueueActor.QueueError.originalUnavailable(_) {}
 
-    try await queue.dismissUnsupportedCaptureFromProgress(uuid: capture.uuid)
+    try await queue.dismissFailedCaptureFromProgress(uuid: capture.uuid)
     let dismissed = try await queue.entries().first(where: { $0.uuid == capture.uuid })
     try requireRecovery(
       dismissed?.stage == .failedUnsupportedColorDescriptor
@@ -326,7 +595,7 @@ func runRecoverySuite() async {
       legacyEntry?.stage == .failedUnsupportedColorDescriptor
         && legacyEntry?.isPermanentlyUnencodable == true,
       "legacy SnapshotError 1 migrates to a permanent color failure")
-    try await legacyQueue.dismissUnsupportedCaptureFromProgress(uuid: legacyCapture.uuid)
+    try await legacyQueue.dismissFailedCaptureFromProgress(uuid: legacyCapture.uuid)
     let legacyDismissed = try await legacyQueue.entries().first(where: {
       $0.uuid == legacyCapture.uuid
     })
@@ -393,6 +662,125 @@ func runRecoverySuite() async {
     await waitTask.value
     try requireRecovery(await signal.completed, "termination resumes after active work finishes")
     _ = try await waitForStage(queue, id: capture.uuid, [.saved])
+  }
+
+  await test("terminationDeletesOnlyDismissedRetainedCaptures") {
+    let dismissedRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "pb-termination-dismissed-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: dismissedRoot) }
+    let dismissedCapture = fixtureCapture()
+    let dismissedImporter = ImportSequence(
+      results: [.failed("Photos unavailable")], root: dismissedRoot,
+      captureID: dismissedCapture.uuid)
+    let dismissedQueue = SaveQueueActor(
+      stagingRoot: dismissedRoot.appendingPathComponent("staging"),
+      importer: { file, _ in await dismissedImporter.run(file) })
+    try await dismissedQueue.enqueue(dismissedCapture)
+    _ = try await waitForStage(
+      dismissedQueue, id: dismissedCapture.uuid, [.failedAddingToPhotos])
+    try await dismissedQueue.dismissFailedCaptureFromProgress(uuid: dismissedCapture.uuid)
+    let dismissedDirectory = dismissedRoot.appendingPathComponent("staging", isDirectory: true)
+      .appendingPathComponent(dismissedCapture.uuid.uuidString, isDirectory: true)
+    try requireRecovery(
+      FileManager.default.fileExists(atPath: dismissedDirectory.path),
+      "dismissed capture remains recoverable until the app quits")
+
+    if await dismissedQueue.beginTermination() {
+      await dismissedQueue.waitForTerminationWorkToFinish()
+    }
+    let removedCount = try await dismissedQueue.discardDismissedCapturesOnTermination()
+    try requireRecovery(removedCount == 1, "one dismissed capture removed at termination")
+    try requireRecovery(
+      try await dismissedQueue.entries().isEmpty, "dismissed journal entry removed")
+    try requireRecovery(
+      !FileManager.default.fileExists(atPath: dismissedDirectory.path),
+      "dismissed source and finalized files removed")
+
+    let retainedRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "pb-termination-retained-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: retainedRoot) }
+    let retainedCapture = fixtureCapture()
+    let retainedImporter = ImportSequence(
+      results: [.failed("Photos unavailable")], root: retainedRoot,
+      captureID: retainedCapture.uuid)
+    let retainedQueue = SaveQueueActor(
+      stagingRoot: retainedRoot.appendingPathComponent("staging"),
+      importer: { file, _ in await retainedImporter.run(file) })
+    try await retainedQueue.enqueue(retainedCapture)
+    _ = try await waitForStage(retainedQueue, id: retainedCapture.uuid, [.failedAddingToPhotos])
+    try await retainedQueue.dismissFailedCaptureFromProgress(uuid: retainedCapture.uuid)
+    try await retainedQueue.restoreRetainedCapture(uuid: retainedCapture.uuid)
+    let retainedDirectory = retainedRoot.appendingPathComponent("staging", isDirectory: true)
+      .appendingPathComponent(retainedCapture.uuid.uuidString, isDirectory: true)
+    if await retainedQueue.beginTermination() {
+      await retainedQueue.waitForTerminationWorkToFinish()
+    }
+    let retainedRemovedCount = try await retainedQueue.discardDismissedCapturesOnTermination()
+    let retainedEntry = try await retainedQueue.entries().first
+    try requireRecovery(retainedRemovedCount == 0, "restored retained capture is preserved")
+    try requireRecovery(
+      retainedEntry?.isProgressDismissed == true && retainedEntry?.isRetainedDismissed == false,
+      "restored item remains in retained recovery")
+    try requireRecovery(
+      FileManager.default.fileExists(atPath: retainedDirectory.path),
+      "restored source and finalized files remain on disk")
+  }
+
+  await test("interruptedDismissedCleanupFinishesOnNextLaunch") {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "pb-termination-dismissed-resume-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let capture = fixtureCapture()
+    let importer = ImportSequence(
+      results: [.failed("Photos unavailable")], root: root, captureID: capture.uuid)
+    let queue = SaveQueueActor(
+      stagingRoot: root.appendingPathComponent("staging"),
+      importer: { file, _ in await importer.run(file) })
+    try await queue.enqueue(capture)
+    _ = try await waitForStage(queue, id: capture.uuid, [.failedAddingToPhotos])
+    try await queue.dismissFailedCaptureFromProgress(uuid: capture.uuid)
+
+    let journalURL = root.appendingPathComponent("journal.json")
+    var journal =
+      try JSONSerialization.jsonObject(with: Data(contentsOf: journalURL))
+      as! [String: Any]
+    var entries = journal["entries"] as! [[String: Any]]
+    entries[0]["discardOnTermination"] = true
+    journal["entries"] = entries
+    try JSONSerialization.data(withJSONObject: journal).write(to: journalURL)
+
+    let relaunched = SaveQueueActor(stagingRoot: root.appendingPathComponent("staging"))
+    try await relaunched.reconcileOnLaunch()
+    let directory = root.appendingPathComponent("staging", isDirectory: true)
+      .appendingPathComponent(capture.uuid.uuidString, isDirectory: true)
+    try requireRecovery(try await relaunched.entries().isEmpty, "marked row is not recovered")
+    try requireRecovery(
+      !FileManager.default.fileExists(atPath: directory.path), "interrupted cleanup completes")
+  }
+
+  await test("dismissedCapturesAreRemovedDuringNextLaunchReconciliation") {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "pb-termination-dismissed-reconcile-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let capture = fixtureCapture()
+    let importer = ImportSequence(
+      results: [.failed("Photos unavailable")], root: root, captureID: capture.uuid)
+    let queue = SaveQueueActor(
+      stagingRoot: root.appendingPathComponent("staging"),
+      importer: { file, _ in await importer.run(file) })
+    try await queue.enqueue(capture)
+    _ = try await waitForStage(queue, id: capture.uuid, [.failedAddingToPhotos])
+    try await queue.dismissFailedCaptureFromProgress(uuid: capture.uuid)
+    let sourceDirectory = root.appendingPathComponent("staging", isDirectory: true)
+      .appendingPathComponent(capture.uuid.uuidString, isDirectory: true)
+
+    let relaunched = SaveQueueActor(stagingRoot: root.appendingPathComponent("staging"))
+    try await relaunched.reconcileOnLaunch()
+    try requireRecovery(
+      try await relaunched.entries().isEmpty, "dismissed journal row is removed on relaunch")
+    try requireRecovery(
+      !FileManager.default.fileExists(atPath: sourceDirectory.path),
+      "dismissed staged files are removed on relaunch")
   }
 
   await test("ambiguousImportNeedsExplicitDuplicateConfirmation") {

@@ -18,6 +18,32 @@ extension Notification.Name {
     Notification.Name("PixelBoothFrameRatePreferencesChanged")
 }
 
+private enum CaptureStatusScene {
+  static let id = "pixelbooth-status"
+}
+
+private enum CaptureDetailsScene {
+  static let id = "pixelbooth-details"
+}
+
+@MainActor
+private final class CaptureStatusWindowState: ObservableObject {
+  static let shared = CaptureStatusWindowState()
+  @Published private(set) var isOpen = false
+
+  func windowDidOpen() { isOpen = true }
+  func windowDidClose() { isOpen = false }
+}
+
+@MainActor
+private final class CaptureDetailsWindowState: ObservableObject {
+  static let shared = CaptureDetailsWindowState()
+  @Published private(set) var isOpen = false
+
+  func windowDidOpen() { isOpen = true }
+  func windowDidClose() { isOpen = false }
+}
+
 @main
 struct PixelBoothApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -47,6 +73,18 @@ struct PixelBoothApp: App {
     .commands {
       PixelBoothCommands()
     }
+    Window("Capture Status", id: CaptureStatusScene.id) {
+      CaptureStatusWindowView()
+    }
+    .defaultSize(width: 760, height: 620)
+    .defaultLaunchBehavior(.suppressed)
+    .restorationBehavior(.disabled)
+    Window("Capture Details", id: CaptureDetailsScene.id) {
+      CaptureDetailsWindowView()
+    }
+    .defaultSize(width: 760, height: 500)
+    .defaultLaunchBehavior(.suppressed)
+    .restorationBehavior(.disabled)
     Settings {
       SettingsView()
     }
@@ -55,12 +93,141 @@ struct PixelBoothApp: App {
 
 struct PixelBoothCommands: Commands {
   @AppStorage("mirrorPreview") private var mirrorPreview = false
+  @AppStorage("countdownSeconds") private var countdownSeconds = 0.0
+  @AppStorage("actualSizePreview") private var actualSizePreview = false
+  @AppStorage("showControls") private var showControls = true
+  @ObservedObject private var saveQueue = SaveQueueHolder.shared
+  @ObservedObject private var captureMenuState = CaptureCommandMenuState.shared
+  @ObservedObject private var statusWindowState = CaptureStatusWindowState.shared
+  @ObservedObject private var detailsWindowState = CaptureDetailsWindowState.shared
+  @Environment(\.openWindow) private var openWindow
+  @Environment(\.dismissWindow) private var dismissWindow
 
   var body: some Commands {
+    CommandGroup(after: .newItem) {
+      Button("Take Photo") {
+        CaptureViewModel.shared.requestCapture()
+      }
+      .keyboardShortcut(.return, modifiers: .command)
+      .disabled(!captureMenuState.shutterEnabled)
+    }
+
+    CommandMenu("Capture") {
+      Picker("Self-Timer", selection: $countdownSeconds) {
+        Text("Off").tag(0.0)
+        Text("3 Seconds").tag(3.0)
+        Text("10 Seconds").tag(10.0)
+      }
+
+      Divider()
+
+      Menu("Camera") {
+        if captureMenuState.cameras.isEmpty {
+          Button(captureMenuState.cameraAccessDenied ? "Camera Access Off" : "No Cameras Found") {}
+            .disabled(true)
+        } else {
+          Picker(
+            "Camera",
+            selection: Binding(
+              get: { captureMenuState.selectedCameraID },
+              set: { selectedID in
+                if let selectedID {
+                  CaptureViewModel.shared.selectedCameraID = selectedID
+                }
+              })
+          ) {
+            ForEach(captureMenuState.cameras) { camera in
+              Text(camera.localizedName).tag(Optional(camera.uniqueID))
+            }
+          }
+          .pickerStyle(.inline)
+          .labelsHidden()
+          .disabled(captureMenuState.cameraAccessDenied)
+        }
+      }
+
+      Menu("Mode") {
+        if captureMenuState.availableModes.isEmpty {
+          Button("No Modes Available") {}
+            .disabled(true)
+        } else {
+          Picker(
+            "Mode",
+            selection: Binding(
+              get: { captureMenuState.selectedModeID },
+              set: { selectedID in
+                if let selectedID {
+                  CaptureViewModel.shared.selectedModeID = selectedID
+                }
+              })
+          ) {
+            ForEach(captureMenuState.availableModes) { mode in
+              Text(mode.descriptiveLabel).tag(Optional(mode.id))
+            }
+          }
+          .pickerStyle(.inline)
+          .labelsHidden()
+          .disabled(captureMenuState.cameraAccessDenied)
+        }
+      }
+    }
     CommandGroup(after: .sidebar) {
+      Toggle("Show Controls", isOn: $showControls)
+
       Toggle("Mirror Preview", isOn: $mirrorPreview)
         .keyboardShortcut("m", modifiers: [.command])
         .accessibilityLabel("Mirror preview")
+
+      Picker("Preview Size", selection: $actualSizePreview) {
+        Text("Fit to Window").tag(false)
+        Text("Actual Size").tag(true)
+      }
+    }
+    CommandGroup(after: .windowList) {
+      Toggle(
+        "Capture Details",
+        isOn: Binding(
+          get: { detailsWindowState.isOpen },
+          set: { shouldOpen in
+            if shouldOpen {
+              openWindow(id: CaptureDetailsScene.id)
+            } else {
+              dismissWindow(id: CaptureDetailsScene.id)
+            }
+          }
+        ))
+      Toggle(
+        statusMenuTitle,
+        isOn: Binding(
+          get: { statusWindowState.isOpen },
+          set: { shouldOpen in
+            if shouldOpen {
+              openWindow(id: CaptureStatusScene.id)
+            } else {
+              dismissWindow(id: CaptureStatusScene.id)
+            }
+          }
+        ))
+    }
+  }
+
+  private var statusMenuTitle: String {
+    hasStatusAttention ? "Capture Status — Needs Attention" : "Capture Status"
+  }
+
+  private var hasStatusAttention: Bool {
+    saveQueue.progressItems.contains(where: \.needsAttention)
+      || !saveQueue.retainedItems.isEmpty
+      || !saveQueue.dismissedRetainedItems.isEmpty
+      || saveQueue.recoveryError != nil
+      || saveQueue.capacityError != nil
+      || photosAuthorizationNeedsAttention
+  }
+
+  private var photosAuthorizationNeedsAttention: Bool {
+    switch saveQueue.photosAuthorizationState {
+    case .denied, .restricted, .unknown: true
+    case .notDetermined, .authorized, .limited: false
     }
   }
 }
@@ -89,6 +256,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = alert.runModal()
         await queue.waitForTerminationWorkToFinish()
       }
+      do {
+        _ = try await queue.discardDismissedCapturesOnTermination()
+      } catch {
+        let alert = NSAlert()
+        alert.messageText = "Could not remove dismissed captures"
+        alert.informativeText =
+          "They remain recoverable on this Mac. \(error.localizedDescription)"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Quit")
+        _ = alert.runModal()
+      }
       sender.reply(toApplicationShouldTerminate: true)
       self?.terminationTask = nil
     }
@@ -97,130 +275,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 struct CaptureWindowView: View {
-  @StateObject private var viewModel = CaptureViewModel()
+  @StateObject private var viewModel = CaptureViewModel.shared
   @ObservedObject private var saveQueue = SaveQueueHolder.shared
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @AppStorage("mirrorPreview") private var mirrorPreview = false
-  @AppStorage("countdownSeconds") private var countdownSeconds = 0.0
-  @State private var isProgressExpanded = false
-  @State private var isInspectorExpanded = false
-  @State private var actualSizePreview = false
+  @AppStorage("actualSizePreview") private var actualSizePreview = false
+  @AppStorage("showControls") private var showControls = true
 
   var body: some View {
-    VStack(spacing: 12) {
-      cameraModeToolbar
+    ZStack(alignment: .topLeading) {
+      previewSurface
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-      ZStack(alignment: .topLeading) {
-        previewSurface
-        if mirrorPreview {
-          Label("Mirrored preview", systemImage: "arrow.left.and.right")
-            .font(.caption.weight(.medium))
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(.ultraThinMaterial, in: Capsule())
-            .padding(12)
-            .accessibilityLabel("Preview is mirrored; saved image is unchanged")
-        }
-        if let remaining = viewModel.countdownRemaining {
-          countdownOverlay(remaining)
-        } else if viewModel.cameraWindowStatus != .ready {
-          cameraStateCard
-        }
-      }
-      .frame(minHeight: 250, maxHeight: .infinity)
-      .clipShape(RoundedRectangle(cornerRadius: 12))
-      .overlay {
-        RoundedRectangle(cornerRadius: 12)
-          .strokeBorder(.quaternary, lineWidth: 1)
+      if showControls && mirrorPreview {
+        Label("Mirrored preview", systemImage: "arrow.left.and.right")
+          .font(.caption.weight(.medium))
+          .padding(.horizontal, 10)
+          .padding(.vertical, 7)
+          .background(.ultraThinMaterial, in: Capsule())
+          .padding(12)
+          .accessibilityLabel("Preview is mirrored; saved image is unchanged")
       }
 
-      captureBar
-      if !saveQueue.photosAuthorizationState.canAddPhotos {
-        PhotosAuthorizationBanner(
-          state: saveQueue.photosAuthorizationState,
-          requestAccess: saveQueue.requestPhotosAuthorization,
-          openSettings: openPhotosSettings)
-      }
-      VStack(alignment: .leading, spacing: 8) {
-        Text(viewModel.captureStateText)
-          .font(.callout.weight(.medium))
-          .accessibilityLabel("Capture readiness")
-          .accessibilityValue(viewModel.captureStateText)
-          .accessibilityAddTraits(.updatesFrequently)
-
-        if viewModel.canOverrideAdjustment {
-          HStack {
-            Text("The camera is still adjusting. You can wait or continue now.")
-              .font(.caption)
-              .foregroundStyle(.secondary)
-            Spacer()
-            Button("Capture while adjusting") { viewModel.allowCaptureWhileAdjusting() }
-              .buttonStyle(.bordered)
-          }
-        }
-
-        if let result = viewModel.lastResultText {
-          Text(result)
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .textSelection(.enabled)
-            .accessibilityLabel("Latest capture result: \(result)")
-        }
-      }
-      .frame(maxWidth: .infinity, alignment: .leading)
-
-      if let recoveryError = saveQueue.recoveryError {
-        RecoveryErrorBanner(message: recoveryError) { saveQueue.retryRecovery() }
-      }
-      if let capacityError = saveQueue.capacityError {
-        QueueCapacityBanner(message: capacityError) { saveQueue.dismissCapacityError() }
+      if let remaining = viewModel.countdownRemaining {
+        countdownOverlay(remaining)
+      } else if viewModel.cameraWindowStatus != .ready {
+        cameraStateCard
       }
 
-      if !saveQueue.progressItems.isEmpty {
-        CaptureProgressSection(
-          items: saveQueue.progressItems,
-          isExpanded: $isProgressExpanded,
-          onRetry: retryCapture,
-          onSaveOriginal: saveOriginal,
-          onDismiss: dismissCapture
-        )
-        .transition(
-          reduceMotion ? .identity : .move(edge: .bottom).combined(with: .opacity))
-      }
-      if !saveQueue.retainedItems.isEmpty {
-        RetainedCapturesSection(
-          items: saveQueue.retainedItems,
-          onSaveOriginal: saveOriginal,
-          onDismiss: saveQueue.dismissRetainedCapture)
-      }
-      if !saveQueue.dismissedRetainedItems.isEmpty {
-        DismissedCapturesSection(
-          items: saveQueue.dismissedRetainedItems,
-          onSaveOriginal: saveOriginal,
-          onRestore: saveQueue.restoreRetainedCapture)
-      }
-      if isInspectorExpanded {
-        CaptureInspectorView(viewModel: viewModel)
+      if showControls {
+        captureControlsOverlay
       }
     }
-    .padding(16)
     .frame(minWidth: 700, minHeight: 560)
-    .animation(reduceMotion ? nil : .snappy(duration: 0.28), value: saveQueue.progressItems)
+    .overlay(alignment: .bottomTrailing) {
+      if activePendingCount > 0 {
+        PendingSaveIndicator(count: activePendingCount)
+          .padding(.horizontal, 10)
+          .padding(.vertical, 7)
+          .background(.ultraThinMaterial, in: Capsule())
+          .padding(16)
+          .transition(reduceMotion ? .identity : .opacity)
+          .animation(reduceMotion ? nil : .snappy(duration: 0.28), value: activePendingCount)
+      }
+    }
     .onAppear {
       viewModel.activate()
       Task { await saveQueue.refreshPhotosAuthorizationStatus() }
-      if !attentionCaptureIDs.isEmpty { isProgressExpanded = true }
     }
     .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification))
     { _ in
       Task { await saveQueue.refreshPhotosAuthorizationStatus() }
-    }
-    .onChange(of: attentionCaptureIDs) { oldValue, newValue in
-      if newValue.isEmpty {
-        if !oldValue.isEmpty { isProgressExpanded = false }
-      } else {
-        isProgressExpanded = true
-      }
     }
     .onDisappear { viewModel.deactivate() }
     .background {
@@ -230,60 +335,53 @@ struct CaptureWindowView: View {
     }
   }
 
-  private var attentionCaptureIDs: [UUID] {
-    saveQueue.progressItems.filter(\.needsAttention).map(\.uuid)
+  private var activePendingCount: Int {
+    saveQueue.progressItems.filter { !$0.needsAttention && !$0.isComplete }.count
   }
 
-  private func openPhotosSettings() {
-    let settingsApp = URL(fileURLWithPath: "/System/Applications/System Settings.app")
-    NSWorkspace.shared.open(settingsApp)
-  }
+  private var captureControlsOverlay: some View {
+    VStack(spacing: 12) {
+      Spacer(minLength: 0)
 
-  private var cameraModeToolbar: some View {
-    HStack(spacing: 12) {
-      VStack(alignment: .leading, spacing: 4) {
-        Text("Camera").font(.caption).foregroundStyle(.secondary)
-        Picker("Camera", selection: $viewModel.selectedCameraID) {
-          ForEach(viewModel.cameras) { camera in
-            Text(camera.localizedName).tag(Optional(camera.uniqueID))
-          }
+      if viewModel.canOverrideAdjustment {
+        HStack(spacing: 12) {
+          Text("The camera is still adjusting. You can wait or continue now.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+          Spacer(minLength: 8)
+          Button("Capture while adjusting") { viewModel.allowCaptureWhileAdjusting() }
+            .buttonStyle(.bordered)
         }
-        .disabled(viewModel.cameras.isEmpty || viewModel.cameraAccessDenied)
-        .accessibilityLabel("Camera")
+        .padding(12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .frame(maxWidth: 620)
       }
-      .frame(maxWidth: .infinity, alignment: .leading)
 
-      VStack(alignment: .leading, spacing: 4) {
-        Text("Mode").font(.caption).foregroundStyle(.secondary)
-        Picker("Mode", selection: $viewModel.selectedModeID) {
-          ForEach(viewModel.availableModes) { mode in
-            Text(
-              "\(mode.dimensionsWidth)×\(mode.dimensionsHeight) · \(Int(mode.maxFrameRate)) fps · \(CaptureFormat.fourCCString(mode.pixelFormat))"
-            )
-            .tag(Optional(mode.id))
-          }
-        }
-        .disabled(viewModel.availableModes.isEmpty || viewModel.cameraAccessDenied)
-        .accessibilityLabel("Camera mode")
+      ShutterButton(state: viewModel.shutterEnabled ? .enabled : .disabled) {
+        viewModel.requestCapture()
       }
-      .frame(maxWidth: .infinity, alignment: .leading)
 
-      Button {
-        isInspectorExpanded.toggle()
-      } label: {
-        Label("Details", systemImage: isInspectorExpanded ? "info.circle.fill" : "info.circle")
+      HStack(spacing: 10) {
+        let latestResult = viewModel.lastResultText
+        Text(
+          latestResult
+            ?? (viewModel.shutterEnabled ? "Ready" : viewModel.captureStateText)
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .accessibilityLabel(latestResult == nil ? "Capture readiness" : "Latest capture result")
+        .accessibilityValue(latestResult ?? viewModel.captureStateText)
+        .accessibilityAddTraits(.updatesFrequently)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.ultraThinMaterial, in: Capsule())
+
+        Spacer(minLength: 0)
       }
-      .buttonStyle(.borderless)
-      .accessibilityValue(isInspectorExpanded ? "Shown" : "Hidden")
-      Menu {
-        Button("Fit to Window") { actualSizePreview = false }
-        Button("Actual Size") { actualSizePreview = true }
-      } label: {
-        Label(actualSizePreview ? "Actual Size" : "Fit", systemImage: "viewfinder")
-      }
-      .accessibilityLabel("Preview scale")
-      .accessibilityValue(actualSizePreview ? "Actual Size" : "Fit to Window")
     }
+    .padding(16)
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
 
   @ViewBuilder
@@ -306,33 +404,6 @@ struct CaptureWindowView: View {
     }
   }
 
-  private var captureBar: some View {
-    HStack(spacing: 16) {
-      Picker("Timer", selection: $countdownSeconds) {
-        Text("Timer Off").tag(0.0)
-        Text("3 seconds").tag(3.0)
-        Text("10 seconds").tag(10.0)
-      }
-      .pickerStyle(.segmented)
-      .frame(width: 210)
-      .accessibilityLabel("Self timer")
-
-      Spacer(minLength: 8)
-      ShutterButton(state: viewModel.shutterEnabled ? .enabled : .disabled) {
-        viewModel.requestCapture()
-      }
-      Spacer(minLength: 8)
-
-      Toggle(isOn: $mirrorPreview) {
-        Label("Mirror", systemImage: "arrow.left.and.right")
-      }
-      .toggleStyle(.switch)
-      .accessibilityLabel("Mirror preview only")
-      .accessibilityHint("Does not change the saved image")
-    }
-    .padding(.vertical, 4)
-  }
-
   @ViewBuilder
   private var cameraStateCard: some View {
     switch viewModel.cameraWindowStatus {
@@ -348,10 +419,18 @@ struct CaptureWindowView: View {
         detail: "Connect a camera or check its connection, then look again.",
         actionTitle: "Refresh Cameras", action: viewModel.refreshCameras)
     case .noSupportedMode:
-      CameraStateCard(
-        symbol: "video.slash", title: "No supported mode is available",
-        detail: "Choose another camera or refresh the camera list.",
-        actionTitle: "Refresh Cameras", action: viewModel.refreshCameras)
+      if viewModel.availableModes.isEmpty {
+        CameraStateCard(
+          symbol: "video.slash", title: "No supported mode is available",
+          detail: "Choose another camera or refresh the camera list.",
+          actionTitle: "Refresh Cameras", action: viewModel.refreshCameras)
+      } else {
+        CameraStateCard(
+          symbol: "video", title: "Choose a camera mode",
+          detail:
+            "This camera has \(viewModel.availableModes.count) available formats. Choose one from the Mode menu to start capture.",
+          actionTitle: nil, action: {})
+      }
     case .connecting:
       CameraStateCard(
         symbol: "camera.aperture", title: "Starting camera",
@@ -395,6 +474,162 @@ struct CaptureWindowView: View {
     }
   }
 
+}
+
+private struct PendingSaveIndicator: View {
+  let count: Int
+
+  private var label: String {
+    count == 1 ? "1 capture is being saved" : "\(count) captures are being saved"
+  }
+
+  var body: some View {
+    HStack(spacing: 8) {
+      ProgressView().controlSize(.small)
+      Text(label).font(.caption).foregroundStyle(.secondary)
+    }
+    .accessibilityElement(children: .ignore)
+    .accessibilityLabel(label)
+    .accessibilityAddTraits(.updatesFrequently)
+  }
+}
+
+private struct CaptureStatusWindowView: View {
+  @ObservedObject private var saveQueue = SaveQueueHolder.shared
+  @ObservedObject private var windowState = CaptureStatusWindowState.shared
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @State private var isProgressExpanded = false
+  @State private var actionMessage: String?
+  @State private var deletionRequest: CaptureDeletionRequest?
+
+  var body: some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 12) {
+        if !saveQueue.photosAuthorizationState.canAddPhotos {
+          PhotosAuthorizationBanner(
+            state: saveQueue.photosAuthorizationState,
+            requestAccess: saveQueue.requestPhotosAuthorization,
+            openSettings: openPhotosSettings)
+        }
+        if let recoveryError = saveQueue.recoveryError {
+          RecoveryErrorBanner(
+            message: recoveryError, retry: saveQueue.retryRecovery,
+            dismiss: saveQueue.dismissRecoveryError)
+        }
+        if let capacityError = saveQueue.capacityError {
+          QueueCapacityBanner(message: capacityError) { saveQueue.dismissCapacityError() }
+        }
+        if let actionMessage {
+          Text(actionMessage)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .textSelection(.enabled)
+            .accessibilityLabel("Capture status action result: \(actionMessage)")
+        }
+        if !saveQueue.progressItems.isEmpty {
+          CaptureProgressSection(
+            items: saveQueue.progressItems,
+            isExpanded: $isProgressExpanded,
+            onRetry: retryCapture,
+            onSaveOriginal: saveOriginal,
+            onDismiss: dismissCapture
+          )
+          .transition(reduceMotion ? .identity : .move(edge: .bottom).combined(with: .opacity))
+        }
+        if !saveQueue.retainedItems.isEmpty {
+          RetainedCapturesSection(
+            items: saveQueue.retainedItems,
+            onRetry: retryCapture,
+            onSaveOriginal: saveOriginal,
+            onDismiss: saveQueue.dismissRetainedCapture,
+            onDelete: requestDeletion)
+        }
+        if !saveQueue.dismissedRetainedItems.isEmpty {
+          DismissedCapturesSection(
+            items: saveQueue.dismissedRetainedItems,
+            onRetry: retryCapture,
+            onSaveOriginal: saveOriginal,
+            onRestore: saveQueue.restoreRetainedCapture,
+            onDelete: requestDeletion)
+        }
+        if hasNoStatusContent {
+          VStack(alignment: .leading, spacing: 6) {
+            Label("No recent capture activity", systemImage: "checkmark.circle")
+              .font(.headline)
+            Text("Active saves, failures and retained originals will appear here.")
+              .font(.callout)
+              .foregroundStyle(.secondary)
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(18)
+          .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
+        }
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(16)
+    }
+    .frame(minWidth: 620, minHeight: 420)
+    .animation(reduceMotion ? nil : .snappy(duration: 0.28), value: saveQueue.progressItems)
+    .onAppear {
+      windowState.windowDidOpen()
+      Task { await saveQueue.refreshPhotosAuthorizationStatus() }
+      if !attentionCaptureIDs.isEmpty { isProgressExpanded = true }
+    }
+    .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification))
+    { _ in
+      Task { await saveQueue.refreshPhotosAuthorizationStatus() }
+    }
+    .onChange(of: attentionCaptureIDs) { oldValue, newValue in
+      if newValue.isEmpty {
+        if !oldValue.isEmpty { isProgressExpanded = false }
+      } else {
+        isProgressExpanded = true
+      }
+    }
+    .onDisappear { windowState.windowDidClose() }
+    .confirmationDialog(
+      "Delete retained capture?",
+      isPresented: Binding(
+        get: { deletionRequest != nil },
+        set: { if !$0 { deletionRequest = nil } }),
+      titleVisibility: .visible
+    ) {
+      Button("Delete Capture", role: .destructive) { confirmDeletion() }
+      Button("Cancel", role: .cancel) { deletionRequest = nil }
+    } message: {
+      if let deletionRequest {
+        if deletionRequest.fileNames.isEmpty {
+          Text(
+            "No staged image or source files remain. This removes only the recovery journal entry for \(deletionRequest.item.title). No Photos asset or exported file is affected."
+          )
+        } else {
+          Text(
+            "This permanently deletes \(deletionRequest.fileNames.joined(separator: ", ")) from PixelBooth's private staging folder for \(deletionRequest.item.title). It does not delete a Photos asset or any file saved with Save Original."
+          )
+        }
+      }
+    }
+  }
+
+  private var attentionCaptureIDs: [UUID] {
+    saveQueue.progressItems.filter(\.needsAttention).map(\.uuid)
+  }
+
+  private var hasNoStatusContent: Bool {
+    saveQueue.photosAuthorizationState.canAddPhotos
+      && saveQueue.recoveryError == nil
+      && saveQueue.capacityError == nil
+      && actionMessage == nil
+      && saveQueue.progressItems.isEmpty
+      && saveQueue.retainedItems.isEmpty
+      && saveQueue.dismissedRetainedItems.isEmpty
+  }
+
+  private func openPhotosSettings() {
+    let settingsApp = URL(fileURLWithPath: "/System/Applications/System Settings.app")
+    NSWorkspace.shared.open(settingsApp)
+  }
+
   private func retryCapture(_ item: CaptureProgressItem, confirmingPossibleDuplicate: Bool) {
     var confirmedPossibleDuplicate = confirmingPossibleDuplicate
     if item.needsDuplicateConfirmation && !confirmedPossibleDuplicate {
@@ -409,17 +644,19 @@ struct CaptureWindowView: View {
       confirmedPossibleDuplicate = true
     }
 
+    actionMessage = nil
     Task {
       do {
         try await saveQueue.queue.retry(
           uuid: item.uuid, confirmingPossibleDuplicate: confirmedPossibleDuplicate)
       } catch {
-        viewModel.lastResultText = "Retry failed: \(error.localizedDescription)"
+        actionMessage = "Retry failed: \(error.localizedDescription)"
       }
     }
   }
 
   private func saveOriginal(_ item: CaptureProgressItem) {
+    actionMessage = nil
     Task(priority: .userInitiated) {
       do {
         let fileName = try await saveQueue.queue.suggestedOriginalFileName(uuid: item.uuid)
@@ -431,22 +668,54 @@ struct CaptureWindowView: View {
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let destination = panel.url else { return }
         _ = try await saveQueue.queue.saveOriginal(uuid: item.uuid, to: destination)
-        viewModel.lastResultText = "Original saved to \(destination.lastPathComponent)"
+        actionMessage = "Original saved to \(destination.lastPathComponent)"
       } catch {
-        viewModel.lastResultText = "Could not save original: \(error.localizedDescription)"
+        actionMessage = "Could not save original: \(error.localizedDescription)"
       }
     }
   }
 
   private func dismissCapture(_ item: CaptureProgressItem) {
+    actionMessage = nil
     Task(priority: .userInitiated) {
       do {
-        try await saveQueue.queue.dismissUnsupportedCaptureFromProgress(uuid: item.uuid)
+        try await saveQueue.queue.dismissFailedCaptureFromProgress(uuid: item.uuid)
       } catch {
-        viewModel.lastResultText = "Could not dismiss capture: \(error.localizedDescription)"
+        actionMessage = "Could not dismiss capture: \(error.localizedDescription)"
       }
     }
   }
+
+  private func requestDeletion(_ item: CaptureProgressItem) {
+    actionMessage = nil
+    Task {
+      do {
+        let fileNames = try await saveQueue.queue.retainedFilesForDeletion(uuid: item.uuid)
+        deletionRequest = CaptureDeletionRequest(item: item, fileNames: fileNames)
+      } catch {
+        actionMessage = "Could not prepare capture deletion: \(error.localizedDescription)"
+      }
+    }
+  }
+
+  private func confirmDeletion() {
+    guard let request = deletionRequest else { return }
+    deletionRequest = nil
+    Task(priority: .userInitiated) {
+      do {
+        try await saveQueue.queue.deleteRetainedCapture(uuid: request.item.uuid)
+        await saveQueue.reconcileAndRefresh()
+        actionMessage = "Deleted retained capture and released its staging capacity."
+      } catch {
+        actionMessage = "Could not delete retained capture: \(error.localizedDescription)"
+      }
+    }
+  }
+}
+
+private struct CaptureDeletionRequest {
+  let item: CaptureProgressItem
+  let fileNames: [String]
 }
 
 private struct CaptureProgressSection: View {
@@ -575,6 +844,7 @@ private struct CameraStateCard: View {
 private struct RecoveryErrorBanner: View {
   let message: String
   let retry: () -> Void
+  let dismiss: () -> Void
 
   var body: some View {
     HStack(alignment: .top, spacing: 12) {
@@ -592,6 +862,9 @@ private struct RecoveryErrorBanner: View {
       Button("Retry Recovery", action: retry)
         .buttonStyle(.bordered)
         .accessibilityLabel("Retry capture recovery")
+      Button("Dismiss", action: dismiss)
+        .buttonStyle(.bordered)
+        .accessibilityLabel("Dismiss recovery error message")
     }
     .padding(12)
     .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
@@ -669,11 +942,14 @@ private struct PhotosAuthorizationBanner: View {
 
 private struct RetainedCapturesSection: View {
   let items: [CaptureProgressItem]
+  let onRetry: (CaptureProgressItem, Bool) -> Void
   let onSaveOriginal: (CaptureProgressItem) -> Void
   let onDismiss: (CaptureProgressItem) -> Void
+  let onDelete: (CaptureProgressItem) -> Void
+  @State private var isExpanded = true
 
   var body: some View {
-    DisclosureGroup("Retained captures (\(items.count))") {
+    DisclosureGroup("Retained captures (\(items.count))", isExpanded: $isExpanded) {
       ScrollView {
         LazyVStack(alignment: .leading, spacing: 8) {
           ForEach(items) { item in
@@ -688,10 +964,15 @@ private struct RetainedCapturesSection: View {
                 }
               }
               Spacer(minLength: 8)
-              Button("Save Original…") { onSaveOriginal(item) }
-                .accessibilityLabel("Save retained original for \(item.title)")
+              if !item.isPermanentlyUnencodable {
+                Button("Retry") { onRetry(item, false) }
+                Button("Save Original…") { onSaveOriginal(item) }
+                  .accessibilityLabel("Save retained original for \(item.title)")
+              }
               Button("Dismiss") { onDismiss(item) }
                 .accessibilityLabel("Dismiss retained capture \(item.title)")
+              Button("Delete Capture", role: .destructive) { onDelete(item) }
+                .accessibilityLabel("Delete retained capture \(item.title)")
             }
             .padding(.vertical, 5)
             if item.id != items.last?.id { Divider() }
@@ -709,14 +990,17 @@ private struct RetainedCapturesSection: View {
 
 private struct DismissedCapturesSection: View {
   let items: [CaptureProgressItem]
+  let onRetry: (CaptureProgressItem, Bool) -> Void
   let onSaveOriginal: (CaptureProgressItem) -> Void
   let onRestore: (CaptureProgressItem) -> Void
+  let onDelete: (CaptureProgressItem) -> Void
+  @State private var isExpanded = true
 
   var body: some View {
-    DisclosureGroup("Dismissed captures (\(items.count))") {
+    DisclosureGroup("Dismissed captures (\(items.count))", isExpanded: $isExpanded) {
       VStack(alignment: .leading, spacing: 8) {
         Text(
-          "These captures remain on this Mac. Restore one to the retained list when you need it."
+          "These captures are removed when PixelBooth quits. Restore one to keep it recoverable."
         )
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -732,7 +1016,12 @@ private struct DismissedCapturesSection: View {
                 }
                 Spacer(minLength: 8)
                 Button("Restore") { onRestore(item) }
-                Button("Save Original…") { onSaveOriginal(item) }
+                Button("Delete Capture", role: .destructive) { onDelete(item) }
+                  .accessibilityLabel("Delete dismissed capture \(item.title)")
+                if !item.isPermanentlyUnencodable {
+                  Button("Retry") { onRetry(item, false) }
+                  Button("Save Original…") { onSaveOriginal(item) }
+                }
               }
               .padding(.vertical, 5)
               if item.id != items.last?.id { Divider() }
@@ -824,6 +1113,22 @@ private struct CaptureInspectorView: View {
   }
 }
 
+private struct CaptureDetailsWindowView: View {
+  @ObservedObject private var viewModel = CaptureViewModel.shared
+  @ObservedObject private var windowState = CaptureDetailsWindowState.shared
+
+  var body: some View {
+    ScrollView {
+      CaptureInspectorView(viewModel: viewModel)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+    }
+    .frame(minWidth: 620, minHeight: 360)
+    .onAppear { windowState.windowDidOpen() }
+    .onDisappear { windowState.windowDidClose() }
+  }
+}
+
 private struct CaptureProgressRow: View {
   let item: CaptureProgressItem
   let onRetry: (Bool) -> Void
@@ -863,15 +1168,14 @@ private struct CaptureProgressRow: View {
           }
 
           HStack(spacing: 8) {
-            if item.isPermanentlyUnencodable {
-              Button("Dismiss", action: onDismiss)
-                .accessibilityLabel("Dismiss \(item.title) from capture progress")
-            } else {
+            if !item.isPermanentlyUnencodable {
               Button("Retry") { onRetry(false) }
                 .accessibilityLabel("Retry \(item.title)")
               Button("Save Original…", action: onSaveOriginal)
                 .accessibilityLabel("Save original for \(item.title)")
             }
+            Button("Dismiss", action: onDismiss)
+              .accessibilityLabel("Dismiss \(item.title) from capture progress")
           }
           .controlSize(.small)
         }
@@ -986,65 +1290,117 @@ struct SettingsView: View {
   @AppStorage("maximumAdjustingWaitMilliseconds") private var maximumAdjustingWaitMilliseconds =
     5000
   @AppStorage("frameRateOverride") private var frameRateOverride = 0.0
+  @State private var isAdvancedExpanded = false
 
   var body: some View {
     Form {
-      Section("General") {
-        Text("Captures are added to the System Photo Library.")
-          .font(.footnote)
-          .foregroundStyle(.secondary)
-        Toggle("Include Location", isOn: $includeLocation)
-        Stepper(value: $locationMaximumAge, in: 10...600, step: 10) {
-          Text("Maximum location age: \(Int(locationMaximumAge)) s")
+      Section {
+        LabeledContent("Save captures to") {
+          Label("System Photo Library", systemImage: "photo.on.rectangle.angled")
+            .foregroundStyle(.secondary)
         }
-        Text(
-          "Host location is the Mac's location, not necessarily a remote camera's location. Disabling this does not scrub location metadata already supplied by the camera."
-        )
-        .font(.footnote)
-        .foregroundStyle(.secondary)
-        Text(
-          "When enabled, PixelBooth asks for while-in-use Location Services access. A photo is saved without a host geotag if access is denied or no sufficiently recent location is available; the shutter never waits for a location fix."
-        )
-        .font(.footnote)
-        .foregroundStyle(.secondary)
+
+        LabeledContent("Self-timer") {
+          Picker("Self-timer", selection: $countdownSeconds) {
+            Text("Off").tag(0.0)
+            Text("3 seconds").tag(3.0)
+            Text("10 seconds").tag(10.0)
+          }
+          .labelsHidden()
+          .pickerStyle(.segmented)
+          .frame(maxWidth: 280)
+          .accessibilityLabel("Self-timer")
+        }
+      } header: {
+        Text("Capture")
+      } footer: {
+        Text("Captures are added directly to Photos.")
       }
-      Section("Capture") {
-        Picker("Self-timer", selection: $countdownSeconds) {
-          Text("Off").tag(0.0)
-          Text("3 seconds").tag(3.0)
-          Text("10 seconds").tag(10.0)
-        }
-        .pickerStyle(.segmented)
-        Picker("Maximum frame rate", selection: $frameRateOverride) {
-          Text("Mode maximum").tag(0.0)
-          Text("Up to 15 fps").tag(15.0)
-          Text("Up to 30 fps").tag(30.0)
-          Text("Up to 60 fps").tag(60.0)
-        }
-        Text(
-          "PixelBooth chooses the highest rate supported by this mode under the selected limit. Resolution and image precision stay unchanged."
-        )
-        .font(.footnote)
-        .foregroundStyle(.secondary)
-      }
+
       Section("Preview") {
         Toggle("Mirror Preview", isOn: $mirrorPreview)
+        Text(
+          "Mirroring changes the live view only. Saved image samples and orientation are unchanged."
+        )
+        .font(.footnote)
+        .foregroundStyle(.secondary)
       }
-      Section("Advanced Readiness") {
-        Stepper(
-          "Minimum fresh frames: \(minimumFreshFrames)", value: $minimumFreshFrames, in: 1...60)
-        Stepper(
-          "Minimum ms since valid start: \(minimumMillisecondsSinceValidStart)",
-          value: $minimumMillisecondsSinceValidStart, in: 100...5000, step: 100)
-        Stepper(
-          "Maximum adjusting wait: \(maximumAdjustingWaitMilliseconds) ms",
-          value: $maximumAdjustingWaitMilliseconds, in: 1000...20000, step: 500)
+
+      Section {
+        Toggle("Include Location", isOn: $includeLocation)
+
+        Stepper(value: $locationMaximumAge, in: 10...600, step: 10) {
+          LabeledContent("Maximum location age") {
+            Text("\(Int(locationMaximumAge)) seconds")
+              .monospacedDigit()
+          }
+        }
+        .disabled(!includeLocation)
+        .accessibilityHint("The maximum age of the Mac location that can be added to a capture")
+      } header: {
+        Text("Location")
+      } footer: {
+        Text(
+          "When enabled, PixelBooth requests while-in-use location access and uses this Mac's location. Capturing never waits for a location fix, and camera metadata remains unchanged."
+        )
+      }
+
+      DisclosureGroup(isExpanded: $isAdvancedExpanded) {
+        VStack(alignment: .leading, spacing: 12) {
+          LabeledContent("Maximum frame rate") {
+            Picker("Maximum frame rate", selection: $frameRateOverride) {
+              Text("Mode maximum").tag(0.0)
+              Text("Up to 15 fps").tag(15.0)
+              Text("Up to 30 fps").tag(30.0)
+              Text("Up to 60 fps").tag(60.0)
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .accessibilityLabel("Maximum frame rate")
+          }
+
+          Text(
+            "Limits the requested rate for the selected mode. Resolution and image precision stay unchanged."
+          )
+          .font(.footnote)
+          .foregroundStyle(.secondary)
+
+          Divider()
+
+          Text("Readiness")
+            .font(.subheadline.weight(.semibold))
+
+          Stepper(value: $minimumFreshFrames, in: 1...60) {
+            LabeledContent("Minimum fresh frames") {
+              Text("\(minimumFreshFrames) frames").monospacedDigit()
+            }
+          }
+
+          Stepper(value: $minimumMillisecondsSinceValidStart, in: 100...5000, step: 100) {
+            LabeledContent("Minimum time after stream start") {
+              Text("\(minimumMillisecondsSinceValidStart) milliseconds").monospacedDigit()
+            }
+          }
+
+          Stepper(value: $maximumAdjustingWaitMilliseconds, in: 1000...20000, step: 500) {
+            LabeledContent("Maximum adjusting wait") {
+              Text("\(maximumAdjustingWaitMilliseconds) milliseconds").monospacedDigit()
+            }
+          }
+
+          Text("Readiness uses fresh frames and a bounded wait while the camera adjusts.")
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+        }
+        .padding(.top, 8)
+      } label: {
+        Label("Advanced", systemImage: "slider.horizontal.3")
+          .font(.headline)
       }
     }
-    .padding()
     .frame(
-      minWidth: 420, idealWidth: 520, maxWidth: 680,
-      minHeight: 440, idealHeight: 560, maxHeight: 780
+      minWidth: 520, idealWidth: 620,
+      minHeight: 540, idealHeight: 660
     )
     .onChange(of: includeLocation) { _, _ in
       NotificationCenter.default.post(name: .pixelBoothLocationPreferencesChanged, object: nil)

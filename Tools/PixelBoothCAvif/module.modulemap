@@ -1,6 +1,6 @@
 module PixelBoothCAvifShim [system] {
   header "include/shim-header.h"
-  link "avif_internal"
+  link "avif"
   link "aom"
   requires c99
   export *

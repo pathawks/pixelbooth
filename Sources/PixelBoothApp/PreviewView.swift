@@ -48,15 +48,40 @@ final class CMIOFrameBox: @unchecked Sendable {
   // written after delivery.
   static let shared = CMIOFrameBox()
   private let lock = NSLock()
-  private var latest: CVPixelBuffer?
+  private var latest: Content?
+  private var expectedDeviceID: String?
+  private var expectedGeneration: Int?
 
-  func store(_ pb: CVPixelBuffer) {
+  enum Content {
+    case pixelBuffer(CVPixelBuffer)
+    case image(CGImage)
+  }
+
+  func beginConfiguration(deviceID: String, generation: Int) {
     lock.lock()
-    latest = pb
+    expectedDeviceID = deviceID
+    expectedGeneration = generation
+    latest = nil
     lock.unlock()
   }
 
-  func current() -> CVPixelBuffer? {
+  func store(_ pb: CVPixelBuffer, from frame: DeliveredFrame) {
+    lock.lock()
+    if expectedDeviceID == frame.deviceUniqueID, expectedGeneration == frame.generation {
+      latest = .pixelBuffer(pb)
+    }
+    lock.unlock()
+  }
+
+  func store(_ image: CGImage, from frame: DeliveredFrame) {
+    lock.lock()
+    if expectedDeviceID == frame.deviceUniqueID, expectedGeneration == frame.generation {
+      latest = .image(image)
+    }
+    lock.unlock()
+  }
+
+  func current() -> Content? {
     lock.lock()
     defer { lock.unlock() }
     return latest
@@ -65,15 +90,27 @@ final class CMIOFrameBox: @unchecked Sendable {
   func clear() {
     lock.lock()
     latest = nil
+    expectedDeviceID = nil
+    expectedGeneration = nil
     lock.unlock()
   }
 }
 
-/// Sink that publishes the most recent CMIO frame for preview rendering.
+/// Display-only CMIO route. JPEG decoding happens on this sink's bounded
+/// background queue; compressed H.264 is previewed from VideoToolbox output.
 final class CMIOFrameBoxSink: FrameSink {
   func receive(_ frame: DeliveredFrame) {
-    if let pb = CMSampleBufferGetImageBuffer(frame.sampleBuffer) {
-      CMIOFrameBox.shared.store(pb)
+    switch frame.previewRoute {
+    case .pixelBuffer:
+      if let pixelBuffer = CMSampleBufferGetImageBuffer(frame.sampleBuffer) {
+        CMIOFrameBox.shared.store(pixelBuffer, from: frame)
+      }
+    case .decodeJPEG:
+      if let image = CompressedPreviewDecoder.decodeJPEG(sampleBuffer: frame.sampleBuffer) {
+        CMIOFrameBox.shared.store(image, from: frame)
+      }
+    case .decodeH264, .unavailable:
+      break
     }
   }
 }
@@ -167,10 +204,14 @@ final class PreviewPreviewView: NSView {
   }
 
   private func renderCMIOFrame() {
-    guard let pb = CMIOFrameBox.shared.current() else { return }
-    var image = CIImage(cvPixelBuffer: pb)
+    guard let content = CMIOFrameBox.shared.current() else { return }
+    var image: CIImage
+    switch content {
+    case .pixelBuffer(let pixelBuffer): image = CIImage(cvPixelBuffer: pixelBuffer)
+    case .image(let cgImage): image = CIImage(cgImage: cgImage)
+    }
     if isMirrored {
-      let width = CGFloat(CVPixelBufferGetWidth(pb))
+      let width = image.extent.width
       // Mirror horizontally around the frame center; preview-only (spec).
       image = image.transformed(
         by: CGAffineTransform(scaleX: -1, y: 1).translatedBy(x: -width, y: 0))

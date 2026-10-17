@@ -162,7 +162,7 @@ public actor SaveQueueActor {
         return "Allow PixelBooth to add captures to Photos."
       case .denied:
         return
-          "Photos access is off. In System Settings, open Privacy & Security > Photos and enable PixelBooth."
+          "Photos access is off. In System Settings, open Privacy & Security > Photos and enable PixelBooth. If PixelBooth is missing, make sure you reopened the latest built PixelBooth.app. Save Original… remains available while Photos access is unavailable."
       case .restricted:
         return
           "Photos access is restricted on this Mac. Check Screen Time or device management settings."
@@ -190,6 +190,16 @@ public actor SaveQueueActor {
     case failedUnsupportedColorDescriptor
     case ambiguousImport
     case exportedOriginal
+
+    public var canDismissFromProgress: Bool {
+      switch self {
+      case .failedEncoding, .failedValidating, .failedAddingToPhotos, .failedDiskFull,
+        .failedUnsupportedColorDescriptor, .ambiguousImport:
+        return true
+      default:
+        return false
+      }
+    }
   }
 
   public struct JournalEntry: Codable, Sendable {
@@ -205,9 +215,14 @@ public actor SaveQueueActor {
     public var lastError: String?
     public var progressDismissed: Bool?
     public var retainedDismissed: Bool?
+    public var discardOnTermination: Bool?
+    /// Source, output and temporary-file allowance retained across relaunches.
+    /// Optional for journals written before buffered capture admission.
+    public var stagingReservationBytes: UInt64?
 
     public var isProgressDismissed: Bool { progressDismissed ?? false }
     public var isRetainedDismissed: Bool { retainedDismissed ?? false }
+    public var shouldDiscardOnTermination: Bool { discardOnTermination ?? false }
 
     public var isPermanentlyUnencodable: Bool {
       if stage == .failedUnsupportedColorDescriptor { return true }
@@ -221,7 +236,8 @@ public actor SaveQueueActor {
       fileHashSHA256: String? = nil, codec: String? = nil,
       encoderSettings: String? = nil, createdAt: Date, updatedAt: Date,
       codecFileName: String? = nil, lastError: String? = nil,
-      progressDismissed: Bool? = nil, retainedDismissed: Bool? = nil
+      progressDismissed: Bool? = nil, retainedDismissed: Bool? = nil,
+      discardOnTermination: Bool? = nil, stagingReservationBytes: UInt64? = nil
     ) {
       self.uuid = uuid
       self.stage = stage
@@ -235,6 +251,8 @@ public actor SaveQueueActor {
       self.lastError = lastError
       self.progressDismissed = progressDismissed
       self.retainedDismissed = retainedDismissed
+      self.discardOnTermination = discardOnTermination
+      self.stagingReservationBytes = stagingReservationBytes
     }
   }
 
@@ -260,7 +278,7 @@ public actor SaveQueueActor {
       case .busy: return "The save queue is busy. Try again shortly."
       case .capacityExceeded:
         return
-          "The local capture staging limit has been reached. Save or remove retained originals, then try again."
+          "The local capture staging limit has been reached. Wait for pending saves to finish, or save or remove retained originals, then try again."
       case .terminating: return "PixelBooth is finishing active captures before quitting."
       case .staging(let reason): return "Capture could not be stored safely: \(reason)"
       case .journal(let reason): return "The recovery journal is unavailable: \(reason)"
@@ -282,15 +300,17 @@ public actor SaveQueueActor {
   private static let changedNotification = Notification.Name("PixelBoothSaveQueueDidChange")
   public static var didChangeNotification: Notification.Name { changedNotification }
 
-  /// One active AVIF encoding job and a bounded thread budget: serializes
-  /// the archival stage without blocking the preview.
+  /// One active save pipeline, with AVIF work serialized by its own worker.
+  /// Waiting capture admission is independent of this processing limit.
   private var inFlightCount = 0
   private var maxInFlight = 1
   private var activeCaptures: Set<UUID> = []
   private var saveAsInProgress = false
   private var terminationRequested = false
   private var terminationWaiters: [CheckedContinuation<Void, Never>] = []
-  private var pendingRecoveryIDs: [UUID] = []
+  /// Waiting payloads live in durable staging, not in an in-memory image array.
+  /// The journal count and cumulative disk reservations bound this FIFO.
+  private var pendingCaptureIDs: [UUID] = []
   private var stagingRoot: URL
   private let saveAsWorker = SaveAsWorker()
   private let stagedFileValidationWorker = StagedFileValidationWorker()
@@ -319,7 +339,8 @@ public actor SaveQueueActor {
     }
   }
 
-  /// Stop accepting work after a quit request and report whether existing work must drain.
+  /// Stop accepting work and finish the active save. Waiting sources remain
+  /// durably staged for the next launch rather than prolonging termination.
   public func beginTermination() -> Bool {
     terminationRequested = true
     return inFlightCount > 0 || saveAsInProgress
@@ -330,6 +351,84 @@ public actor SaveQueueActor {
     guard terminationRequested, inFlightCount > 0 || saveAsInProgress else { return }
     await withCheckedContinuation { continuation in
       terminationWaiters.append(continuation)
+    }
+  }
+
+  /// Remove captures explicitly dismissed from retained recovery when the app
+  /// is quitting. The journal marker makes cleanup recoverable if termination
+  /// is interrupted after intent is recorded but before staged data is removed.
+  @discardableResult
+  public func discardDismissedCapturesOnTermination() throws -> Int {
+    guard terminationRequested else { throw QueueError.terminating }
+    guard inFlightCount == 0, !saveAsInProgress, activeCaptures.isEmpty else {
+      throw QueueError.busy
+    }
+
+    var entries = try readJournal()
+    let dismissedIDs = Set(
+      entries.filter {
+        $0.shouldDiscardOnTermination
+          || ($0.isProgressDismissed && $0.isRetainedDismissed
+            && $0.stage != .saved && $0.stage != .exportedOriginal)
+      }.map(\.uuid))
+    guard !dismissedIDs.isEmpty else { return 0 }
+
+    for index in entries.indices where dismissedIDs.contains(entries[index].uuid) {
+      entries[index].discardOnTermination = true
+      entries[index].updatedAt = Date()
+    }
+    try writeJournal(entries)
+
+    for uuid in dismissedIDs {
+      try removeStagingDirectoryForTermination(uuid)
+    }
+
+    entries.removeAll { $0.shouldDiscardOnTermination }
+    try writeJournal(entries)
+    return dismissedIDs.count
+  }
+
+  /// Names of the exact locally staged files a confirmed discard will remove.
+  /// Exported originals live outside the staging directory and are never listed.
+  public func retainedFilesForDeletion(uuid: UUID) throws -> [String] {
+    try requireDeletionIdle()
+    guard let entry = try readJournal().first(where: { $0.uuid == uuid }) else {
+      throw QueueError.missingOriginal(uuid)
+    }
+    guard entry.isProgressDismissed, entry.stage != .saved, entry.stage != .exportedOriginal else {
+      throw QueueError.originalUnavailable("only retained recovery captures can be deleted")
+    }
+    return try checkedStagingChildren(for: entry).map(\.lastPathComponent)
+  }
+
+  /// Durably records delete intent before removing any staged source or
+  /// finalized image. A crash or partial filesystem failure cannot schedule an
+  /// intentionally deleted capture for encoding or Photos import.
+  public func deleteRetainedCapture(uuid: UUID) throws {
+    guard !terminationRequested else { throw QueueError.terminating }
+    try requireDeletionIdle()
+    var entries = try readJournal()
+    guard let index = entries.firstIndex(where: { $0.uuid == uuid }) else {
+      throw QueueError.missingOriginal(uuid)
+    }
+    guard entries[index].isProgressDismissed,
+      entries[index].stage != .saved, entries[index].stage != .exportedOriginal
+    else {
+      throw QueueError.originalUnavailable("only retained recovery captures can be deleted")
+    }
+    _ = try checkedStagingChildren(for: entries[index])
+    entries[index].discardOnTermination = true
+    entries[index].updatedAt = Date()
+    try writeJournal(entries)
+
+    try removeStagingDirectoryForTermination(uuid)
+    entries.removeAll { $0.uuid == uuid }
+    try writeJournal(entries)
+  }
+
+  private func requireDeletionIdle() throws {
+    guard inFlightCount == 0, !saveAsInProgress, activeCaptures.isEmpty else {
+      throw QueueError.busy
     }
   }
 
@@ -345,15 +444,9 @@ public actor SaveQueueActor {
   /// Enqueue a capture; refuses when at capacity with a clear explanation.
   public func enqueue(_ capture: CapturedCapture) async throws {
     guard !terminationRequested else { throw QueueError.terminating }
-    guard inFlightCount < maxInFlight else {
-      throw QueueError.busy
-    }
     try writeStagingAndJournal(capture)
-    inFlightCount += 1
-    activeCaptures.insert(capture.uuid)
-    Task(priority: .utility) {
-      await process(capture)
-    }
+    pendingCaptureIDs.append(capture.uuid)
+    pumpPendingWork()
   }
 
   private func reportCapacityExhausted() {
@@ -383,9 +476,11 @@ public actor SaveQueueActor {
         throw QueueError.staging("capture UUID already has staged data")
       }
       let data = try JSONEncoder().encode(capture)
-      let existing = try readJournal()
+      let existing = try readJournal().filter {
+        $0.stage != .saved && $0.stage != .exportedOriginal
+      }
       guard existing.count < journalMaxEntries else { throw capacityExceededError() }
-      let used = try stagedByteCount()
+      let used = try reservedStagedByteCount(entries: existing)
       let required = try stagingCapacityReservation(for: capture, encodedSourceBytes: data.count)
       guard used <= maximumStagedBytes, required <= maximumStagedBytes - used else {
         throw capacityExceededError()
@@ -396,7 +491,8 @@ public actor SaveQueueActor {
       try upsertJournal(
         JournalEntry(
           uuid: capture.uuid, stage: .capturedLocally,
-          stagingPath: dir.path, createdAt: Date(), updatedAt: Date()))
+          stagingPath: dir.path, createdAt: Date(), updatedAt: Date(),
+          stagingReservationBytes: required))
       NotificationCenter.default.post(name: Self.changedNotification, object: nil)
     } catch let error as QueueError {
       throw error
@@ -410,7 +506,7 @@ public actor SaveQueueActor {
     defer {
       inFlightCount = max(0, inFlightCount - 1)
       activeCaptures.remove(capture.uuid)
-      Task { await self.pumpPendingWork() }
+      Task { self.pumpPendingWork() }
     }
     var importWasAttempted = false
     do {
@@ -687,6 +783,72 @@ public actor SaveQueueActor {
     stagingRoot.appendingPathComponent(uuid.uuidString, isDirectory: true)
   }
 
+  private func removeStagingDirectoryForTermination(_ uuid: UUID) throws {
+    guard let entry = try readJournal().first(where: { $0.uuid == uuid }) else { return }
+    let directory = stagingDirectory(uuid).standardizedFileURL
+    _ = try checkedStagingChildren(for: entry)
+    guard FileManager.default.fileExists(atPath: directory.path) else { return }
+    do {
+      try FileManager.default.removeItem(at: directory)
+      try synchronizeDirectory(stagingRoot)
+    } catch let error as QueueError {
+      throw error
+    } catch {
+      throw QueueError.staging(
+        "could not remove dismissed capture \(uuid.uuidString): \(error.localizedDescription)")
+    }
+  }
+
+  private func checkedStagingChildren(for entry: JournalEntry) throws -> [URL] {
+    let root = stagingRoot.standardizedFileURL
+    let directory = stagingDirectory(entry.uuid).standardizedFileURL
+    guard directory.deletingLastPathComponent().path == root.path,
+      URL(fileURLWithPath: entry.stagingPath).standardizedFileURL.path == directory.path
+    else {
+      throw QueueError.staging("capture staging path does not match its journal UUID")
+    }
+    guard !isSymlink(root), !isSymlink(directory) else {
+      throw QueueError.staging("capture staging path contains a symbolic link")
+    }
+    guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
+    let values = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+    guard values.isDirectory == true, values.isSymbolicLink != true else {
+      throw QueueError.staging("capture staging path is not a regular directory")
+    }
+    let allowedNames: Set<String> = ["capture.json", "capture.jpg", "capture.avif"]
+    let children = try FileManager.default.contentsOfDirectory(
+      at: directory, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+      options: [])
+    for child in children {
+      let childValues = try child.resourceValues(
+        forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+      guard
+        allowedNames.contains(child.lastPathComponent)
+          || isKnownAtomicTemporaryName(child.lastPathComponent),
+        childValues.isRegularFile == true,
+        childValues.isSymbolicLink != true
+      else {
+        throw QueueError.staging(
+          "capture staging directory contains an unexpected or symbolic-link item")
+      }
+    }
+    return children.sorted { $0.lastPathComponent < $1.lastPathComponent }
+  }
+
+  private func isKnownAtomicTemporaryName(_ name: String) -> Bool {
+    for destination in ["capture.json", "capture.jpg", "capture.avif"] {
+      let prefix = ".\(destination)."
+      guard name.hasPrefix(prefix), name.hasSuffix(".tmp") else { continue }
+      let identifierStart = name.index(name.startIndex, offsetBy: prefix.count)
+      let identifierEnd = name.index(name.endIndex, offsetBy: -4)
+      guard identifierStart <= identifierEnd,
+        UUID(uuidString: String(name[identifierStart..<identifierEnd])) != nil
+      else { continue }
+      return true
+    }
+    return false
+  }
+
   private func durableAtomicWrite(_ data: Data, to destination: URL) throws {
     let parent = destination.deletingLastPathComponent()
     try ensureDirectoryDurable(parent)
@@ -756,15 +918,15 @@ public actor SaveQueueActor {
     guard Darwin.fsync(fd) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
   }
 
-  private func stagedByteCount() throws -> UInt64 {
+  private func stagedByteCounts() throws -> [String: UInt64] {
     let items = try FileManager.default.contentsOfDirectory(
       at: stagingRoot,
       includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey],
       options: [])
-    return items.reduce(UInt64(0)) { total, item in
+    return items.reduce(into: [String: UInt64]()) { counts, item in
       guard let values = try? item.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
         values.isSymbolicLink != true
-      else { return total }
+      else { return }
       var subtotal = UInt64(
         max(0, (try? item.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0))
       if values.isDirectory == true {
@@ -779,9 +941,43 @@ public actor SaveQueueActor {
           subtotal = overflow ? UInt64.max : next
         }
       }
-      let (sum, overflow) = total.addingReportingOverflow(subtotal)
-      return overflow ? UInt64.max : sum
+      counts[item.lastPathComponent] = subtotal
     }
+  }
+
+  /// Count actual staging plus the unused portion of every outstanding
+  /// reservation. Merely counting existing files would let many small source
+  /// snapshots consume the space promised for waiting images' finalization.
+  private func reservedStagedByteCount(entries: [JournalEntry]) throws -> UInt64 {
+    let counts = try stagedByteCounts()
+    var total: UInt64 = 0
+    for count in counts.values {
+      let (next, overflow) = total.addingReportingOverflow(count)
+      guard !overflow else { throw capacityExceededError() }
+      total = next
+    }
+    for entry in entries {
+      let stored = counts[entry.uuid.uuidString] ?? 0
+      let reservation: UInt64
+      if let recorded = entry.stagingReservationBytes {
+        reservation = recorded
+      } else if let capture = try? loadCapture(entry.uuid) {
+        // Legacy journals have no reservation. Reconstruct it one source at a
+        // time so admission remains bounded even after an interrupted old save.
+        let source = stagingDirectory(entry.uuid).appendingPathComponent("capture.json")
+        let sourceBytes = try source.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        reservation = try stagingCapacityReservation(
+          for: capture, encodedSourceBytes: max(0, sourceBytes))
+      } else {
+        reservation = stored
+      }
+      if reservation > stored {
+        let (next, overflow) = total.addingReportingOverflow(reservation - stored)
+        guard !overflow else { throw capacityExceededError() }
+        total = next
+      }
+    }
+    return total
   }
 
   /// Reserve local source JSON, a conservative encoded output allowance, the
@@ -896,6 +1092,9 @@ public actor SaveQueueActor {
     guard let entry = try readJournal().first(where: { $0.uuid == uuid }) else {
       throw QueueError.missingOriginal(uuid)
     }
+    guard !entry.shouldDiscardOnTermination else {
+      throw QueueError.originalUnavailable("capture deletion is already pending")
+    }
     if entry.isPermanentlyUnencodable {
       throw QueueError.originalUnavailable(
         entry.lastError ?? "The saved capture lacks enough verified color metadata to encode.")
@@ -909,7 +1108,8 @@ public actor SaveQueueActor {
       throw QueueError.originalUnavailable("capture is already completed")
     }
     let capture = try loadCapture(uuid)
-    pendingRecoveryIDs.removeAll { $0 == uuid }
+    pendingCaptureIDs.removeAll { $0 == uuid }
+    try restoreCaptureToProgress(uuid: uuid)
     try updateJournal(uuid, stage: .encoding, error: nil)
     inFlightCount += 1
     activeCaptures.insert(uuid)
@@ -925,6 +1125,24 @@ public actor SaveQueueActor {
   /// is never retried without a deliberate user action.
   public func reconcileOnLaunch() async throws {
     var entries = try readJournal()  // corrupt journal is surfaced; never overwritten
+    let previouslyDismissedIDs = Set(
+      entries.filter {
+        $0.shouldDiscardOnTermination
+          || ($0.isProgressDismissed && $0.isRetainedDismissed
+            && $0.stage != .saved && $0.stage != .exportedOriginal)
+      }.map(\.uuid))
+    if !previouslyDismissedIDs.isEmpty {
+      for index in entries.indices where previouslyDismissedIDs.contains(entries[index].uuid) {
+        entries[index].discardOnTermination = true
+        entries[index].updatedAt = Date()
+      }
+      try writeJournal(entries)
+      for uuid in previouslyDismissedIDs {
+        try removeStagingDirectoryForTermination(uuid)
+      }
+      entries.removeAll { $0.shouldDiscardOnTermination }
+      try writeJournal(entries)
+    }
     try recoverOrphanedSources(entries: &entries)
     for entry in entries {
       if activeCaptures.contains(entry.uuid) { continue }
@@ -943,41 +1161,38 @@ public actor SaveQueueActor {
           entry.uuid, stage: .ambiguousImport,
           error: "Previous Photos request may have completed; confirm before retrying.")
       } else if [.capturing, .capturedLocally, .encoding, .validating].contains(entry.stage),
-        !pendingRecoveryIDs.contains(entry.uuid)
+        !pendingCaptureIDs.contains(entry.uuid)
       {
-        pendingRecoveryIDs.append(entry.uuid)
+        pendingCaptureIDs.append(entry.uuid)
       }
     }
-    await pumpPendingWork()
+    pumpPendingWork()
     NotificationCenter.default.post(name: Self.changedNotification, object: nil)
   }
 
-  private func pumpPendingWork() async {
+  private func pumpPendingWork() {
     guard !terminationRequested else {
       resumeTerminationWaitersIfIdle()
       return
     }
-    guard inFlightCount < maxInFlight, !pendingRecoveryIDs.isEmpty else { return }
-    let uuid = pendingRecoveryIDs.removeFirst()
-    guard !activeCaptures.contains(uuid) else {
-      await pumpPendingWork()
-      return
-    }
-    do {
-      guard let latest = try readJournal().first(where: { $0.uuid == uuid }),
-        [.capturing, .capturedLocally, .encoding, .validating].contains(latest.stage)
-      else {
-        await pumpPendingWork()
+    guard inFlightCount < maxInFlight, !saveAsInProgress else { return }
+    while !pendingCaptureIDs.isEmpty {
+      let uuid = pendingCaptureIDs.removeFirst()
+      if activeCaptures.contains(uuid) { continue }
+      do {
+        guard let latest = try readJournal().first(where: { $0.uuid == uuid }),
+          !latest.shouldDiscardOnTermination,
+          [.capturing, .capturedLocally, .encoding, .validating].contains(latest.stage)
+        else { continue }
+        let capture = try loadCapture(uuid)
+        try updateJournal(uuid, stage: .encoding)
+        inFlightCount += 1
+        activeCaptures.insert(uuid)
+        Task(priority: .utility) { await process(capture) }
         return
+      } catch {
+        try? updateJournal(uuid, stage: .failedEncoding, error: error.localizedDescription)
       }
-      let capture = try loadCapture(uuid)
-      try updateJournal(uuid, stage: .encoding)
-      inFlightCount += 1
-      activeCaptures.insert(uuid)
-      Task(priority: .utility) { await process(capture) }
-    } catch {
-      try? updateJournal(uuid, stage: .failedEncoding, error: error.localizedDescription)
-      await pumpPendingWork()
     }
   }
 
@@ -1026,9 +1241,13 @@ public actor SaveQueueActor {
     defer {
       saveAsInProgress = false
       resumeTerminationWaitersIfIdle()
+      Task { self.pumpPendingWork() }
     }
     guard let entry = try readJournal().first(where: { $0.uuid == uuid }) else {
       throw QueueError.missingOriginal(uuid)
+    }
+    guard !entry.shouldDiscardOnTermination else {
+      throw QueueError.originalUnavailable("capture deletion is already pending")
     }
     if entry.isPermanentlyUnencodable {
       throw QueueError.originalUnavailable(
@@ -1036,11 +1255,19 @@ public actor SaveQueueActor {
     }
     let wasActive = activeCaptures.contains(uuid)
     if !wasActive { activeCaptures.insert(uuid) }
-    pendingRecoveryIDs.removeAll { $0 == uuid }
+    let pendingIndex = pendingCaptureIDs.firstIndex(of: uuid)
+    pendingCaptureIDs.removeAll { $0 == uuid }
     defer {
       if !wasActive {
         activeCaptures.remove(uuid)
-        Task { await self.pumpPendingWork() }
+        if let pendingIndex,
+          let latest = try? readJournal().first(where: { $0.uuid == uuid }),
+          [.capturing, .capturedLocally, .encoding, .validating].contains(latest.stage)
+        {
+          // A failed explicit export must not strand a waiting capture until
+          // relaunch. Successful exports have a terminal journal state.
+          pendingCaptureIDs.insert(uuid, at: min(pendingIndex, pendingCaptureIDs.count))
+        }
       }
     }
     var finalized: (url: URL, hashHex: String)
@@ -1098,19 +1325,31 @@ public actor SaveQueueActor {
     return destination
   }
 
-  /// Hide a permanently unsupported capture from progress without deleting its source.
-  public func dismissUnsupportedCaptureFromProgress(uuid: UUID) throws {
+  /// Hide an inactive failed capture without deleting its immutable source or finalized file.
+  public func dismissFailedCaptureFromProgress(uuid: UUID) throws {
     var entries = try readJournal()
     guard let index = entries.firstIndex(where: { $0.uuid == uuid }) else {
       throw QueueError.missingOriginal(uuid)
     }
-    guard entries[index].isPermanentlyUnencodable else {
-      throw QueueError.originalUnavailable("only permanently unsupported captures can be dismissed")
+    guard !activeCaptures.contains(uuid), entries[index].stage.canDismissFromProgress else {
+      throw QueueError.originalUnavailable("only inactive failed captures can be dismissed")
     }
-    entries[index].stage = .failedUnsupportedColorDescriptor
+    if entries[index].isPermanentlyUnencodable {
+      entries[index].stage = .failedUnsupportedColorDescriptor
+    }
     entries[index].progressDismissed = true
-    entries[index].retainedDismissed = false
+    entries[index].retainedDismissed = true
     entries[index].updatedAt = Date()
+    try writeJournal(entries)
+  }
+
+  private func restoreCaptureToProgress(uuid: UUID) throws {
+    var entries = try readJournal()
+    guard let index = entries.firstIndex(where: { $0.uuid == uuid }) else {
+      throw QueueError.missingOriginal(uuid)
+    }
+    entries[index].progressDismissed = false
+    entries[index].retainedDismissed = false
     try writeJournal(entries)
   }
 
@@ -1131,6 +1370,9 @@ public actor SaveQueueActor {
     }
     guard entries[index].isProgressDismissed, entries[index].stage != .exportedOriginal else {
       throw QueueError.originalUnavailable("capture is not in retained recovery")
+    }
+    guard !entries[index].shouldDiscardOnTermination else {
+      throw QueueError.originalUnavailable("capture deletion is already pending")
     }
     entries[index].retainedDismissed = dismissed
     entries[index].updatedAt = Date()

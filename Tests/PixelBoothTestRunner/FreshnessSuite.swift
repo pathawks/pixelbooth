@@ -66,6 +66,25 @@ private func makeFrame(
 func runFreshnessSuite() async {
   suite("Freshness")
 
+  await test("latestFrameMailboxBoundsPendingUncompressedWork") {
+    let mailbox = LatestFrameMailbox<Int>()
+    let shouldStartDrain = mailbox.offer(1)
+    let scheduledAgain = mailbox.offer(2)
+    check(shouldStartDrain, "first frame schedules one drain loop")
+    check(!scheduledAgain, "new frames replace the one pending value")
+    check(mailbox.takeNext() == 2, "drain loop receives the newest pending frame")
+
+    let scheduledWhileProcessing = mailbox.offer(3)
+    let replacedWhileProcessing = mailbox.offer(4)
+    check(!scheduledWhileProcessing && !replacedWhileProcessing, "active drain remains unique")
+    check(mailbox.takeNext() == 4, "only the newest waiting frame remains pending")
+    check(mailbox.takeNext() == nil, "empty mailbox ends the drain loop")
+
+    check(mailbox.offer(5), "a later frame starts a fresh drain loop")
+    check(mailbox.takeNext() == 5, "the later frame is preserved")
+    check(mailbox.takeNext() == nil, "the restarted drain loop terminates")
+  }
+
   // Regression: one frame arrives, then delivery stops. The last frame's
   // media timestamp and the store's newest observed timestamp stay equal
   // forever, so comparing frames only with each other kept reporting fresh

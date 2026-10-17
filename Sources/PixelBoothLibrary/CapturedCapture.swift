@@ -306,6 +306,9 @@ public struct CapturedCapture: Sendable, Codable {
     from frame: DeliveredFrame, metadata: FrameMetadataSnapshot,
     acquisitionEvidence: AcquisitionEvidence? = nil
   ) throws {
+    let sourceSampleBuffer = frame.sourceSampleBuffer ?? frame.sampleBuffer
+    try FrameExtraction.validateProgressiveFrame(
+      sampleBuffer: frame.sampleBuffer, sourceSampleBuffer: frame.sourceSampleBuffer)
     let pixelBuffer = frame.sampleBuffer.imageBuffer
     let dimensions: (width: Int, height: Int)
     if !PixelFormatFourCC.isJPEG(frame.fourCC), let pixelBuffer {
@@ -328,17 +331,22 @@ public struct CapturedCapture: Sendable, Codable {
     self.acceptedAtISO = frame.hostWallClockISO
     self.color = try Self.colorDescriptor(
       pixelBuffer,
-      formatDescription: CMSampleBufferGetFormatDescription(
-        frame.sourceSampleBuffer ?? frame.sampleBuffer))
+      formatDescription: CMSampleBufferGetFormatDescription(sourceSampleBuffer))
     self.acquisitionEvidence = acquisitionEvidence
     // Snapshot the immutable payload at acceptance.
     if PixelFormatFourCC.isJPEG(frame.sourceFourCC) {
       // MJPEG: complete JPEG passthrough, byte-exact.
       self.payload = .jpegBytes(
-        try FrameExtraction.extractJPEG(from: frame.sourceSampleBuffer ?? frame.sampleBuffer))
+        try FrameExtraction.extractJPEG(from: sourceSampleBuffer))
     } else if let pb = pixelBuffer {
       // Uncompressed: adapt and snapshot contiguous planes (padding excluded).
-      self.payload = .planes(try FrameExtraction.snapshot(pb, fourCC: frame.fourCC))
+      self.payload = .planes(
+        try FrameExtraction.snapshot(
+          pb, fourCC: frame.fourCC,
+          formatDescriptions: [
+            CMSampleBufferGetFormatDescription(frame.sampleBuffer),
+            CMSampleBufferGetFormatDescription(sourceSampleBuffer),
+          ]))
     } else {
       throw AdapterError.unsupportedFourCC(frame.fourCC)
     }
@@ -415,11 +423,10 @@ public struct CapturedCapture: Sendable, Codable {
       return Int(code)
     }
     let format = CVPixelBufferGetPixelFormatType(pb)
-    let range: CaptureFormat.YUVRange? =
-      format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-      ? .full
-      : (format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        || format == PixelFormatFourCC.twoVuy || format == PixelFormatFourCC.yuvs ? .limited : nil)
+    let range = CaptureFormatFacts.applying(
+      to: CaptureFormat(
+        width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb), fourCC: format)
+    ).yuvRange
     let topChromaValue = try attachment(kCVImageBufferChromaLocationTopFieldKey)
     let bottomChromaValue = try attachment(kCVImageBufferChromaLocationBottomFieldKey)
     if let topChromaValue, let bottomChromaValue, !CFEqual(topChromaValue, bottomChromaValue) {

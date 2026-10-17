@@ -8,10 +8,10 @@
 	<true/>
 	<key>com.apple.security.personal-information.location</key>
 	<true/>
-	<!-- Add-only access is the minimum PhotoKit authorization for
-	     Photos-first saving. Library *browsing* is requested only for the
-	     optional integration check, and never required for routine captures. -->
-	<key>com.apple.security.photos.add</key>
+	<!-- macOS requires the documented Photos resource entitlement even when
+	     PhotoKit requests only PHAccessLevel.addOnly. This entitlement does
+	     not replace the user's separate runtime authorization decision. -->
+	<key>com.apple.security.personal-information.photos-library</key>
 	<true/>
 	<!-- User-selected files: used for the explicit Save Original…
 	     folder destination and security-scoped retry paths. -->

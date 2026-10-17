@@ -1,1 +1,2 @@
 /* Privacy prompt strings (English) */
+"NSLocationWhenInUseUsageDescription" = "PixelBooth can add the Mac's current location to capture metadata when Include Location is enabled.";

@@ -33,7 +33,7 @@ let package = Package(
       linkerSettings: [
         .unsafeFlags([
           "-L", "vendor/build/avif",
-          "-lavif_internal",
+          "-lavif",
           "-L", "vendor/build/aom",
           "-laom",
           "-target", "arm64-apple-macos27.0",
@@ -78,7 +78,7 @@ let package = Package(
       name: "PixelBoothTestRunner",
       dependencies: ["PixelBoothCore", "PixelBoothAdapters", "PixelBoothJPEG", "PixelBoothAVIF", "PixelBoothMetadata", "PixelBoothLibrary", "PixelBoothCapture"],
       path: "Tests/PixelBoothTestRunner",
-      resources: [.copy("Fixtures/h264-synthetic.264")]
+      resources: [.copy("Fixtures")]
     ),
   ],
   swiftLanguageModes: [.v6]

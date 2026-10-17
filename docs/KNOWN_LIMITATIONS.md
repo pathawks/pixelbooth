@@ -33,7 +33,8 @@
 
 ## Automated tests and implementation acceptance
 
-- **86 tests pass, 0 fail; 1 test is explicitly `NOT RUN`** (`PixelBoothTestRunner`): selection/timing, image fidelity
+- **93 tests pass, 0 fail** (`PixelBoothTestRunner`, October 12, 2026,
+  macOS 27.0.1 build 26A434): selection/timing, image fidelity
   (random + edge-value fixtures, supported depths/layouts, odd dims, padded
   strides, packed/bi-planar adapters, high-bit-depth packing, alpha, full and
   limited range with superblack/superwhite — exact native-sample comparison
@@ -66,13 +67,12 @@
   independent of the mode-selection observer, and an unconfigurable selection
   tears the previous stream down) and mode identity is device-qualified and
   unit-tested; no live switch was performed in this environment.
-- **H.264 input**: the decoder and encoded-fixture pipeline are implemented,
-  but the fixture acceptance test cannot create a VideoToolbox session on this
-  host (`kVTVideoDecoderMalfunctionErr`, `-12911`). The encoded fixture and
-  CoreMedia format/sample description are valid; no decoded output or
-  decoder-to-AVIF round trip was observed. A host with a functioning VideoToolbox
-  decoder is required before this capability can be called verified. No H.264
-  mode was exposed by the available cameras.
+- **Live H.264 input and wider source representations**: the synthetic 8-bit
+  encoded-fixture-to-AVIF test passed on macOS 27.0.1 on October 12, 2026.
+  This supersedes the older decoder-session failure (`-12911`) for that
+  fixture only. No live H.264 camera was tested in this review. The decoder
+  requests 8-bit, limited-range 4:2:0 output; preservation of other source
+  representations is unverified and needs an explicit fidelity gate.
 - **BGR24 live delivery**: the production packed-RGB adapter, snapshot, and
   exact AVIF round trip pass with a padded-stride fixture. CoreVideo refused a
   synthetic 24BG buffer in the local test setup (`-6680`), and no physical
@@ -98,3 +98,12 @@
 HEIC output, mixed-codec HEIF, embedded H.264 tracks, video recording, burst
 mode, filters, beautification, editing, Photos-library browser, analytics,
 accounts, telemetry, app-controlled uploads.
+
+## Remaining implementation findings
+
+Interlaced samples, JPEG metadata/completeness, and MJPEG acquisition-policy
+handling have known gaps. Camera-switching, preview, queue-bounding and staging-
+capacity issues also require further work. The Photos entitlement, capture
+dismissal controls, 10-bit range propagation, completed-history capacity check
+and app notice packaging have been corrected. Live Photos authorization/import
+and interactive UI acceptance remain manual.

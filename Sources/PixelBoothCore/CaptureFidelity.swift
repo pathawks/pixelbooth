@@ -119,7 +119,7 @@ public struct AcquisitionEvidence: Hashable, Sendable, Codable {
   }
 }
 
-public enum CaptureFidelityError: Error, Equatable, Sendable {
+public enum CaptureFidelityError: Error, Equatable, LocalizedError, Sendable {
   case contradictoryFourCCFacts(UInt32)
   case staleDevice(expected: String, delivered: String)
   case staleGeneration(expected: Int, delivered: Int)
@@ -129,6 +129,35 @@ public enum CaptureFidelityError: Error, Equatable, Sendable {
   case chromaChanged(selected: String, delivered: String)
   case rangeChanged(selected: String, delivered: String)
   case chromaLocationChanged(selected: String, delivered: String)
+  case jpegCodingDataUnavailable(selected: String, delivered: String)
+
+  public var errorDescription: String? {
+    switch self {
+    case .contradictoryFourCCFacts(let fourCC):
+      return
+        "The reported facts contradict the \(CaptureFormat.fourCCString(fourCC)) representation."
+    case .staleDevice(let expected, let delivered):
+      return "The frame came from camera \(delivered), but camera \(expected) is selected."
+    case .staleGeneration(let expected, let delivered):
+      return
+        "The frame belongs to configuration \(delivered), but configuration \(expected) is active."
+    case .dimensionsChanged(let selected, let delivered):
+      return "The selected dimensions are \(selected), but macOS delivered \(delivered)."
+    case .bitDepthChanged(let selected, let delivered):
+      return "The selected bit depth is \(selected), but macOS delivered \(delivered)."
+    case .colorModelChanged(let selected, let delivered):
+      return "The selected color model is \(selected), but macOS delivered \(delivered)."
+    case .chromaChanged(let selected, let delivered):
+      return "The selected chroma sampling is \(selected), but macOS delivered \(delivered)."
+    case .rangeChanged(let selected, let delivered):
+      return "The selected YUV range is \(selected), but macOS delivered \(delivered)."
+    case .chromaLocationChanged(let selected, let delivered):
+      return "The selected chroma location is \(selected), but macOS delivered \(delivered)."
+    case .jpegCodingDataUnavailable(let selected, let delivered):
+      return
+        "The selected \(selected) mode requires camera JPEG coding data, but macOS delivered \(delivered). Select a mode that delivers JPEG data or choose the delivered mode explicitly."
+    }
+  }
 }
 
 public enum AcquisitionPolicy {
@@ -153,6 +182,13 @@ public enum AcquisitionPolicy {
     }
     let selected = CaptureFormatFacts.applying(to: selected)
     let delivered = CaptureFormatFacts.applying(to: delivered)
+    let selectedFamily = PixelFormatFourCC.codecFamily(selected.fourCC)
+    let deliveredFamily = PixelFormatFourCC.codecFamily(delivered.fourCC)
+    if selectedFamily == .nativeJPEG && deliveredFamily != .nativeJPEG {
+      throw CaptureFidelityError.jpegCodingDataUnavailable(
+        selected: CaptureFormat.fourCCString(selected.fourCC),
+        delivered: CaptureFormat.fourCCString(delivered.fourCC))
+    }
     func model(_ f: CaptureFormat) -> String? {
       switch PixelFormatFourCC.codecFamily(f.fourCC) {
       case .uncompressedRGB: return "RGB"
@@ -186,18 +222,24 @@ public enum AcquisitionPolicy {
       selected.fourCC == delivered.fourCC && selected.bitsPerChannel == delivered.bitsPerChannel
       && (selected.chromaSampling == nil || selected.chromaSampling == delivered.chromaSampling)
       && (selected.yuvRange == nil || selected.yuvRange == delivered.yuvRange)
+    // MJPG, jpeg and dmb1 are recognized spellings for the same native JPEG
+    // coding-data path. A spelling change is not a decoded-pixel conversion;
+    // FrameExtraction still validates and retains the complete JPEG payload.
+    let equivalentJPEG = selectedFamily == .nativeJPEG && deliveredFamily == .nativeJPEG
+    let representationPreserved = exact || equivalentJPEG
     let conversion =
-      exact
+      representationPreserved
       ? []
       : [
         "Selected \(CaptureFormat.fourCCString(selected.fourCC)); macOS delivered \(CaptureFormat.fourCCString(delivered.fourCC))."
       ]
-    let verifiedNative = exact && upstreamNoConversionEstablished
+    let verifiedNative = representationPreserved && upstreamNoConversionEstablished
     return AcquisitionEvidence(
       deviceUniqueID: deviceUniqueID, generation: generation,
       selectedFormat: selected, deliveredFormat: delivered,
       fidelity: verifiedNative
-        ? .nativePreserved : (exact ? .macDeliveredUnknownUpstream : .macDeliveredConverted),
+        ? .nativePreserved
+        : (representationPreserved ? .macDeliveredUnknownUpstream : .macDeliveredConverted),
       knownConversions: conversion)
   }
 }

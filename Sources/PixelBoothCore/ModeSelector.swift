@@ -34,6 +34,18 @@ public enum ModeSelector {
     }
   }
 
+  /// Resolve a remembered selection, migrating the former rate-based ID only
+  /// when it identifies one unambiguous representation in the current list.
+  public static func rememberedMode(id: String, in modes: [CameraMode]) -> CameraMode? {
+    if let exact = modes.first(where: { $0.id == id }) {
+      return exact
+    }
+    let matches = modes.filter { $0.matchesLegacyRateBasedID(id) }
+    let identities = Set(matches.map(\.id))
+    guard identities.count == 1 else { return nil }
+    return matches.first
+  }
+
   public static func compare(_ a: CameraMode, _ b: CameraMode) -> ComparisonResult {
     let areaA = a.dimensions.width * a.dimensions.height
     let areaB = b.dimensions.width * b.dimensions.height
