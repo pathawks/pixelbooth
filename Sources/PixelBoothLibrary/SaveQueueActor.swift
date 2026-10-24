@@ -16,7 +16,7 @@ import PixelBoothMetadata
 
 /// Isolated, high-priority destination worker for explicit Save Original… actions.
 /// Streaming copy keeps memory bounded and never overwrites a user-selected file.
-private actor SaveAsWorker {
+actor SaveAsWorker {
   func exportIfMatching(
     finalizedFile: URL, stagingDirectory: URL, expectedHash: String, to destination: URL
   ) throws -> Bool {
@@ -133,59 +133,6 @@ private actor StagedFileValidationWorker {
 
   private static func isSymlink(_ url: URL) -> Bool {
     (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true
-  }
-}
-
-/// Serializes all AOM work so Save As can request the same encoder without
-/// competing with a background Photos encode or exceeding the thread budget.
-private actor AVIFEncodingWorker {
-  private let estimator = DepthAnythingV2Estimator()
-  private let testDisparityEstimator: (@Sendable ([UInt8]) async throws -> RelativeDisparityMap)?
-  private var encoding = false
-  private var waiters: [CheckedContinuation<Void, Never>] = []
-
-  init(disparityEstimator: (@Sendable ([UInt8]) async throws -> RelativeDisparityMap)? = nil) {
-    self.testDisparityEstimator = disparityEstimator
-  }
-
-  func encode(
-    _ capture: CapturedCapture, exifPayload: [UInt8], xmpPayload: [UInt8],
-    portraitRenderIntent: PortraitRenderIntent?
-  ) async throws -> (
-    data: [UInt8], settings: LosslessAVIF.AppliedSettings, disparity: AVIFDisparity.Descriptor?
-  ) {
-    // Keep the entire job serialized across the estimator actor hop, including
-    // an overlapping explicit Save Original request. No second AOM job starts
-    // while a primary image and its derived map are in flight.
-    if encoding {
-      await withCheckedContinuation { waiters.append($0) }
-    }
-    encoding = true
-    defer {
-      if waiters.isEmpty {
-        encoding = false
-      } else {
-        waiters.removeFirst().resume()
-      }
-    }
-    try Task.checkCancellation()
-    let primary = try capture.encodeAVIF(exifPayload: exifPayload, xmpPayload: xmpPayload)
-    guard capture.metadata.includeEstimatedDisparity == true else {
-      return (primary.data, primary.settings, nil)
-    }
-    let map: RelativeDisparityMap
-    if let testDisparityEstimator {
-      map = try await testDisparityEstimator(primary.data)
-    } else {
-      map = try await estimator.estimate(avifData: primary.data)
-    }
-    let result = try AVIFDisparity.attach(
-      to: primary.data, width: map.width, height: map.height,
-      relativeDisparity: map.values,
-      modelIdentifier: map.modelIdentifier,
-      preprocessingDescription: map.preprocessingDescription,
-      outputDescription: map.outputDescription, portraitRenderIntent: portraitRenderIntent)
-    return (result.data, primary.settings, result.descriptor)
   }
 }
 
@@ -362,7 +309,7 @@ public actor SaveQueueActor {
   private var stagingRoot: URL
   private let saveAsWorker = SaveAsWorker()
   private let stagedFileValidationWorker = StagedFileValidationWorker()
-  private let avifEncodingWorker: AVIFEncodingWorker
+  private let imageFinalizer: CaptureImageFinalizer
   private let journalMaxEntries = 200
   private let maximumStagedBytes: UInt64
   private let testImporter: (@Sendable (URL, Date) async -> ImportResult)?
@@ -375,7 +322,7 @@ public actor SaveQueueActor {
     photosAuthorizationProvider: (@Sendable (Bool) async -> PhotosAuthorizationState)? = nil,
     disparityEstimator: (@Sendable ([UInt8]) async throws -> RelativeDisparityMap)? = nil
   ) {
-    self.avifEncodingWorker = AVIFEncodingWorker(disparityEstimator: disparityEstimator)
+    self.imageFinalizer = CaptureImageFinalizer(disparityEstimator: disparityEstimator)
     self.testImporter = importer
     self.testPhotosAuthorizationProvider = photosAuthorizationProvider
     self.maximumStagedBytes = maximumStagedBytes
@@ -619,121 +566,14 @@ public actor SaveQueueActor {
     }
   }
 
-  /// Produce the finalized file from the immutable payload:
-  /// - MJPEG: JPEG passthrough with documented additional XMP metadata.
-  /// - Uncompressed: lossless AVIF with verified native-channel round trip.
+  /// Produce the same verified final image used by every destination.
   private func finalize(_ capture: CapturedCapture) async throws -> (
     url: URL, hashHex: String, codec: String, settings: String
   ) {
-    let dir = stagingRoot.appendingPathComponent(capture.uuid.uuidString, isDirectory: true)
-    switch capture.payload {
-    case .jpegBytes(let bytes):
-      // Metadata-only addition; image-coding data stays byte-exact. Never
-      // replace or rewrite camera Exif (it may contain unknown tags or
-      // MakerNotes). When no source Exif exists, add a standards-based Exif
-      // block with the host capture time and optional accepted location.
-      let jpegStructure = try JPEGParser.parse(bytes)
-      let generatedExif: [UInt8] =
-        jpegStructure.exifSegment == nil
-        ? ExifBuilder.build(
-          make: capture.metadata.deviceIdentity?.manufacturer
-            ?? capture.metadata.hostObservedDeviceMake,
-          model: capture.metadata.deviceIdentity?.model ?? capture.metadata.hostObservedDeviceModel,
-          software: "PixelBooth \(AppVersion.current)",
-          captureISO: capture.acceptedAtISO,
-          location: capture.metadata.hostLocation)
-        : []
-      let additionalExif = generatedExif.isEmpty ? nil : generatedExif
-      let xmp = PixelBoothXMP.build(
-        captureUUID: capture.uuid, appVersion: AppVersion.current,
-        captureBackend: capture.metadata.captureBackend ?? "unknown",
-        backendVersion: capture.metadata.captureBackendVersion ?? "unknown",
-        libavifVersion: LosslessAVIF.libraryVersion,
-        actualCaptureFormat:
-          "\(CaptureFormat.fourCCString(capture.pixelFourCC ?? capture.fourCC)) \(capture.width)×\(capture.height)",
-        encoderSettings: "metadata-only",
-        metadataProvenance: try Self.deviceIdentityProvenance(capture)
-          + capture.archivedMetadataProvenance(),
-        fidelity: capture.acquisitionEvidence.map { Self.fidelityName($0.fidelity) } ?? "unknown",
-        hostLocation: capture.metadata.hostLocation,
-        mediaTimeNanos: capture.timestampNanos,
-        wallClockAnchorISO: capture.metadata.wallClockAnchorISO,
-        sourceFormat: CaptureFormat.fourCCString(capture.fourCC),
-        dataSource: String(describing: capture.dataSource ?? .unknown))
-      let withMeta = try JPEGMetadataWriter.withAdditionalMetadata(
-        original: bytes, additionalXMP: xmp, additionalExif: additionalExif)
-      let url = dir.appendingPathComponent("capture.jpg")
-      try durableAtomicWrite(Data(withMeta), to: url)
-      let digest = SHA256.hash(data: withMeta)
-      let hex = digest.map { String(format: "%02x", $0) }.joined()
-      return (url, hex, "jpeg-passthrough", "metadata-only")
-
-    case .planes(let snapshot):
-      let dimensions = try snapshot.nativeDimensions()
-      let portraitRenderIntent =
-        capture.metadata.includeEstimatedDisparity == true
-        ? try PortraitRenderIntent(primaryWidth: dimensions.width, primaryHeight: dimensions.height)
-        : nil
-      // Lossless AVIF from planes, verified by exact native-channel decode.
-      // Metadata: the same application XMP provenance model as the JPEG path,
-      // plus Exif carrying the host-observed device identity and capture time
-      // (Photos reads Exif; the XMP labels that provenance as host-observed —
-      // never presented as camera-provided metadata).
-      let provenance =
-        try Self.deviceIdentityProvenance(capture) + capture.archivedMetadataProvenance()
-      let generatedXMP = PixelBoothXMP.build(
-        captureUUID: capture.uuid, appVersion: AppVersion.current,
-        captureBackend: capture.metadata.captureBackend ?? "unknown",
-        backendVersion: capture.metadata.captureBackendVersion ?? "unknown",
-        libavifVersion: LosslessAVIF.libraryVersion,
-        actualCaptureFormat:
-          "\(CaptureFormat.fourCCString(capture.pixelFourCC ?? capture.fourCC)) \(dimensions.width)×\(dimensions.height)",
-        encoderSettings: "quality=100 speed=0 (lossless, round-trip verified)",
-        metadataProvenance: provenance,
-        fidelity: capture.acquisitionEvidence.map { Self.fidelityName($0.fidelity) } ?? "unknown",
-        hostLocation: capture.metadata.hostLocation,
-        mediaTimeNanos: capture.timestampNanos,
-        wallClockAnchorISO: capture.metadata.wallClockAnchorISO,
-        sourceFormat: CaptureFormat.fourCCString(capture.fourCC),
-        dataSource: String(describing: capture.dataSource ?? .unknown),
-        portraitRenderIntent: portraitRenderIntent)
-      let xmp: [UInt8]
-      if let sourceXMP = capture.metadata.embeddedSourceXMP {
-        xmp = try JPEGMetadataWriter.mergingXMP(source: sourceXMP, additional: generatedXMP)
-      } else {
-        xmp = generatedXMP
-      }
-      let exif =
-        capture.metadata.embeddedSourceExif
-        ?? ExifBuilder.build(
-          make: capture.metadata.deviceIdentity?.manufacturer
-            ?? capture.metadata.hostObservedDeviceMake,
-          model: capture.metadata.deviceIdentity?.model ?? capture.metadata.hostObservedDeviceModel,
-          software: "PixelBooth \(AppVersion.current)",
-          captureISO: capture.acceptedAtISO,
-          location: capture.metadata.hostLocation)
-      let (data, settings, disparity) = try await avifEncodingWorker.encode(
-        capture, exifPayload: exif, xmpPayload: xmp, portraitRenderIntent: portraitRenderIntent)
-      let url = dir.appendingPathComponent("capture.avif")
-      try durableAtomicWrite(Data(data), to: url)
-      let digest = SHA256.hash(data: data)
-      let hex = digest.map { String(format: "%02x", $0) }.joined()
-      var appliedSettings = "quality=\(settings.quality) speed=\(settings.speed)"
-      if let disparity {
-        appliedSettings +=
-          "; DepthAnythingV2 estimated relative disparity \(disparity.width)×\(disparity.height) fdis/L008, lossless storage verified"
-        appliedSettings += "; model=\(disparity.modelIdentifier)"
-        if let scale = disparity.renderingScale {
-          appliedSettings +=
-            "; application relative render scale=\(scale.rawValue) \(disparity.nativeMinimumDisparity)…\(disparity.nativeMaximumDisparity)"
-        }
-        if let intent = disparity.portraitRenderIntent {
-          appliedSettings +=
-            "; application render intent v1: simulated aperture \(intent.simulatedAperture), center focus; Photos Portrait recognition unverified"
-        }
-      }
-      return (url, hex, settings.codec, appliedSettings)
-    }
+    let image = try await imageFinalizer.finalize(capture)
+    let url = stagingDirectory(capture.uuid).appendingPathComponent(image.fileName)
+    try durableAtomicWrite(image.data, to: url)
+    return (url, image.hashHex, image.codec, image.settings)
   }
 
   /// PhotoKit original-resource creation with the finished file — never an
@@ -1073,51 +913,15 @@ public actor SaveQueueActor {
     return total
   }
 
-  /// Reserve local source JSON, a conservative encoded output allowance, the
-  /// temporary output used by atomic finalization, and bounded journal space.
-  /// The limit is checked before creating the per-capture directory so a
-  /// refused capture leaves no orphan staging folder.
   private func stagingCapacityReservation(
     for capture: CapturedCapture, encodedSourceBytes: Int
   ) throws -> UInt64 {
-    let sourceBytes: UInt64
-    switch capture.payload {
-    case .jpegBytes(let bytes):
-      sourceBytes = UInt64(bytes.count)
-    case .planes(let snapshot):
-      sourceBytes = try snapshot.contiguous.reduce(into: UInt64(0)) { total, plane in
-        let (next, overflow) = total.addingReportingOverflow(UInt64(plane.count))
-        guard !overflow else { throw capacityExceededError() }
-        total = next
-      }
-    }
-    let (doubledOutput, outputOverflow) = sourceBytes.multipliedReportingOverflow(by: 2)
-    guard !outputOverflow else { throw capacityExceededError() }
-    var outputReserve = max(doubledOutput, 4 * 1024 * 1024)
-    if capture.metadata.attachmentArchive != nil || capture.metadata.deviceIdentity != nil
-      || capture.metadata.streamColorObservations != nil
-    {
-      let metadataBytes = try JSONEncoder().encode(capture.metadata).count
-      let (metadataReserve, overflow) = UInt64(metadataBytes).multipliedReportingOverflow(by: 8)
-      let (withMetadata, additionOverflow) = outputReserve.addingReportingOverflow(metadataReserve)
-      guard !overflow, !additionOverflow else { throw capacityExceededError() }
-      outputReserve = withMetadata
-    }
-    if case .planes = capture.payload, capture.metadata.includeEstimatedDisparity == true {
-      // Configurations allow at most 1,048,576 gray8 samples. Include a
-      // conservative encoding/metadata allowance for output and its atomic copy.
-      let (withDisparity, overflow) = outputReserve.addingReportingOverflow(2 * 1024 * 1024)
-      guard !overflow else { throw capacityExceededError() }
-      outputReserve = withDisparity
-    }
-    let (sourceAndOutput, firstOverflow) = UInt64(encodedSourceBytes).addingReportingOverflow(
-      outputReserve)
-    let (withTemporary, secondOverflow) = sourceAndOutput.addingReportingOverflow(outputReserve)
-    let (required, thirdOverflow) = withTemporary.addingReportingOverflow(2 * 1024 * 1024)
-    guard !firstOverflow, !secondOverflow, !thirdOverflow else {
+    do {
+      return try CaptureStagingCapacity.reservation(
+        for: capture, encodedSourceBytes: encodedSourceBytes)
+    } catch {
       throw capacityExceededError()
     }
-    return required
   }
 
   private func captureDate(_ capture: CapturedCapture) -> Date {
@@ -1127,80 +931,6 @@ public actor SaveQueueActor {
     let legacy = ISO8601DateFormatter()
     legacy.formatOptions = [.withInternetDateTime]
     return legacy.date(from: capture.acceptedAtISO) ?? Date()
-  }
-
-  private static func fidelityName(_ fidelity: AcquisitionFidelity) -> String {
-    switch fidelity {
-    case .nativePreserved: return "nativePreserved"
-    case .macDeliveredConverted: return "macDeliveredConverted"
-    case .macDeliveredUnknownUpstream: return "macDeliveredUnknownUpstream"
-    }
-  }
-
-  /// Host-observed device identity provenance for the application XMP. The
-  /// backend-reported device manufacturer/name are labeled hostObserved; the
-  /// Exif mirror is labeled applicationGenerated.
-  private static func deviceIdentityProvenance(_ capture: CapturedCapture) -> [MetadataObservation]
-  {
-    var provenance: [MetadataObservation] = []
-    if let make = capture.metadata.hostObservedDeviceMake, !make.isEmpty {
-      provenance.append(
-        MetadataObservation(
-          key: "DeviceMake", rawValueString: make, provenance: .hostObserved))
-    }
-    if let model = capture.metadata.hostObservedDeviceModel, !model.isEmpty {
-      provenance.append(
-        MetadataObservation(
-          key: "DeviceModel", rawValueString: model, provenance: .hostObserved))
-    }
-    if let modelID = capture.metadata.hostObservedDeviceModelID, !modelID.isEmpty {
-      provenance.append(
-        MetadataObservation(
-          key: "DeviceModelID", rawValueString: modelID, provenance: .hostObserved))
-    }
-    if let usb = capture.metadata.usbIdentity {
-      let values: [(String, String?)] = [
-        ("USBVendorID", String(format: "0x%04X", usb.vendorID)),
-        ("USBProductID", String(format: "0x%04X", usb.productID)),
-        ("USBLocationID", String(format: "0x%08X", usb.locationID)),
-        ("USBManufacturerString", usb.manufacturer), ("USBProductString", usb.productName),
-        ("USBAssociationMethod", usb.associationMethod),
-      ]
-      for (key, value) in values {
-        if let value {
-          provenance.append(
-            MetadataObservation(
-              key: key, rawValueString: value, provenance: .hostObserved,
-              observedAtISO: usb.observedAtISO))
-        }
-      }
-    }
-    if let identity = capture.metadata.deviceIdentity {
-      if let value = identity.manufacturer, let source = identity.manufacturerSource {
-        provenance.append(
-          MetadataObservation(
-            key: "ResolvedDeviceMake", rawValueString: value,
-            provenance: source.provenance))
-        provenance.append(
-          MetadataObservation(
-            key: "DeviceMakeSource", rawValueString: source.rawValue,
-            provenance: .applicationGenerated))
-      }
-      if let value = identity.model, let source = identity.modelSource {
-        provenance.append(
-          MetadataObservation(
-            key: "ResolvedDeviceModel", rawValueString: value,
-            provenance: source.provenance))
-      }
-    }
-    provenance.append(
-      MetadataObservation(
-        key: "ExifMakeModelMirroredFromHostObservedDeviceIdentity",
-        rawValueString: capture.metadata.embeddedSourceExif == nil
-          && capture.metadata.deviceIdentity == nil
-          ? "true" : "false",
-        provenance: .applicationGenerated))
-    return provenance
   }
 
   private func existingFinalized(_ uuid: UUID) async throws -> (

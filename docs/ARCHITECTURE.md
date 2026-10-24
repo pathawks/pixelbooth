@@ -76,3 +76,70 @@ converting. Metadata parsing bounds-checks segment lengths before reads.
 codec-name verification, image allocation). Swift code never touches libaom
 internals, and the encoder's `codecChoice` is verified to be AOM after every
 write — automatic codec substitution is impossible.
+
+## Command-line frontend
+
+`PixelBoothCLI` takes one photograph through the shared `CaptureFrameIngest`,
+immutable-frame, metadata and `CaptureImageFinalizer` pipeline, writes the
+result, prints its destination and exits. `SinglePhotoCapture` owns automatic
+selection and the acquisition deadline. `StandaloneCaptureExporter` owns CLI
+source staging, isolated journals and atomic file/stdout completion. It does
+not request Photos access or import into Photos.
+
+- Rank all eligible external USB camera/mode pairs using the existing order:
+  pixel area, width, uncompressed before MJPEG before H.264, meaningful bit
+  depth, chroma detail, maximum frame rate, then stable identifier.
+  CLI color-detail ranking treats RGB's per-pixel components as equivalent to
+  4:4:4; the comparator's default preserves the GUI's existing ranking. USB
+  classification must survive unavailable identity-enrichment fields. Exclude
+  virtual and Continuity cameras from automatic selection. If no external USB
+  camera exists, use the built-in camera's highest supported mode. If a USB
+  camera exists but cannot capture a supported representation, report failure.
+- Select among modes the archival pipeline supports. Preserve the existing
+  adapter restrictions and the current maximum of 12 meaningful bits per
+  channel; 16-bit storage words do not establish 16-bit sample precision.
+- After camera authorization, allow `--timeout SECONDS` (positive integer,
+  default 10) for discovery, configuration,
+  warm-up and acquisition of an acceptable immutable frame. Reuse freshness,
+  generation and readiness checks; stop acquisition and exit nonzero on timeout.
+  Stop the camera after retaining the photograph. Encoding, estimated-disparity
+  model preparation and final validation are outside the acquisition deadline.
+- Default to `~/Pictures`. Use `--output-dir DIRECTORY` for a generated filename
+  and `--output FILE` for an explicit filename; reject conflicting arguments.
+  Generated names must avoid collisions. Refuse to overwrite existing files
+  by default and publish only fully validated files, atomically.
+- Keep MJPEG as JPEG and uncompressed/decoded H.264 as AVIF. Reject an explicit
+  filename extension that conflicts with the actual output representation.
+  A successful file save prints only the absolute destination path and newline
+  to stdout. `--output -` emits only standard base64 of the complete finalized
+  image, without line wrapping, followed by a newline. Diagnostics use stderr;
+  a broken pipe or incomplete output is a failure.
+- Retain recoverable staged data and diagnostics on encoding, saving,
+  cancellation or stdout failure, and print its recovery location to stderr.
+  Isolate CLI journal ownership from GUI work and concurrent CLI processes.
+  `--recover DIRECTORY` retries retained source/finalized data without camera
+  access, preserving the original metadata and processing choice.
+- CLI defaults for host location and estimated disparity are disabled and
+  independent of GUI preferences. Preserve camera-supplied metadata. Any
+  enabled disparity uses the same pinned model and verified auxiliary path.
+
+`scripts/build_cli.sh` provides a separate CLT-compatible build path targeting
+arm64 and macOS 27. Native dependency preparation also needs CMake, Ninja and
+pkg-config. The CLI is an ordinary command-line executable with embedded
+camera usage metadata and ad-hoc hardened-runtime signing with camera access.
+It uses process filesystem permissions for explicit output paths. First-use
+camera authorization may require interaction; the GUI has its own App Sandbox
+entitlements and Photos destination policy.
+
+Model preparation uses Xcode's `coremlcompiler` when available, with a CLT-built
+helper fallback calling the public
+[`MLModel.compileModel(at:)`](https://developer.apple.com/documentation/coreml/mlmodel/compilemodel(at:)-45ao6)
+API. Compiled artifacts are persisted atomically and cached by source identity,
+OS/Core ML runtime and toolchain/helper identity. Preparation retains the pinned
+source checksum, license and model-interface checks and completes before
+capture; there are no capture-time downloads. `build_cli.sh --with-disparity`
+packages resources beside the executable for explicit `--estimated-disparity`.
+
+- [ ] TODO: investigate exact 16-bit AVIF through `sato` sample transforms.
+  Add native-channel reconstruction, metadata and decoder-compatibility
+  validation before advertising support; keep this outside the initial CLI.

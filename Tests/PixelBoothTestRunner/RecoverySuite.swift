@@ -530,7 +530,10 @@ func runRecoverySuite() async {
     let capture = CapturedCapture.makeTestCapture(
       fourCC: 0x4e56_3132, width: 4, height: 2,
       payload: .planes(syntheticNV12Snapshot(width: 4, height: 2)))
-    let queue = SaveQueueActor(stagingRoot: root.appendingPathComponent("staging"))
+    let queue = SaveQueueActor(
+      stagingRoot: root.appendingPathComponent("staging"),
+      importer: { _, _ in .failed("Synthetic importer; Photos access disabled in automated tests") }
+    )
     try await queue.enqueue(capture)
     let entry = try await waitForStage(
       queue, id: capture.uuid, [.failedUnsupportedColorDescriptor])
@@ -568,7 +571,10 @@ func runRecoverySuite() async {
     let legacyCapture = CapturedCapture.makeTestCapture(
       fourCC: 0x4e56_3132, width: 4, height: 2,
       payload: .planes(syntheticNV12Snapshot(width: 4, height: 2)))
-    let legacyQueue = SaveQueueActor(stagingRoot: legacyRoot.appendingPathComponent("staging"))
+    let legacyQueue = SaveQueueActor(
+      stagingRoot: legacyRoot.appendingPathComponent("staging"),
+      importer: { _, _ in .failed("Synthetic importer; Photos access disabled in automated tests") }
+    )
     try await legacyQueue.enqueue(legacyCapture)
     _ = try await waitForStage(
       legacyQueue, id: legacyCapture.uuid, [.failedUnsupportedColorDescriptor])
@@ -749,7 +755,10 @@ func runRecoverySuite() async {
     journal["entries"] = entries
     try JSONSerialization.data(withJSONObject: journal).write(to: journalURL)
 
-    let relaunched = SaveQueueActor(stagingRoot: root.appendingPathComponent("staging"))
+    let relaunched = SaveQueueActor(
+      stagingRoot: root.appendingPathComponent("staging"),
+      importer: { _, _ in .failed("Synthetic importer; Photos access disabled in automated tests") }
+    )
     try await relaunched.reconcileOnLaunch()
     let directory = root.appendingPathComponent("staging", isDirectory: true)
       .appendingPathComponent(capture.uuid.uuidString, isDirectory: true)
@@ -774,7 +783,10 @@ func runRecoverySuite() async {
     let sourceDirectory = root.appendingPathComponent("staging", isDirectory: true)
       .appendingPathComponent(capture.uuid.uuidString, isDirectory: true)
 
-    let relaunched = SaveQueueActor(stagingRoot: root.appendingPathComponent("staging"))
+    let relaunched = SaveQueueActor(
+      stagingRoot: root.appendingPathComponent("staging"),
+      importer: { _, _ in .failed("Synthetic importer; Photos access disabled in automated tests") }
+    )
     try await relaunched.reconcileOnLaunch()
     try requireRecovery(
       try await relaunched.entries().isEmpty, "dismissed journal row is removed on relaunch")
@@ -813,7 +825,10 @@ func runRecoverySuite() async {
     let journal = root.appendingPathComponent("journal.json")
     let corrupt = Data("{bad journal".utf8)
     try corrupt.write(to: journal)
-    let queue = SaveQueueActor(stagingRoot: root.appendingPathComponent("staging"))
+    let queue = SaveQueueActor(
+      stagingRoot: root.appendingPathComponent("staging"),
+      importer: { _, _ in .failed("Synthetic importer; Photos access disabled in automated tests") }
+    )
     do {
       try await queue.reconcileOnLaunch()
       throw RecoveryAssertion.failed("corrupt journal accepted")

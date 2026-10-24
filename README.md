@@ -21,9 +21,9 @@ image data** and **explaining exactly what was saved**.
 
 Requirements:
 - Apple Silicon Mac
-- macOS 27.0 SDK and full Xcode 27 for app builds. The headless test runner can
-  be built with Command Line Tools, but they cannot load the SwiftUI macro plugin
-  required by the app target.
+- macOS 27.0 SDK. The CLI and headless test runner build with Command Line
+  Tools 27; GUI app builds require full Xcode 27 for the SwiftUI macro plugin.
+- CMake, Ninja and pkg-config for the pinned native codec dependencies
 - Python 3.9 or newer for model preparation (Xcode's `/usr/bin/python3` works)
 - Camera permission when running the app
 
@@ -59,11 +59,114 @@ captures recoverable for the next launch.
 |---------|---------|
 | `scripts/validate.sh` | Strict lint, pinned native deps, debug app/test builds, automated tests; does not assemble `.app` |
 | `scripts/build_app.sh` | Strict lint, release build, and assembly; replaces `build/PixelBooth.app` |
+| `scripts/build_cli.sh` | CLT-compatible release build and ad-hoc signing of `build/pixelbooth` |
 | `swift format lint --strict --recursive Sources Tests Tools` | Check formatting and Swift style rules |
 | `swift build --product PixelBooth` | Executable only |
+| `swift build --product PixelBoothCLI` | CLI executable only; use `build_cli.sh` for signing and optional resources |
 | `swift run --skip-build PixelBoothTestRunner` | Automated test suite |
 | `scripts/fetch_deps.sh` | Re-fetch/rebuild libavif 1.3.0 + libaom 3.13.1 (checksum-verified) |
 | `scripts/fetch_depth_model.sh` | Fetch, verify, and compile the selected pinned DepthAnythingV2 Core ML model |
+
+## Command-line capture
+
+The CLI takes one photograph through the shared capture and preservation
+pipeline, saves it, prints the absolute filename and exits. It requires Apple
+Silicon and macOS 27.0 or later. Build it with Command Line Tools 27, without
+full Xcode:
+
+```sh
+scripts/build_cli.sh
+build/pixelbooth
+build/pixelbooth --timeout 20 --output-dir ./photos
+build/pixelbooth --output ./photo.avif
+build/pixelbooth --output - > photo.base64
+```
+
+The CLI build defaults `DEVELOPER_DIR` to `/Library/Developer/CommandLineTools`
+and does not load the GUI's `.env.local` override. Native codec preparation
+requires CMake, Ninja and pkg-config in addition to CLT; for example,
+`brew install cmake ninja pkg-config`. Source archives are pinned and
+checksum-verified. The resulting executable is signed ad hoc, with embedded
+camera privacy metadata. It uses ordinary process filesystem permissions and
+macOS camera authorization. First-use authorization may require an interactive
+terminal session. No Photos or host-location access is requested.
+
+Automatic selection compares supported camera/mode pairs across connected
+external USB cameras. It ranks pixel area, width, uncompressed before MJPEG
+before H.264, meaningful bit depth, chroma detail, maximum frame rate and
+stable identifier, in that order. USB eligibility does not depend on successful
+descriptor enrichment. For color-detail ranking, RGB's full per-pixel components
+tie with 4:4:4 sampling. If no external USB camera exists, it selects the best
+supported built-in camera mode. Virtual and Continuity cameras are excluded.
+An unavailable or unsupported USB camera produces an error rather than
+switching to another camera group. Selection never promises sensor-native
+acquisition; the same macOS-delivered preservation boundary applies.
+
+`--timeout SECONDS` accepts positive integer seconds and defaults to **10**.
+It covers discovery, configuration, warm-up and acquisition after camera
+authorization. Encoding and validation are outside that deadline. The camera
+is stopped after the immutable photograph is retained. A timeout exits nonzero.
+
+The default directory is `~/Pictures`. `--output-dir` creates a unique
+capture-UUID filename with the actual image extension; `--output` uses an
+explicit filename verbatim. Missing destination directories are created.
+Existing files are never overwritten. MJPEG remains JPEG; uncompressed and
+decoded H.264 samples become verified lossless AVIF. A supplied extension must
+match that result (`.jpg`/`.jpeg` or `.avif`); an extensionless name is allowed.
+Specifying `.avif` cannot force a JPEG-mode camera capture through recompression.
+
+With `--output -`, stdout contains only standard base64 of the complete finalized
+image, without wrapping, followed by a newline. Successful file output prints
+only the absolute saved path and newline. All diagnostics use stderr. Exit
+codes are 0 for success, 2 for argument errors, 3 for camera permission failure,
+1 for other failures, and 128 plus the signal number for interruption.
+
+Accepted sources and metadata are durably staged under
+`~/Library/Application Support/PixelBoothCLI/staging`, with per-capture journals
+and cross-process locks. Staging is bounded to 512 MiB and 200 retained captures.
+Encoding, output or interruption failures retain recovery evidence and report
+its directory on stderr. Retry a retained capture without opening a camera:
+
+```sh
+build/pixelbooth --recover /path/from/the/diagnostic --output-dir ./recovered
+```
+
+Ordinary staging is removed after confirmed output success. Captures with
+metadata diagnostic reports retain their local evidence. Recovery preserves
+the original capture-time metadata and disparity choice.
+
+Estimated disparity is disabled by default, independently of GUI preferences.
+To include the same verified auxiliary processing, prepare the pinned model
+and license with the CLI build, then request it explicitly:
+
+```sh
+scripts/build_cli.sh --with-disparity
+build/pixelbooth --estimated-disparity --timeout 10
+```
+
+Resources are stored beside the executable in `pixelbooth-resources`. An
+explicit pair of `PIXELBOOTH_DEPTH_CONFIGURATION` and `PIXELBOOTH_DEPTH_MODEL`
+paths is also supported. CLT model preparation uses a small Swift helper and
+the public `MLModel.compileModel(at:)` API when `coremlcompiler` is unavailable.
+There are no capture-time model downloads. `--help` and `--version` do not
+access a camera. Exact 16-bit AVIF through `sato` remains a deferred TODO;
+initial support retains the current adapters and maximum 12 meaningful bits.
+
+Run the synthetic pipeline and camera-free CLI integration tests with CLT:
+
+```sh
+export DEVELOPER_DIR=/Library/Developer/CommandLineTools
+scripts/build_cli.sh --with-disparity
+swift build --product PixelBoothTestRunner
+PIXELBOOTH_DEPTH_MODEL="$PWD/build/pixelbooth-resources/PixelBoothDepth.mlmodelc" \
+  PIXELBOOTH_DEPTH_CONFIGURATION="$PWD/build/pixelbooth-resources/DepthModel.json" \
+  PIXELBOOTH_CLI_EXECUTABLE="$PWD/build/pixelbooth" \
+  "$(swift build --show-bin-path)/PixelBoothTestRunner"
+```
+
+These tests include actual pinned-model inference on synthetic images and
+CLI retries from synthetic retained captures. They do not activate cameras
+or access a Photos library. Hardware-dependent checks remain manual.
 
 ## Estimated disparity in AVIF
 
@@ -76,7 +179,8 @@ The checked-in build choices are Apple's Apache-2.0 Core ML conversions of
 **DepthAnythingV2 Small F16** (default) and **Small F32**. Inference runs locally
 during encoding, once per photograph. No model download or network access
 happens during capture. Build scripts fetch the pinned model files with
-SHA-256 verification and compile them with Xcode.
+SHA-256 verification and compile them with Xcode's compiler or a CLT-built
+helper using public Core ML APIs.
 
 Choose a public build variant explicitly:
 
@@ -165,10 +269,11 @@ claim Portrait support.
 
 ## Project-local Xcode selection
 
-The build scripts leave the machine-wide `xcode-select` setting unchanged. If
+The GUI build scripts leave the machine-wide `xcode-select` setting unchanged. If
 it points to Command Line Tools, copy `.env.local.example` to `.env.local` and
 set `DEVELOPER_DIR` to the full Xcode Developer directory. The scripts load
 that file only when `DEVELOPER_DIR` is not already set in the environment.
+CLI and model preparation scripts use their CLT-compatible toolchain setup.
 
 ## The fidelity contract, in short
 

@@ -10,19 +10,32 @@ import PixelBoothCore
 
 /// An enumerated camera with the identity information we could actually read.
 public struct CameraDevice: Identifiable, Hashable, Sendable {
+  public enum Kind: String, Hashable, Sendable {
+    case builtIn, external, other
+  }
+
   public var uniqueID: String
   public var localizedName: String
   public var modelID: String?
   public var manufacturer: String?
   public var deviceConnected: Bool
   public var usbIdentity: USBDeviceIdentity?
+  /// Device type and transport are acquisition API observations, independent
+  /// of optional USB descriptor enrichment.
+  public var kind: Kind
+  public var transportType: UInt32?
+
+  public var isExternalUSB: Bool {
+    kind == .external && transportType == UInt32(kAudioDeviceTransportTypeUSB)
+  }
 
   public var id: String { uniqueID }
 
   public init(
     uniqueID: String, localizedName: String,
     modelID: String? = nil, manufacturer: String? = nil,
-    deviceConnected: Bool = true, usbIdentity: USBDeviceIdentity? = nil
+    deviceConnected: Bool = true, usbIdentity: USBDeviceIdentity? = nil,
+    kind: Kind = .other, transportType: UInt32? = nil
   ) {
     self.uniqueID = uniqueID
     self.localizedName = localizedName
@@ -30,6 +43,8 @@ public struct CameraDevice: Identifiable, Hashable, Sendable {
     self.manufacturer = manufacturer
     self.deviceConnected = deviceConnected
     self.usbIdentity = usbIdentity
+    self.kind = kind
+    self.transportType = transportType
   }
 }
 
@@ -57,33 +72,38 @@ public actor CaptureDiscovery {
           deviceUID: dev.uniqueID,
           isUSBTransport: UInt32(bitPattern: dev.transportType)
             == UInt32(kAudioDeviceTransportTypeUSB),
-          records: usbRecords))
+          records: usbRecords),
+        kind: dev.deviceType == .builtInWideAngleCamera
+          ? .builtIn
+          : dev.deviceType == .external ? .external : .other,
+        transportType: UInt32(bitPattern: dev.transportType))
     }
   }
 
   public func enumerateModes(for device: AVCaptureDevice) -> [CameraMode] {
-    device.formats.map { formatDescription in
-      let desc = formatDescription.formatDescription
-      let dims = CMVideoFormatDescriptionGetDimensions(desc)
-      let fourCC = CMFormatDescriptionGetMediaSubType(desc)
-      // Frame-rate ranges.
-      let ranges = formatDescription.videoSupportedFrameRateRanges
-      let supported = ranges.map {
-        SupportedFrameRateRange(
-          minimum: 1.0 / $0.maxFrameDuration.seconds,
-          maximum: 1.0 / $0.minFrameDuration.seconds)
-      }
-      let minRate = supported.map(\.minimum).min() ?? 0
-      let maxRate = supported.map(\.maximum).max() ?? 0
+    Self.advertisedModes(for: device)
+  }
+
+  /// Stable AVFoundation format identities and understood representation facts.
+  public static func advertisedModes(
+    for device: AVCaptureDevice, formats: [AVCaptureDevice.Format]? = nil
+  ) -> [CameraMode] {
+    (formats ?? device.formats).enumerated().map { index, format in
+      let description = format.formatDescription
+      let dimensions = CMVideoFormatDescriptionGetDimensions(description)
+      let fourCC = CMFormatDescriptionGetMediaSubType(description)
+      let ranges = format.videoSupportedFrameRateRanges
+      let minimum = ranges.map { 1.0 / $0.maxFrameDuration.seconds }.min() ?? 0
+      let maximum = ranges.map { 1.0 / $0.minFrameDuration.seconds }.max() ?? 0
+      let facts = CaptureFormatFacts.applying(
+        to: CaptureFormat(
+          width: Int(dimensions.width), height: Int(dimensions.height), fourCC: fourCC))
       return CameraMode(
-        deviceID: device.uniqueID,
-        formatID: nil,
-        mediaSubType: fourCC,
-        dimensions: (Int(dims.width), Int(dims.height)),
-        minFrameRate: minRate,
-        maxFrameRate: maxRate,
-        pixelFormat: fourCC,
-        isHighestFrameRate: false)
+        deviceID: device.uniqueID, formatID: String(index), mediaSubType: fourCC,
+        dimensions: (Int(dimensions.width), Int(dimensions.height)),
+        minFrameRate: minimum, maxFrameRate: maximum, pixelFormat: fourCC,
+        bitsPerChannel: facts.bitsPerChannel, chromaSampling: facts.chromaSampling,
+        yuvRange: facts.yuvRange)
     }
   }
 

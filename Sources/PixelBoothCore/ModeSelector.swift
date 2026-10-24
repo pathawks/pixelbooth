@@ -46,7 +46,12 @@ public enum ModeSelector {
     return matches.first
   }
 
-  public static func compare(_ a: CameraMode, _ b: CameraMode) -> ComparisonResult {
+  /// The CLI can rank full per-pixel RGB components alongside YUV444 detail.
+  /// This affects ordering only; actual RGB sampling metadata remains unchanged.
+  /// The default retains the GUI's established mode-selection behavior.
+  public static func compare(
+    _ a: CameraMode, _ b: CameraMode, rankRGBAsFullColor: Bool = false
+  ) -> ComparisonResult {
     let areaA = a.dimensions.width * a.dimensions.height
     let areaB = b.dimensions.width * b.dimensions.height
     if areaA != areaB { return areaA < areaB ? .orderedAscending : .orderedDescending }
@@ -63,8 +68,10 @@ public enum ModeSelector {
     let depthB = b.bitsPerChannel ?? 8
     if depthA != depthB { return depthA < depthB ? .orderedAscending : .orderedDescending }
     // Higher chroma detail (444 > 422 > 420).
-    let detailA = chromaDetail(a.chromaSampling)
-    let detailB = chromaDetail(b.chromaSampling)
+    let detailA =
+      rankRGBAsFullColor && a.codecFamily == .uncompressedRGB ? 3 : chromaDetail(a.chromaSampling)
+    let detailB =
+      rankRGBAsFullColor && b.codecFamily == .uncompressedRGB ? 3 : chromaDetail(b.chromaSampling)
     if detailA != detailB { return detailA < detailB ? .orderedAscending : .orderedDescending }
     // Maximum frame rate.
     if a.maxFrameRate != b.maxFrameRate {

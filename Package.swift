@@ -1,13 +1,19 @@
 // swift-tools-version:6.0
 // PixelBooth — a macOS camera application focused on preserving
 // camera-delivered image data and explaining exactly what was saved.
+import Foundation
 import PackageDescription
+
+let cliInfoPlist = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+  .appendingPathComponent("Support/CLIInfo.plist").path
 
 let package = Package(
   name: "PixelBooth",
   platforms: [.macOS("27.0")],
   products: [
     .executable(name: "PixelBooth", targets: ["PixelBoothApp"]),
+    // Distinct from PixelBooth on case-insensitive macOS filesystems.
+    .executable(name: "PixelBoothCLI", targets: ["PixelBoothCLI"]),
     .library(name: "PixelBoothCore", targets: ["PixelBoothCore"]),
     .library(name: "PixelBoothAdapters", targets: ["PixelBoothAdapters"]),
     .library(name: "PixelBoothJPEG", targets: ["PixelBoothJPEG"]),
@@ -57,6 +63,20 @@ let package = Package(
     .target(name: "PixelBoothCapture", dependencies: ["PixelBoothCore", "PixelBoothAdapters"], path: "Sources/PixelBoothCapture"),
     // Destination: staging, journal, Photos-first import, recovery.
     .target(name: "PixelBoothLibrary", dependencies: ["PixelBoothCore", "PixelBoothAVIF", "PixelBoothDepth", "PixelBoothAdapters", "PixelBoothCapture", "PixelBoothMetadata", "PixelBoothJPEG"], path: "Sources/PixelBoothLibrary"),
+    // Command-line policy and streaming output, shared with synthetic tests.
+    .target(name: "PixelBoothCommand", path: "Sources/PixelBoothCommand"),
+    .executableTarget(
+      name: "PixelBoothCLI",
+      dependencies: ["PixelBoothCore", "PixelBoothCommand", "PixelBoothLibrary"],
+      path: "Sources/PixelBoothCLI",
+      linkerSettings: [
+        .unsafeFlags([
+          "-Xlinker", "-sectcreate", "-Xlinker", "__TEXT",
+          "-Xlinker", "__info_plist", "-Xlinker", cliInfoPlist,
+          "-target", "arm64-apple-macos27.0",
+        ])
+      ]
+    ),
     // SwiftUI application.
     .executableTarget(
       name: "PixelBoothApp",
@@ -79,7 +99,7 @@ let package = Package(
     // load the SDK Testing macro plugin, and XCTest requires full Xcode).
     .executableTarget(
       name: "PixelBoothTestRunner",
-      dependencies: ["PixelBoothCore", "PixelBoothAdapters", "PixelBoothJPEG", "PixelBoothAVIF", "PixelBoothDepth", "PixelBoothMetadata", "PixelBoothLibrary", "PixelBoothCapture"],
+      dependencies: ["PixelBoothCore", "PixelBoothAdapters", "PixelBoothJPEG", "PixelBoothAVIF", "PixelBoothDepth", "PixelBoothMetadata", "PixelBoothLibrary", "PixelBoothCapture", "PixelBoothCommand"],
       path: "Tests/PixelBoothTestRunner",
       resources: [.copy("Fixtures")]
     ),

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>app.pixelbooth.cli</string>
+	<key>CFBundleName</key>
+	<string>PixelBooth CLI</string>
+	<key>CFBundleExecutable</key>
+	<string>pixelbooth</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>27.0</string>
+	<key>NSCameraUsageDescription</key>
+	<string>PixelBooth CLI uses the selected camera to capture one photograph and save it to the requested destination.</string>
+</dict>
+</plist>

@@ -29,3 +29,32 @@ jobs:
         run: scripts/validate.sh
       - name: Assemble app bundle
         run: scripts/build_app.sh
+
+  cli-clt:
+    runs-on: xcode-27  # arm64 runner with the macOS 27 Command Line Tools installed
+    env:
+      DEVELOPER_DIR: /Library/Developer/CommandLineTools
+      PIXELBOOTH_DEPTH_VARIANT: SmallF16
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show CLT toolchain
+        run: |
+          test -d "$DEVELOPER_DIR"
+          xcrun --sdk macosx --show-sdk-version
+          swift --version
+      - name: Install codec build prerequisites
+        run: brew install cmake ninja pkg-config
+      - name: Build CLI and optional model with CLT
+        run: scripts/build_cli.sh --with-disparity
+      - name: Build and run synthetic pipeline tests with CLT
+        run: |
+          swift build --arch arm64 --product PixelBoothTestRunner
+          PIXELBOOTH_DEPTH_MODEL="$PWD/build/pixelbooth-resources/PixelBoothDepth.mlmodelc" \
+            PIXELBOOTH_DEPTH_CONFIGURATION="$PWD/build/pixelbooth-resources/DepthModel.json" \
+            PIXELBOOTH_CLI_EXECUTABLE="$PWD/build/pixelbooth" \
+            "$(swift build --arch arm64 --show-bin-path)/PixelBoothTestRunner"
+      - name: Check help and argument validation without camera access
+        run: |
+          build/pixelbooth --help
+          build/pixelbooth --version
+          if build/pixelbooth --timeout 1.5; then exit 1; else test "$?" = 2; fi

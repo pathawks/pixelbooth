@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -199,6 +200,103 @@ class IntegrityTests(unittest.TestCase):
         original = depth.tree_hashes(self.root)
         (model / "coremldata.bin").write_bytes(b"modified")
         self.assertNotEqual(original, depth.tree_hashes(self.root))
+
+
+class CompilerTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.root = Path(self.temporary.name)
+        self.patcher = patch.object(depth, "ROOT", self.root)
+        self.patcher.start()
+        self.source = self.root / "Tools/CompileDepthModel/CompileDepthModel.swift"
+        self.source.parent.mkdir(parents=True)
+        self.source.write_text("public helper source")
+
+    def tearDown(self):
+        self.patcher.stop()
+        self.temporary.cleanup()
+
+    def output(self, *arguments):
+        return {
+            ("xcrun", "--sdk", "macosx", "--show-sdk-path"): "/sdk",
+            ("xcrun", "--sdk", "macosx", "--show-sdk-version"): "27.0",
+            ("sw_vers", "-buildVersion"): "26A434",
+            ("xcrun", "--find", "swiftc"): "/clt/swiftc",
+            ("xcrun", "swiftc", "--version"): "Swift 6.4",
+            ("xcrun", "coremlcompiler", "version"): "compiler version",
+        }[arguments]
+
+    def test_command_line_tools_use_public_helper_with_runtime_identity(self):
+        helper = self.root / "helper"
+        with patch.object(depth, "coremlcompiler_path", return_value=None), patch.object(depth, "command", side_effect=self.output), patch.object(depth, "prepare_public_helper", return_value=(helper, "a" * 64)):
+            toolchain, selected = depth.prepare_compiler()
+        self.assertEqual(selected, helper)
+        self.assertEqual(toolchain["backend"], "publicCoreMLAPI")
+        self.assertEqual(toolchain["osBuild"], "26A434")
+        self.assertEqual(toolchain["helperSourceSHA256"], depth.digest(self.source))
+        self.assertEqual(toolchain["helperExecutableSHA256"], "a" * 64)
+
+    def test_full_xcode_retains_coremlcompiler_route(self):
+        with patch.object(depth, "coremlcompiler_path", return_value="/xcode/coremlcompiler"), patch.object(depth, "command", side_effect=self.output), patch.object(depth, "prepare_public_helper") as helper:
+            toolchain, selected = depth.prepare_compiler()
+        self.assertIsNone(selected)
+        self.assertEqual(toolchain["backend"], "coremlcompiler")
+        self.assertEqual(toolchain["compilerVersion"], "compiler version")
+        helper.assert_not_called()
+
+    def test_api_model_cache_identity_tracks_helper_source(self):
+        with patch.object(depth, "coremlcompiler_path", return_value=None), patch.object(depth, "command", side_effect=self.output), patch.object(depth, "prepare_public_helper", return_value=(self.root / "helper", "a" * 64)):
+            original = depth.prepare_compiler()[0]
+            self.source.write_text("revised helper source")
+            revised = depth.prepare_compiler()[0]
+        self.assertNotEqual(depth.canonical(original), depth.canonical(revised))
+
+    def test_wrong_sdk_fails_before_preparation(self):
+        def wrong_sdk(*arguments):
+            return "26.0" if arguments[-1] == "--show-sdk-version" else self.output(*arguments)
+        with patch.object(depth, "command", side_effect=wrong_sdk), patch.object(depth, "prepare_public_helper") as helper:
+            with self.assertRaises(ValueError):
+                depth.prepare_compiler()
+        helper.assert_not_called()
+
+    def test_helper_executable_is_rehashed_before_reuse(self):
+        def compile_helper(arguments, **unused):
+            executable = Path(arguments[arguments.index("-o") + 1])
+            executable.write_bytes(b"compiled helper")
+            executable.chmod(0o700)
+        with patch.object(depth.subprocess, "run", side_effect=compile_helper) as run:
+            helper, checksum = depth.prepare_public_helper({"sdkPath": "/sdk"}, self.source)
+            self.assertEqual(depth.prepare_public_helper({"sdkPath": "/sdk"}, self.source), (helper, checksum))
+            self.assertEqual(run.call_count, 1)
+            helper.write_bytes(b"mutated")
+            rebuilt, new_checksum = depth.prepare_public_helper({"sdkPath": "/sdk"}, self.source)
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(rebuilt.read_bytes(), b"compiled helper")
+            self.assertEqual(new_checksum, checksum)
+
+    def test_helper_build_failure_preserves_prior_cache(self):
+        identity = hashlib.sha256(depth.canonical({"sdkPath": "/sdk"})).hexdigest()
+        prior = self.root / ".vendor-cache/depth/compiler-helpers" / identity / "compile-depth-model"
+        prior.parent.mkdir(parents=True)
+        prior.write_bytes(b"prior artifact")
+        with patch.object(depth.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "swiftc")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                depth.prepare_public_helper({"sdkPath": "/sdk"}, self.source)
+        self.assertEqual(prior.read_bytes(), b"prior artifact")
+
+    def test_public_metadata_validation_still_rejects_schema_mismatch(self):
+        descriptor = CATALOG["models"]["SmallF16"]["descriptor"]
+        metadata = [{
+            "inputSchema": [{"type": "Image", "colorspace": "RGB", "name": "image", "width": 518, "height": 392, "hasSizeFlexibility": "0"}],
+            "outputSchema": [{"type": "Image", "colorspace": "Grayscale16Half", "name": "depth", "width": 518, "height": 392, "hasSizeFlexibility": "0"}],
+            "version": "2.0",
+        }]
+        with patch.object(depth.subprocess, "check_output", side_effect=lambda *args, **kwargs: json.dumps(metadata)) as inspect:
+            self.assertEqual(depth.validate_metadata(self.root, descriptor, self.root / "helper"), metadata[0])
+            metadata[0]["outputSchema"][0]["hasSizeFlexibility"] = "1"
+            with self.assertRaises(ValueError):
+                depth.validate_metadata(self.root, descriptor, self.root / "helper")
+        self.assertEqual(inspect.call_args.args[0][1], "metadata")
 
 
 if __name__ == "__main__":

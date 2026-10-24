@@ -11,7 +11,10 @@ func runPersistenceSuite() async {
   await test("journalPersistsStagedCapture") {
     let root = URL(fileURLWithPath: "/tmp/pixelbooth-stage-\(UUID().uuidString.prefix(8))")
     defer { try? FileManager.default.removeItem(at: root) }
-    let queue = SaveQueueActor(stagingRoot: root.appendingPathComponent("staging"))
+    let queue = SaveQueueActor(
+      stagingRoot: root.appendingPathComponent("staging"),
+      importer: { _, _ in .failed("Synthetic importer; Photos access disabled in automated tests") }
+    )
     // Journal is created on first capture; simulate a stage write via the
     // runner path (CapturedCapture from synthetic planes).
     let snapshot = syntheticNV12Snapshot(width: 4, height: 2)
@@ -29,7 +32,11 @@ func runPersistenceSuite() async {
     let root = URL(fileURLWithPath: "/tmp/pixelbooth-capacity-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: root) }
     let staging = root.appendingPathComponent("staging", isDirectory: true)
-    let queue = SaveQueueActor(stagingRoot: staging, maximumStagedBytes: 1)
+    let queue = SaveQueueActor(
+      stagingRoot: staging,
+      importer: { _, _ in .failed("Synthetic importer; Photos access disabled in automated tests")
+      },
+      maximumStagedBytes: 1)
     let snapshot = syntheticNV12Snapshot(width: 4, height: 2)
     let capture = CapturedCapture.makeTestCapture(
       fourCC: 0x4e56_3132, width: 4, height: 2, payload: .planes(snapshot))

@@ -259,8 +259,87 @@ def command(*arguments):
     return subprocess.check_output(arguments, text=True).strip()
 
 
-def validate_metadata(package, descriptor):
-    metadata = json.loads(command("xcrun", "coremlcompiler", "metadata", str(package)))
+def coremlcompiler_path():
+    try:
+        return subprocess.check_output(
+            ["xcrun", "--find", "coremlcompiler"], text=True, stderr=subprocess.DEVNULL
+        ).strip() or None
+    except subprocess.CalledProcessError:
+        return None
+
+
+def helper_environment():
+    runtime = ROOT / ".vendor-cache/depth/compiler-runtime"
+    no_symlinks(runtime)
+    runtime.mkdir(parents=True, exist_ok=True)
+    environment = os.environ.copy()
+    environment["TMPDIR"] = str(runtime) + os.sep
+    return environment
+
+
+def prepare_public_helper(toolchain, source):
+    identity = hashlib.sha256(canonical(toolchain)).hexdigest()
+    parent = ROOT / ".vendor-cache/depth/compiler-helpers"
+    no_symlinks(parent)
+    parent.mkdir(parents=True, exist_ok=True)
+    output = parent / identity
+    no_symlinks(output)
+    executable = output / "compile-depth-model"
+    receipt = output / ".helper.json"
+    try:
+        no_symlinks(receipt)
+        recorded = json.loads(receipt.read_text())
+        if recorded["toolchain"] == toolchain and matches(executable, recorded["sha256"]) and os.access(executable, os.X_OK):
+            return executable, recorded["sha256"]
+    except (ValueError, KeyError, TypeError, OSError):
+        pass
+    with tempfile.TemporaryDirectory(prefix=".helper.", dir=parent) as temporary_name:
+        temporary = Path(temporary_name)
+        compiled = temporary / "compile-depth-model"
+        subprocess.run([
+            "xcrun", "--sdk", "macosx", "swiftc", "-parse-as-library", "-swift-version", "6",
+            "-target", "arm64-apple-macos27.0", "-sdk", toolchain["sdkPath"],
+            "-module-cache-path", str(temporary / "modules"), str(source), "-o", str(compiled),
+        ], check=True, env=helper_environment())
+        checksum = digest(compiled)
+        (temporary / ".helper.json").write_text(json.dumps({"toolchain": toolchain, "sha256": checksum}, indent=2) + "\n")
+        if output.exists():
+            shutil.rmtree(output)
+        temporary.rename(output)
+    return executable, checksum
+
+
+def prepare_compiler():
+    toolchain = {
+        "sdkPath": command("xcrun", "--sdk", "macosx", "--show-sdk-path"),
+        "sdkVersion": command("xcrun", "--sdk", "macosx", "--show-sdk-version"),
+        "osBuild": command("sw_vers", "-buildVersion"),
+    }
+    if not toolchain["sdkVersion"].startswith("27."):
+        fail("Depth model preparation requires the macOS 27 SDK")
+    compiler = coremlcompiler_path()
+    if compiler is not None:
+        toolchain.update(backend="coremlcompiler", compiler=compiler, compilerVersion=command("xcrun", "coremlcompiler", "version"))
+        return toolchain, None
+    source = ROOT / "Tools/CompileDepthModel/CompileDepthModel.swift"
+    no_symlinks(source)
+    toolchain.update(
+        backend="publicCoreMLAPI", compiler="MLModel.compileModel(at:)",
+        swiftCompiler=command("xcrun", "--find", "swiftc"),
+        swiftVersion=command("xcrun", "swiftc", "--version"),
+        helperSourceSHA256=digest(source),
+    )
+    helper, checksum = prepare_public_helper(toolchain, source)
+    toolchain.update(helper=str(helper), helperExecutableSHA256=checksum)
+    return toolchain, helper
+
+
+def validate_metadata(package, descriptor, helper=None):
+    if helper is None:
+        contents = command("xcrun", "coremlcompiler", "metadata", str(package))
+    else:
+        contents = subprocess.check_output([str(helper), "metadata", str(package)], text=True, env=helper_environment())
+    metadata = json.loads(contents)
     if len(metadata) != 1 or "error" in metadata[0]:
         fail("Core ML compiler could not inspect the selected model")
     metadata = metadata[0]
@@ -357,8 +436,8 @@ def main():
         no_symlinks(cache)
         cache.mkdir(parents=True, exist_ok=True)
         package = fetch_package(model, cache)
-        metadata = validate_metadata(package, model["descriptor"])
-        toolchain = {"compiler": command("xcrun", "--find", "coremlcompiler"), "compilerVersion": command("xcrun", "coremlcompiler", "version"), "sdkPath": command("xcrun", "--sdk", "macosx", "--show-sdk-path"), "sdkVersion": command("xcrun", "--sdk", "macosx", "--show-sdk-version")}
+        toolchain, helper = prepare_compiler()
+        metadata = validate_metadata(package, model["descriptor"], helper)
         identity = hashlib.sha256(canonical({"model": model, "toolchain": toolchain})).hexdigest()
         build = ROOT / "vendor/build/depth"
         configurations = build / "configurations"
@@ -371,7 +450,10 @@ def main():
         if not valid:
             with tempfile.TemporaryDirectory(prefix=".compile.", dir=configurations) as temporary_name:
                 temporary = Path(temporary_name)
-                subprocess.run(["xcrun", "coremlcompiler", "compile", str(package), str(temporary)], check=True)
+                if helper is None:
+                    subprocess.run(["xcrun", "coremlcompiler", "compile", str(package), str(temporary)], check=True)
+                else:
+                    subprocess.run([str(helper), "compile", str(package), str(temporary)], check=True, env=helper_environment())
                 compiled = temporary / (Path(model["packageName"]).stem + ".mlmodelc")
                 if not (compiled / "coremldata.bin").is_file() or not (compiled / "weights/weight.bin").is_file():
                     fail("Core ML compiler did not produce a complete model")

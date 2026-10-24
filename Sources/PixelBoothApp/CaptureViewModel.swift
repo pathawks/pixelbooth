@@ -10,7 +10,6 @@ import PixelBoothCore
 import PixelBoothLibrary
 import PixelBoothMetadata
 import SwiftUI
-import os
 
 enum CaptureWindowStatus: Equatable {
   case permissionDenied
@@ -22,351 +21,61 @@ enum CaptureWindowStatus: Equatable {
   case failed(String)
 }
 
-/// Receives frames on the capture queue (not main-actor isolated).
-final class FrameIngest: FrameSink, @unchecked Sendable {
-  // @unchecked Sendable is a narrow, documented exception: `weakVM` is only
-  // touched via the coalescer lock, and work is dispatched to detached tasks
-  // immediately.
-  private weak var weakVM: CaptureViewModel?
-  private let store = FrameStore()
-  private let latestFrameMailbox = FrameAdmissionMailbox<DeliveredFrame>(
-    policy: .latest(maximumBytes: 128 * 1024 * 1024))
-  private let dependentFrameMailbox = FrameAdmissionMailbox<DeliveredFrame>(
-    policy: .dependencyPreserving(maximumFrames: 16, maximumBytes: 64 * 1024 * 1024))
-  private let processingQueue = DispatchQueue(
-    label: "app.pixelbooth.frame-ingest", qos: .userInteractive)
-  private let h264Decoder = H264VideoToolboxStreamDecoder()
-  // Coalescer: publish UI state only when it actually changes, at most
-  // ~4 Hz. Per-frame publication re-rendered the whole window at frame
-  // rate and re-entered AppKit event routing mid-layout (crash trigger).
-  private let coalescer = OSAllocatedUnfairLock<CoalescedState>(
-    initialState: CoalescedState())
-
-  private struct CoalescedState {
-    var lastState: ReadinessState?
-    var lastFresh: Bool?
-    var lastFormatError: String?
-    var lastPublishNanos: UInt64 = 0
-    /// The configuration whose frames may publish readiness. Reconfiguration
-    /// advances it so a callback queued under the previous configuration
-    /// cannot republish state after the reset.
-    var generation: Int?
-    var deviceID: String?
-    var expectedFormat: CaptureFormat?
-  }
+/// Bridges shared archival ingestion events into presentation and preview.
+final class FrameIngest: FrameSink {
+  private let shared = CaptureFrameIngest()
 
   func bind(_ vm: CaptureViewModel) {
-    coalescer.withLock { _ in weakVM = vm }
-  }
-
-  func receive(_ frame: DeliveredFrame) {
-    if frame.sourceFourCC != PixelFormatFourCC.avc1 {
-      let result = latestFrameMailbox.offer(frame, byteCount: frame.retainedByteCount)
-      if result.shouldScheduleDrain {
-        processingQueue.async { [weak self] in
-          self?.drainLatestFrames()
+    shared.setEventHandler { [weak vm] event in
+      switch event {
+      case .frame(let frame, let readiness, let fresh, let formatError):
+        await vm?.frameArrived(
+          frame: frame, freshnessText: CaptureViewModel.readinessDescription(readiness),
+          readiness: readiness, fresh: fresh, formatError: formatError)
+      case .decodedFrame(let frame):
+        if let pixel = CMSampleBufferGetImageBuffer(frame.sampleBuffer) {
+          CMIOFrameBox.shared.store(pixel, from: frame)
         }
-      }
-      return
-    }
-    if CMSampleBufferGetImageBuffer(frame.sampleBuffer) != nil {
-      processSerially(frame)
-      return
-    }
-    let result = dependentFrameMailbox.offer(
-      frame, byteCount: frame.retainedByteCount,
-      isRandomAccessFrame: frame.isRandomAccessFrame)
-    if result.shouldScheduleDrain {
-      processingQueue.async { [weak self] in self?.drainDependentFrames() }
-    }
-  }
-
-  /// Processes only the latest pending independently decodable frame. Every
-  /// frame still enters the store and readiness policy with its original
-  /// buffer; only frames superseded before processing are discarded.
-  private func drainLatestFrames() {
-    while let delivery = latestFrameMailbox.takeNext() {
-      processSerially(delivery.value)
-    }
-  }
-
-  private func drainDependentFrames() {
-    while let delivery = dependentFrameMailbox.takeNext() {
-      var frame = delivery.value
-      frame.requiresDecoderReset = frame.requiresDecoderReset || delivery.requiresDecoderReset
-      guard isCurrent(frame) else { continue }
-      if frame.requiresDecoderReset { h264Decoder.invalidate() }
-      do {
-        for output in try h264Decoder.decode(frame) {
-          guard let decodedFrame = makeDecodedFrame(output) else {
-            publishDecodeError(frame, "VideoToolbox returned an invalid image buffer")
-            continue
-          }
-          processSerially(decodedFrame)
-        }
-      } catch {
-        publishDecodeError(frame, error.localizedDescription)
+      case .decodeFailure(let frame, let message):
+        await vm?.frameDecodeFailed(frame: frame, message: message)
+      case .fieldMetadataFailure(let frame, let message):
+        await vm?.frameFormatRejected(frame: frame, message: message)
+      case .stopped(let stop):
+        await vm?.streamStopped(
+          reason: stop.reason, deviceID: stop.deviceUniqueID, generation: stop.generation)
       }
     }
   }
 
-  private func isCurrent(_ frame: DeliveredFrame) -> Bool {
-    coalescer.withLock { state in
-      state.generation == frame.generation && state.deviceID == frame.deviceUniqueID
-    }
-  }
+  func receive(_ frame: DeliveredFrame) { shared.receive(frame) }
 
-  private func processSerially(_ frame: DeliveredFrame) {
-    let completion = DispatchSemaphore(value: 0)
-    Task {
-      await process(frame)
-      completion.signal()
-    }
-    completion.wait()
-  }
-
-  private func makeDecodedFrame(_ output: H264VideoToolboxStreamDecoder.DecodedOutput)
-    -> DeliveredFrame?
-  {
-    var format: CMVideoFormatDescription?
-    guard
-      CMVideoFormatDescriptionCreateForImageBuffer(
-        allocator: kCFAllocatorDefault, imageBuffer: output.pixelBuffer,
-        formatDescriptionOut: &format) == noErr,
-      let format
-    else { return nil }
-    var timing = CMSampleTimingInfo(
-      duration: output.duration, presentationTimeStamp: output.presentationTimeStamp,
-      decodeTimeStamp: .invalid)
-    var sample: CMSampleBuffer?
-    guard
-      CMSampleBufferCreateReadyWithImageBuffer(
-        allocator: kCFAllocatorDefault, imageBuffer: output.pixelBuffer,
-        formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample) == noErr,
-      let sample
-    else { return nil }
-    let source = output.sourceFrame
-    let pts = output.presentationTimeStamp
-    let timestampNanos: UInt64 = {
-      guard pts.isNumeric else { return source.timestampNanos }
-      let seconds = CMTimeGetSeconds(pts)
-      return seconds >= 0 ? UInt64(seconds * 1_000_000_000) : source.timestampNanos
-    }()
-    let decodedFrame = DeliveredFrame(
-      sampleBuffer: sample, generation: source.generation,
-      deviceUniqueID: source.deviceUniqueID,
-      fourCC: CVPixelBufferGetPixelFormatType(output.pixelBuffer),
-      width: CVPixelBufferGetWidth(output.pixelBuffer),
-      height: CVPixelBufferGetHeight(output.pixelBuffer),
-      timestampNanos: timestampNanos,
-      hostMonotonicNanos: source.hostMonotonicNanos,
-      hostWallClockISO: source.hostWallClockISO,
-      sourceFourCC: source.sourceFourCC,
-      sourceSampleBuffer: source.sourceSampleBuffer ?? source.sampleBuffer,
-      streamColorObservations: source.streamColorObservations)
-    CMIOFrameBox.shared.store(output.pixelBuffer, from: source)
-    return decodedFrame
-  }
-
-  private func publishDecodeError(_ frame: DeliveredFrame, _ message: String) {
-    let publish = coalescer.withLock { state -> CaptureViewModel? in
-      guard state.generation == frame.generation, state.deviceID == frame.deviceUniqueID,
-        state.lastFormatError != message
-      else { return nil }
-      state.lastFormatError = message
-      state.lastFresh = false
-      state.lastPublishNanos = DispatchTime.now().uptimeNanoseconds
-      return weakVM
-    }
-    guard let publish else { return }
-    Task { @MainActor [weak publish] in
-      publish?.frameDecodeFailed(frame: frame, message: message)
-    }
-  }
-
-  private func process(_ frame: DeliveredFrame) async {
-    let configuration = coalescer.withLock { state -> (Int, String, CaptureFormat)? in
-      guard let generation = state.generation, let deviceID = state.deviceID,
-        let expected = state.expectedFormat
-      else {
-        return nil
-      }
-      return (generation, deviceID, expected)
-    }
-    guard let configuration else { return }
-    do {
-      try FrameExtraction.validateProgressiveFrame(
-        sampleBuffer: frame.sampleBuffer, sourceSampleBuffer: frame.sourceSampleBuffer)
-    } catch {
-      publishFieldMetadataFailure(frame, message: error.localizedDescription)
-      return
-    }
-    guard await store.store(frame) else { return }
-    let formatError: String? = {
-      var deliveredFourCC = frame.fourCC
-      var width = frame.width
-      var height = frame.height
-      if let pixel = CMSampleBufferGetImageBuffer(frame.sampleBuffer) {
-        deliveredFourCC = CVPixelBufferGetPixelFormatType(pixel)
-        width = CVPixelBufferGetWidth(pixel)
-        height = CVPixelBufferGetHeight(pixel)
-      }
-      let delivered = CaptureFormat(width: width, height: height, fourCC: deliveredFourCC)
-      do {
-        _ = try AcquisitionPolicy.evaluate(
-          deviceUniqueID: frame.deviceUniqueID, generation: frame.generation,
-          expectedDeviceID: configuration.1, expectedGeneration: configuration.0,
-          selected: configuration.2, delivered: delivered)
-        return nil
-      } catch {
-        return error.localizedDescription
-      }
-    }()
-    let isFresh: Bool
-    if formatError == nil {
-      isFresh = await store.freshFrameAvailable()
-    } else {
-      isFresh = false
-    }
-    // Readiness is recorded only while the frame still belongs to the active
-    // configuration; an obsolete callback returns nil here. macOS
-    // AVFoundation does not expose per-frame adjustment indicators on most
-    // UVC cameras, so the explicitly labeled heuristic runs with
-    // `adjusting: false`.
-    let readiness: ReadinessState
-    if formatError == nil {
-      guard let state = await store.recordAndEvaluate(frame: frame, adjusting: false) else {
-        return
-      }
-      readiness = state
-    } else {
-      readiness = await store.currentReadiness()
-    }
-    // Capture the weak VM under the lock; the hop itself happens after.
-    let shouldPublish: (vm: CaptureViewModel?, text: String, fresh: Bool, formatError: String?)? =
-      coalescer.withLock { c in
-        // A frame queued before reconfiguration must not republish readiness
-        // for the configuration that replaced it.
-        guard c.generation == frame.generation else { return nil }
-        let changed =
-          c.lastState != readiness || c.lastFresh != isFresh
-          || c.lastFormatError != formatError
-        let now = DispatchTime.now().uptimeNanoseconds
-        let due = now &- c.lastPublishNanos > 250_000_000
-        guard changed || due else { return nil }
-        c.lastState = readiness
-        c.lastFresh = isFresh
-        c.lastFormatError = formatError
-        c.lastPublishNanos = now
-        return (weakVM, CaptureViewModel.readinessDescription(readiness), isFresh, formatError)
-      }
-    guard let vm = shouldPublish?.vm else { return }
-    await vm.frameArrived(
-      frame: frame,
-      freshnessText: shouldPublish!.text,
-      readiness: readiness,
-      fresh: shouldPublish!.fresh,
-      formatError: shouldPublish!.formatError)
-  }
-
-  private func publishFieldMetadataFailure(_ frame: DeliveredFrame, message: String) {
-    let target = coalescer.withLock { state -> CaptureViewModel? in
-      guard state.generation == frame.generation, state.deviceID == frame.deviceUniqueID else {
-        return nil
-      }
-      state.lastFormatError = message
-      state.lastFresh = false
-      state.lastPublishNanos = DispatchTime.now().uptimeNanoseconds
-      return weakVM
-    }
-    guard let target else { return }
-    Task { @MainActor [weak target] in
-      target?.frameFormatRejected(frame: frame, message: message)
-    }
-  }
+  func streamStopped(_ stop: StreamStop) { shared.streamStopped(stop) }
 
   func newestFreshFrame(timeoutNanos: UInt64) async -> DeliveredFrame? {
-    await store.newestFreshFrame(timeoutNanos: timeoutNanos)
+    await shared.newestFreshFrame(timeoutNanos: timeoutNanos)
   }
 
   func frameRates() async -> (requested: Double, measured: Double) {
-    let requested = await store.requestedFrameRate
-    let measured = await store.measuredFrameRate
-    return (requested, measured)
-  }
-
-  /// Reset coalesced publishing and advance the configuration whose frames may
-  /// publish. Set before the store's configuration so a frame cannot publish
-  /// between the two.
-  private func resetPublishing(
-    generation: Int?, deviceID: String? = nil, expectedFormat: CaptureFormat? = nil
-  ) {
-    coalescer.withLock {
-      $0.generation = generation
-      $0.deviceID = deviceID
-      $0.expectedFormat = expectedFormat
-      $0.lastFresh = false
-      $0.lastState = .noStream
-      $0.lastFormatError = nil
-      $0.lastPublishNanos = 0
-    }
+    await shared.frameRates()
   }
 
   func beginConfiguration(
     deviceID: String, generation: Int, frameIntervalNanos: UInt64,
     expectedFormat: CaptureFormat
   ) async {
-    resetPublishing(
-      generation: generation, deviceID: deviceID, expectedFormat: expectedFormat)
-    latestFrameMailbox.reset()
-    dependentFrameMailbox.reset()
-    processingQueue.async { [h264Decoder] in h264Decoder.invalidate() }
-    await store.beginConfiguration(
-      deviceID: deviceID, generation: generation,
-      frameIntervalNanos: frameIntervalNanos)
+    await shared.beginConfiguration(
+      deviceID: deviceID, generation: generation, frameIntervalNanos: frameIntervalNanos,
+      expectedFormat: expectedFormat)
   }
 
-  /// Drop retained frames and stop publishing readiness for the previous
-  /// configuration. Called before reconfiguring so delayed callbacks from the
-  /// old stream cannot enter (or republish state for) the replacement.
-  func invalidateConfiguration() async {
-    resetPublishing(generation: nil)
-    latestFrameMailbox.reset()
-    dependentFrameMailbox.reset()
-    processingQueue.async { [h264Decoder] in h264Decoder.invalidate() }
-    await store.invalidate()
-  }
-
-  /// Drop retained frames for the stopping stream and reset coalesced
-  /// readiness publishing. A delayed stop for an already-replaced stream is
-  /// ignored by the store, so the window is not told to shut down either.
-  func streamStopped(_ stop: StreamStop) {
-    let ingest = self
-    Task {
-      guard
-        await store.invalidateIfActive(
-          deviceID: stop.deviceUniqueID, generation: stop.generation)
-      else { return }
-      ingest.resetPublishing(generation: nil)
-      ingest.latestFrameMailbox.reset()
-      ingest.dependentFrameMailbox.reset()
-      ingest.processingQueue.async { [h264Decoder = ingest.h264Decoder] in
-        h264Decoder.invalidate()
-      }
-      guard let vm = ingest.coalescer.withLock({ _ in ingest.weakVM }) else { return }
-      await vm.streamStopped(
-        reason: stop.reason,
-        deviceID: stop.deviceUniqueID,
-        generation: stop.generation)
-    }
-  }
+  func invalidateConfiguration() async { await shared.invalidateConfiguration() }
 
   func snapshotMetadata(for frame: DeliveredFrame) async -> FrameMetadataSnapshot {
-    await store.snapshotMetadata(for: frame)
+    await shared.snapshotMetadata(for: frame)
   }
 
   func setReadinessHeuristic(_ heuristic: ReadinessHeuristic) async {
-    await store.setReadinessHeuristic(heuristic)
+    await shared.setReadinessHeuristic(heuristic)
   }
 }
 
@@ -834,27 +543,7 @@ final class CaptureViewModel: ObservableObject {
   }
 
   private func deviceModes(_ device: AVCaptureDevice) -> [CameraMode] {
-    device.formats.enumerated().map { index, fmt in
-      let desc = fmt.formatDescription
-      let dims = CMVideoFormatDescriptionGetDimensions(desc)
-      let fourCC = CMFormatDescriptionGetMediaSubType(desc)
-      let supportedRanges = fmt.videoSupportedFrameRateRanges
-      var minRate = 0.0
-      var maxRate = 0.0
-      if !supportedRanges.isEmpty {
-        minRate = supportedRanges.map { 1.0 / $0.maxFrameDuration.seconds }.min() ?? 0
-        maxRate = supportedRanges.map { 1.0 / $0.minFrameDuration.seconds }.max() ?? 0
-      }
-      let probe = CaptureFormatFacts.applying(
-        to: CaptureFormat(width: Int(dims.width), height: Int(dims.height), fourCC: fourCC))
-      return CameraMode(
-        deviceID: device.uniqueID, formatID: String(index), mediaSubType: fourCC,
-        dimensions: (Int(dims.width), Int(dims.height)),
-        minFrameRate: minRate, maxFrameRate: maxRate, pixelFormat: fourCC,
-        bitsPerChannel: probe.bitsPerChannel,
-        chromaSampling: probe.chromaSampling,
-        yuvRange: probe.yuvRange)
-    }
+    CaptureDiscovery.advertisedModes(for: device)
   }
 
   func reconfigure() async {
