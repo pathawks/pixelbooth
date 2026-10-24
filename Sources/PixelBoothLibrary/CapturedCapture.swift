@@ -201,6 +201,9 @@ public struct CapturedCapture: Sendable, Codable {
   }
 
   private func encodingColorDescriptor(for snapshot: PlaneSnapshot) throws -> ColorDescriptor {
+    guard metadata.colorEncodingFailure == nil else {
+      throw SnapshotError.unsupportedColorDescriptor
+    }
     if let color { return color }
 
     // Legacy snapshots predate the serialized ColorDescriptor. Reconstruct only
@@ -328,16 +331,35 @@ public struct CapturedCapture: Sendable, Codable {
     self.timestampNanos = frame.timestampNanos
     self.deviceUniqueID = frame.deviceUniqueID
     self.metadata = metadata
+    if let observations = frame.streamColorObservations {
+      self.metadata.streamColorObservations = observations
+    }
+    self.metadata.attachmentArchive = CaptureMetadataArchiver.snapshot(frame)
     self.acceptedAtISO = frame.hostWallClockISO
-    self.color = try Self.colorDescriptor(
-      pixelBuffer,
-      formatDescription: CMSampleBufferGetFormatDescription(sourceSampleBuffer))
+    do {
+      self.color = try Self.colorDescriptor(
+        pixelBuffer, formatDescription: CMSampleBufferGetFormatDescription(sourceSampleBuffer))
+    } catch {
+      self.color = nil
+      self.metadata.colorEncodingFailure = error.localizedDescription
+    }
     self.acquisitionEvidence = acquisitionEvidence
     // Snapshot the immutable payload at acceptance.
     if PixelFormatFourCC.isJPEG(frame.sourceFourCC) {
       // MJPEG: complete JPEG passthrough, byte-exact.
       self.payload = .jpegBytes(
         try FrameExtraction.extractJPEG(from: sourceSampleBuffer))
+      if case .jpegBytes(let bytes) = self.payload {
+        let structure = try JPEGParser.parse(bytes)
+        for segment in structure.segments
+        where (0xE0...0xEF).contains(segment.marker) || segment.marker == 0xFE {
+          self.metadata.attachmentArchive?.entries.append(
+            .init(
+              scope: "source.jpeg",
+              key: String(format: "segment-%02X-at-%d", segment.marker, segment.offset),
+              encoding: "jpeg-segment-payload", payload: Data(segment.payload)))
+        }
+      }
     } else if let pb = pixelBuffer {
       // Uncompressed: adapt and snapshot contiguous planes (padding excluded).
       self.payload = .planes(
@@ -349,6 +371,14 @@ public struct CapturedCapture: Sendable, Codable {
           ]))
     } else {
       throw AdapterError.unsupportedFourCC(frame.fourCC)
+    }
+    if case .planes(let snapshot) = payload, let color,
+      snapshot.contiguous.count != 4, !PixelFormatFourCC.isRGB(frame.fourCC),
+      color.matrix == nil || color.matrix == 2
+    {
+      self.metadata.attachmentArchive?.issues.append(
+        "delivered.YCbCrMatrix: YUV-to-RGB matrix is unavailable; native samples are retained with unspecified matrix coefficients"
+      )
     }
   }
 
@@ -464,14 +494,10 @@ public struct CapturedCapture: Sendable, Codable {
     if iccValue != nil && (icc == nil || icc!.isEmpty) {
       throw SnapshotError.unsupportedColorDescriptor
     }
-    let mastering = try attachment(kCVImageBufferMasteringDisplayColorVolumeKey)
-    guard mastering == nil else { throw SnapshotError.unsupportedColorDescriptor }
     let logTransfer = try attachment(kCVImageBufferLogTransferFunctionKey)
     guard logTransfer == nil else { throw SnapshotError.unsupportedColorDescriptor }
     let gamma = try attachment(kCVImageBufferGammaLevelKey)
     guard gamma == nil || icc != nil else { throw SnapshotError.unsupportedColorDescriptor }
-    let ambientViewing = try attachment(kCVImageBufferAmbientViewingEnvironmentKey)
-    guard ambientViewing == nil else { throw SnapshotError.unsupportedColorDescriptor }
     let clliValue = try attachment(kCVImageBufferContentLightLevelInfoKey)
     guard
       clliValue == nil

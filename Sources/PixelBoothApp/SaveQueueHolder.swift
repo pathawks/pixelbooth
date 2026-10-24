@@ -15,6 +15,7 @@ struct CaptureProgressItem: Identifiable, Equatable {
   let updatedAt: Date
   let lastError: String?
   let isPermanentlyUnencodable: Bool
+  let hasMetadataReport: Bool
 
   var id: UUID { uuid }
 
@@ -31,19 +32,22 @@ struct CaptureProgressItem: Identifiable, Equatable {
     case .validating: return "Validating image"
     case .addingToPhotos: return "Adding to Photos"
     case .saved: return "Saved to Photos"
+    case .savedWithMetadataReport: return "Saved to Photos · metadata report available"
     case .failedEncoding: return "Encoding failed"
     case .failedValidating: return "Validation failed"
     case .failedAddingToPhotos:
       return lastError?.contains("Photos access is off") == true
         ? "Photos access is off" : "Photos import failed"
     case .failedDiskFull: return "Not enough disk space"
-    case .failedUnsupportedColorDescriptor: return "Cannot safely encode this image"
+    case .failedUnsupportedColorDescriptor:
+      return hasMetadataReport
+        ? "Captured locally · metadata needs review" : "Cannot safely encode this image"
     case .ambiguousImport: return "Photos status needs confirmation"
     case .exportedOriginal: return "Original saved"
     }
   }
 
-  var isComplete: Bool { stage == .saved }
+  var isComplete: Bool { stage == .saved || stage == .savedWithMetadataReport }
 
   var needsAttention: Bool {
     stage.canDismissFromProgress
@@ -54,18 +58,21 @@ struct CaptureProgressItem: Identifiable, Equatable {
   init(entry: SaveQueueActor.JournalEntry) {
     self.init(
       uuid: entry.uuid, stage: entry.stage, updatedAt: entry.updatedAt,
-      lastError: entry.lastError, isPermanentlyUnencodable: entry.isPermanentlyUnencodable)
+      lastError: entry.lastError, isPermanentlyUnencodable: entry.isPermanentlyUnencodable,
+      hasMetadataReport: entry.hasMetadataReport ?? false)
   }
 
   init(
     uuid: UUID, stage: SaveQueueActor.Stage, updatedAt: Date,
-    lastError: String? = nil, isPermanentlyUnencodable: Bool = false
+    lastError: String? = nil, isPermanentlyUnencodable: Bool = false,
+    hasMetadataReport: Bool = false
   ) {
     self.uuid = uuid
     self.stage = stage
     self.updatedAt = updatedAt
     self.lastError = lastError
     self.isPermanentlyUnencodable = isPermanentlyUnencodable
+    self.hasMetadataReport = hasMetadataReport
   }
 }
 

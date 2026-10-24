@@ -532,6 +532,7 @@ private struct CaptureStatusWindowView: View {
             isExpanded: $isProgressExpanded,
             onRetry: retryCapture,
             onSaveOriginal: saveOriginal,
+            onMetadataReport: saveMetadataReport,
             onDismiss: dismissCapture
           )
           .transition(reduceMotion ? .identity : .move(edge: .bottom).combined(with: .opacity))
@@ -541,6 +542,7 @@ private struct CaptureStatusWindowView: View {
             items: saveQueue.retainedItems,
             onRetry: retryCapture,
             onSaveOriginal: saveOriginal,
+            onMetadataReport: saveMetadataReport,
             onDismiss: saveQueue.dismissRetainedCapture,
             onDelete: requestDeletion)
         }
@@ -549,6 +551,7 @@ private struct CaptureStatusWindowView: View {
             items: saveQueue.dismissedRetainedItems,
             onRetry: retryCapture,
             onSaveOriginal: saveOriginal,
+            onMetadataReport: saveMetadataReport,
             onRestore: saveQueue.restoreRetainedCapture,
             onDelete: requestDeletion)
         }
@@ -686,6 +689,23 @@ private struct CaptureStatusWindowView: View {
     }
   }
 
+  private func saveMetadataReport(_ item: CaptureProgressItem) {
+    let panel = NSSavePanel()
+    panel.title = "Save Metadata Report"
+    panel.prompt = "Save Report"
+    panel.nameFieldStringValue = "PixelBooth-\(item.uuid.uuidString)-metadata.json"
+    panel.canCreateDirectories = true
+    guard panel.runModal() == .OK, let destination = panel.url else { return }
+    Task {
+      do {
+        _ = try await saveQueue.queue.exportMetadataReport(uuid: item.uuid, to: destination)
+        actionMessage = "Metadata report saved to \(destination.lastPathComponent)"
+      } catch {
+        actionMessage = "Could not save metadata report: \(error.localizedDescription)"
+      }
+    }
+  }
+
   private func requestDeletion(_ item: CaptureProgressItem) {
     actionMessage = nil
     Task {
@@ -723,6 +743,7 @@ private struct CaptureProgressSection: View {
   @Binding var isExpanded: Bool
   let onRetry: (CaptureProgressItem, Bool) -> Void
   let onSaveOriginal: (CaptureProgressItem) -> Void
+  let onMetadataReport: (CaptureProgressItem) -> Void
   let onDismiss: (CaptureProgressItem) -> Void
 
   var body: some View {
@@ -734,6 +755,7 @@ private struct CaptureProgressSection: View {
               item: item,
               onRetry: { onRetry(item, $0) },
               onSaveOriginal: { onSaveOriginal(item) },
+              onMetadataReport: { onMetadataReport(item) },
               onDismiss: { onDismiss(item) }
             )
             .padding(.vertical, 5)
@@ -944,6 +966,7 @@ private struct RetainedCapturesSection: View {
   let items: [CaptureProgressItem]
   let onRetry: (CaptureProgressItem, Bool) -> Void
   let onSaveOriginal: (CaptureProgressItem) -> Void
+  let onMetadataReport: (CaptureProgressItem) -> Void
   let onDismiss: (CaptureProgressItem) -> Void
   let onDelete: (CaptureProgressItem) -> Void
   @State private var isExpanded = true
@@ -965,9 +988,12 @@ private struct RetainedCapturesSection: View {
               }
               Spacer(minLength: 8)
               if !item.isPermanentlyUnencodable {
-                Button("Retry") { onRetry(item, false) }
+                if !item.isComplete { Button("Retry") { onRetry(item, false) } }
                 Button("Save Original…") { onSaveOriginal(item) }
                   .accessibilityLabel("Save retained original for \(item.title)")
+              }
+              if item.hasMetadataReport {
+                Button("Metadata Report…") { onMetadataReport(item) }
               }
               Button("Dismiss") { onDismiss(item) }
                 .accessibilityLabel("Dismiss retained capture \(item.title)")
@@ -992,6 +1018,7 @@ private struct DismissedCapturesSection: View {
   let items: [CaptureProgressItem]
   let onRetry: (CaptureProgressItem, Bool) -> Void
   let onSaveOriginal: (CaptureProgressItem) -> Void
+  let onMetadataReport: (CaptureProgressItem) -> Void
   let onRestore: (CaptureProgressItem) -> Void
   let onDelete: (CaptureProgressItem) -> Void
   @State private var isExpanded = true
@@ -1019,8 +1046,11 @@ private struct DismissedCapturesSection: View {
                 Button("Delete Capture", role: .destructive) { onDelete(item) }
                   .accessibilityLabel("Delete dismissed capture \(item.title)")
                 if !item.isPermanentlyUnencodable {
-                  Button("Retry") { onRetry(item, false) }
+                  if !item.isComplete { Button("Retry") { onRetry(item, false) } }
                   Button("Save Original…") { onSaveOriginal(item) }
+                }
+                if item.hasMetadataReport {
+                  Button("Metadata Report…") { onMetadataReport(item) }
                 }
               }
               .padding(.vertical, 5)
@@ -1133,6 +1163,7 @@ private struct CaptureProgressRow: View {
   let item: CaptureProgressItem
   let onRetry: (Bool) -> Void
   let onSaveOriginal: () -> Void
+  let onMetadataReport: () -> Void
   let onDismiss: () -> Void
   @State private var detailsExpanded = false
 
@@ -1169,10 +1200,15 @@ private struct CaptureProgressRow: View {
 
           HStack(spacing: 8) {
             if !item.isPermanentlyUnencodable {
-              Button("Retry") { onRetry(false) }
-                .accessibilityLabel("Retry \(item.title)")
+              if !item.isComplete {
+                Button("Retry") { onRetry(false) }
+                  .accessibilityLabel("Retry \(item.title)")
+              }
               Button("Save Original…", action: onSaveOriginal)
                 .accessibilityLabel("Save original for \(item.title)")
+            }
+            if item.hasMetadataReport {
+              Button("Metadata Report…", action: onMetadataReport)
             }
             Button("Dismiss", action: onDismiss)
               .accessibilityLabel("Dismiss \(item.title) from capture progress")

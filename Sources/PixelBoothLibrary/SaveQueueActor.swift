@@ -183,6 +183,7 @@ public actor SaveQueueActor {
     case validating
     case addingToPhotos
     case saved
+    case savedWithMetadataReport
     case failedEncoding
     case failedValidating
     case failedAddingToPhotos
@@ -194,7 +195,7 @@ public actor SaveQueueActor {
     public var canDismissFromProgress: Bool {
       switch self {
       case .failedEncoding, .failedValidating, .failedAddingToPhotos, .failedDiskFull,
-        .failedUnsupportedColorDescriptor, .ambiguousImport:
+        .failedUnsupportedColorDescriptor, .ambiguousImport, .savedWithMetadataReport:
         return true
       default:
         return false
@@ -219,13 +220,14 @@ public actor SaveQueueActor {
     /// Source, output and temporary-file allowance retained across relaunches.
     /// Optional for journals written before buffered capture admission.
     public var stagingReservationBytes: UInt64?
+    public var hasMetadataReport: Bool?
 
     public var isProgressDismissed: Bool { progressDismissed ?? false }
     public var isRetainedDismissed: Bool { retainedDismissed ?? false }
     public var shouldDiscardOnTermination: Bool { discardOnTermination ?? false }
 
     public var isPermanentlyUnencodable: Bool {
-      if stage == .failedUnsupportedColorDescriptor { return true }
+      if stage == .failedUnsupportedColorDescriptor { return hasMetadataReport != true }
       guard stage == .failedEncoding, let lastError else { return false }
       let normalized = lastError.lowercased()
       return normalized == "snapshoterror 1" || normalized.contains("snapshoterror error 1")
@@ -237,7 +239,8 @@ public actor SaveQueueActor {
       encoderSettings: String? = nil, createdAt: Date, updatedAt: Date,
       codecFileName: String? = nil, lastError: String? = nil,
       progressDismissed: Bool? = nil, retainedDismissed: Bool? = nil,
-      discardOnTermination: Bool? = nil, stagingReservationBytes: UInt64? = nil
+      discardOnTermination: Bool? = nil, stagingReservationBytes: UInt64? = nil,
+      hasMetadataReport: Bool? = nil
     ) {
       self.uuid = uuid
       self.stage = stage
@@ -253,6 +256,7 @@ public actor SaveQueueActor {
       self.retainedDismissed = retainedDismissed
       self.discardOnTermination = discardOnTermination
       self.stagingReservationBytes = stagingReservationBytes
+      self.hasMetadataReport = hasMetadataReport
     }
   }
 
@@ -488,11 +492,15 @@ public actor SaveQueueActor {
       try ensureDirectoryDurable(dir, rejectSymlinkAtTarget: true)
       try synchronizeDirectory(stagingRoot)
       try durableAtomicWrite(data, to: dir.appendingPathComponent("capture.json"))
+      if capture.hasMetadataReport {
+        try durableAtomicWrite(
+          capture.metadataReportData(), to: dir.appendingPathComponent("metadata-report.json"))
+      }
       try upsertJournal(
         JournalEntry(
           uuid: capture.uuid, stage: .capturedLocally,
           stagingPath: dir.path, createdAt: Date(), updatedAt: Date(),
-          stagingReservationBytes: required))
+          stagingReservationBytes: required, hasMetadataReport: capture.hasMetadataReport))
       NotificationCenter.default.post(name: Self.changedNotification, object: nil)
     } catch let error as QueueError {
       throw error
@@ -528,8 +536,14 @@ public actor SaveQueueActor {
       importWasAttempted = true
       switch await importIntoPhotos(fileURL: finalized.url, creationDate: captureDate(capture)) {
       case .saved:
-        try updateJournal(capture.uuid, stage: .saved, fileHash: finalized.hashHex)
-        try? FileManager.default.removeItem(at: stagingDirectory(capture.uuid))
+        if capture.hasMetadataReport {
+          try updateJournal(
+            capture.uuid, stage: .savedWithMetadataReport, fileHash: finalized.hashHex,
+            error: capture.metadataWarningSummary)
+        } else {
+          try updateJournal(capture.uuid, stage: .saved, fileHash: finalized.hashHex)
+          try? FileManager.default.removeItem(at: stagingDirectory(capture.uuid))
+        }
       case .failed(let message):
         try updateJournal(
           capture.uuid, stage: .failedAddingToPhotos,
@@ -592,7 +606,8 @@ public actor SaveQueueActor {
         actualCaptureFormat:
           "\(CaptureFormat.fourCCString(capture.pixelFourCC ?? capture.fourCC)) \(capture.width)×\(capture.height)",
         encoderSettings: "metadata-only",
-        metadataProvenance: Self.deviceIdentityProvenance(capture),
+        metadataProvenance: try Self.deviceIdentityProvenance(capture)
+          + capture.archivedMetadataProvenance(),
         fidelity: capture.acquisitionEvidence.map { Self.fidelityName($0.fidelity) } ?? "unknown",
         hostLocation: capture.metadata.hostLocation,
         mediaTimeNanos: capture.timestampNanos,
@@ -614,7 +629,8 @@ public actor SaveQueueActor {
       // plus Exif carrying the host-observed device identity and capture time
       // (Photos reads Exif; the XMP labels that provenance as host-observed —
       // never presented as camera-provided metadata).
-      let provenance = Self.deviceIdentityProvenance(capture)
+      let provenance =
+        try Self.deviceIdentityProvenance(capture) + capture.archivedMetadataProvenance()
       let xmp = PixelBoothXMP.build(
         captureUUID: capture.uuid, appVersion: AppVersion.current,
         captureBackend: capture.metadata.captureBackend ?? "unknown",
@@ -817,7 +833,9 @@ public actor SaveQueueActor {
     guard values.isDirectory == true, values.isSymbolicLink != true else {
       throw QueueError.staging("capture staging path is not a regular directory")
     }
-    let allowedNames: Set<String> = ["capture.json", "capture.jpg", "capture.avif"]
+    let allowedNames: Set<String> = [
+      "capture.json", "capture.jpg", "capture.avif", "metadata-report.json",
+    ]
     let children = try FileManager.default.contentsOfDirectory(
       at: directory, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
       options: [])
@@ -838,7 +856,7 @@ public actor SaveQueueActor {
   }
 
   private func isKnownAtomicTemporaryName(_ name: String) -> Bool {
-    for destination in ["capture.json", "capture.jpg", "capture.avif"] {
+    for destination in ["capture.json", "capture.jpg", "capture.avif", "metadata-report.json"] {
       let prefix = ".\(destination)."
       guard name.hasPrefix(prefix), name.hasSuffix(".tmp") else { continue }
       let identifierStart = name.index(name.startIndex, offsetBy: prefix.count)
@@ -1002,7 +1020,16 @@ public actor SaveQueueActor {
     }
     let (doubledOutput, outputOverflow) = sourceBytes.multipliedReportingOverflow(by: 2)
     guard !outputOverflow else { throw capacityExceededError() }
-    let outputReserve = max(doubledOutput, 4 * 1024 * 1024)
+    var outputReserve = max(doubledOutput, 4 * 1024 * 1024)
+    if capture.metadata.attachmentArchive != nil || capture.metadata.deviceIdentity != nil
+      || capture.metadata.streamColorObservations != nil
+    {
+      let metadataBytes = try JSONEncoder().encode(capture.metadata).count
+      let (metadataReserve, overflow) = UInt64(metadataBytes).multipliedReportingOverflow(by: 8)
+      let (withMetadata, additionOverflow) = outputReserve.addingReportingOverflow(metadataReserve)
+      guard !overflow, !additionOverflow else { throw capacityExceededError() }
+      outputReserve = withMetadata
+    }
     let (sourceAndOutput, firstOverflow) = UInt64(encodedSourceBytes).addingReportingOverflow(
       outputReserve)
     let (withTemporary, secondOverflow) = sourceAndOutput.addingReportingOverflow(outputReserve)
@@ -1131,6 +1158,33 @@ public actor SaveQueueActor {
     } catch let error as QueueError { throw error } catch { throw QueueError.invalidCapture(uuid) }
   }
 
+  /// Explicit local export only. Reports include the original serialized
+  /// attachments and capture identity; nothing is uploaded by the application.
+  public func exportMetadataReport(uuid: UUID, to destination: URL) async throws -> URL {
+    guard !saveAsInProgress, !terminationRequested else { throw QueueError.busy }
+    guard let entry = try readJournal().first(where: { $0.uuid == uuid }),
+      entry.hasMetadataReport == true
+    else { throw QueueError.missingOriginal(uuid) }
+    _ = try checkedStagingChildren(for: entry)
+    let source = stagingDirectory(uuid).appendingPathComponent("metadata-report.json")
+    let data = try Data(contentsOf: source)
+    let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    saveAsInProgress = true
+    defer {
+      saveAsInProgress = false
+      resumeTerminationWaitersIfIdle()
+      Task { self.pumpPendingWork() }
+    }
+    guard
+      try await saveAsWorker.exportIfMatching(
+        finalizedFile: source, stagingDirectory: stagingDirectory(uuid),
+        expectedHash: hash, to: destination)
+    else {
+      throw QueueError.originalUnavailable("the metadata report changed before export")
+    }
+    return destination
+  }
+
   public func retry(uuid: UUID, confirmingPossibleDuplicate: Bool = false) async throws {
     guard !terminationRequested else { throw QueueError.terminating }
     guard inFlightCount < maxInFlight, !saveAsInProgress else { throw QueueError.busy }
@@ -1149,7 +1203,10 @@ public actor SaveQueueActor {
     {
       throw QueueError.ambiguousNeedsConfirmation
     }
-    guard entry.stage != .saved && entry.stage != .exportedOriginal else {
+    guard
+      entry.stage != .saved && entry.stage != .savedWithMetadataReport
+        && entry.stage != .exportedOriginal
+    else {
       throw QueueError.originalUnavailable("capture is already completed")
     }
     let capture = try loadCapture(uuid)
@@ -1260,11 +1317,16 @@ public actor SaveQueueActor {
       do {
         let capture = try JSONDecoder().decode(CapturedCapture.self, from: Data(contentsOf: file))
         guard capture.uuid == uuid else { continue }
+        if capture.hasMetadataReport {
+          try durableAtomicWrite(
+            capture.metadataReportData(), to: folder.appendingPathComponent("metadata-report.json"))
+        }
         entries.append(
           JournalEntry(
             uuid: uuid, stage: .capturedLocally, stagingPath: folder.path,
             createdAt: Date(), updatedAt: Date(),
-            lastError: "Recovered staged capture without a journal record."))
+            lastError: "Recovered staged capture without a journal record.",
+            hasMetadataReport: capture.hasMetadataReport))
         changed = true
       } catch {
         // Leave malformed orphan data untouched and visibly report it.
@@ -1360,7 +1422,7 @@ public actor SaveQueueActor {
         throw QueueError.originalUnavailable("the finalized file changed before export")
       }
     }
-    if !wasActive {
+    if !wasActive && entry.stage != .savedWithMetadataReport {
       try updateJournal(
         uuid, stage: .exportedOriginal,
         fileHash: finalized.hashHex,
@@ -1383,7 +1445,7 @@ public actor SaveQueueActor {
       entries[index].stage = .failedUnsupportedColorDescriptor
     }
     entries[index].progressDismissed = true
-    entries[index].retainedDismissed = true
+    entries[index].retainedDismissed = entries[index].stage != .savedWithMetadataReport
     entries[index].updatedAt = Date()
     try writeJournal(entries)
   }

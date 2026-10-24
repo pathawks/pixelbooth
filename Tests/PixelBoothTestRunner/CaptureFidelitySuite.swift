@@ -1,9 +1,11 @@
 import AVFoundation
+import CoreGraphics
 import CoreMedia
 import CoreVideo
 import Foundation
 import PixelBoothAVIF
 import PixelBoothAdapters
+import PixelBoothCAvifShim
 import PixelBoothCapture
 import PixelBoothCore
 import PixelBoothLibrary
@@ -74,7 +76,8 @@ private func makeNV12(fullRange: Bool) throws -> CVPixelBuffer {
 }
 
 private func makeCapture(
-  _ pb: CVPixelBuffer, reportedWidth: Int? = nil, reportedHeight: Int? = nil
+  _ pb: CVPixelBuffer, reportedWidth: Int? = nil, reportedHeight: Int? = nil,
+  sampleHDR10Plus: Data? = nil, sourceHDR10Plus: Data? = nil
 ) throws -> CapturedCapture {
   var description: CMVideoFormatDescription?
   guard
@@ -94,12 +97,30 @@ private func makeCapture(
       formatDescription: description, sampleTiming: &timing, sampleBufferOut: &sample) == noErr,
     let sample
   else { throw CaptureFidelityTestError.setup("sample buffer") }
+  func attachHDR10Plus(_ data: Data, to sample: CMSampleBuffer) throws {
+    guard
+      let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true)
+        as? [NSMutableDictionary], let first = attachments.first
+    else { throw CaptureFidelityTestError.setup("HDR10+ attachment array") }
+    first[kCMSampleAttachmentKey_HDR10PlusPerFrameData as String] = data
+  }
+  if let sampleHDR10Plus { try attachHDR10Plus(sampleHDR10Plus, to: sample) }
+  var originalSample: CMSampleBuffer?
+  if let sourceHDR10Plus {
+    guard
+      CMSampleBufferCreateReadyWithImageBuffer(
+        allocator: kCFAllocatorDefault, imageBuffer: pb, formatDescription: description,
+        sampleTiming: &timing, sampleBufferOut: &originalSample) == noErr, let originalSample
+    else { throw CaptureFidelityTestError.setup("original HDR10+ sample buffer") }
+    try attachHDR10Plus(sourceHDR10Plus, to: originalSample)
+  }
   let frame = DeliveredFrame(
     sampleBuffer: sample, generation: 1, deviceUniqueID: "fixture",
     fourCC: CVPixelBufferGetPixelFormatType(pb),
     width: reportedWidth ?? CVPixelBufferGetWidth(pb),
     height: reportedHeight ?? CVPixelBufferGetHeight(pb),
-    timestampNanos: 1, hostMonotonicNanos: 1, hostWallClockISO: "2026-09-22T12:00:00Z")
+    timestampNanos: 1, hostMonotonicNanos: 1, hostWallClockISO: "2026-09-22T12:00:00Z",
+    sourceSampleBuffer: originalSample)
   let metadata = FrameMetadataSnapshot(
     mediaTimeNanos: 1, wallClockAnchorISO: "2026-09-22T12:00:00Z", generation: 1)
   return try CapturedCapture(from: frame, metadata: metadata)
@@ -204,6 +225,45 @@ private func makeBGRA() throws -> CVPixelBuffer {
 
 func runCaptureFidelitySuite() async {
   suite("CaptureSnapshotAndColor")
+
+  await test("missingYUVMatrixRetainsSamplesAndReportsUncertaintyWithOrWithoutICC") {
+    for includeICC in [false, true] {
+      let buffer = try makeNV12(fullRange: false)
+      CVBufferRemoveAttachment(buffer, kCVImageBufferYCbCrMatrixKey)
+      if includeICC {
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB) else {
+          throw CaptureFidelityTestError.setup("ICC fixture color space")
+        }
+        CVBufferSetAttachment(buffer, kCVImageBufferCGColorSpaceKey, space, .shouldPropagate)
+      }
+      let capture = try makeCapture(buffer)
+      try require(capture.color?.matrix == nil, "missing matrix is never inferred from ICC")
+      try require(
+        capture.metadata.colorEncodingFailure == nil, "missing matrix does not block saving")
+      try require(
+        capture.hasMetadataReport
+          && capture.metadata.attachmentArchive?.issues.contains(where: {
+            $0.contains("YCbCrMatrix")
+          }) == true,
+        "missing matrix has a capture-specific diagnostic")
+      guard case .planes(let snapshot) = capture.payload else {
+        throw CaptureFidelityTestError.assertion("retained YUV source planes missing")
+      }
+      let restored = try JSONDecoder().decode(
+        CapturedCapture.self, from: JSONEncoder().encode(capture))
+      try require(restored.hasMetadataReport, "matrix uncertainty survives durable JSON")
+      let result = try restored.encodeAVIF()
+      let decoded = try LosslessAVIF.decode(encoded: result.data)
+      try require(decoded.matrixCoefficients == 2, "AVIF honestly records unspecified matrix")
+      try require(decoded.planes == snapshot.contiguous, "every native YUV sample is preserved")
+      try require(
+        (restored.color?.iccProfile != nil) == includeICC, "ICC presence is preserved separately")
+    }
+    let known = try makeCapture(makeNV12(fullRange: false))
+    try require(!known.hasMetadataReport, "known matrix does not create a missing-matrix warning")
+    let rgb = try makeCapture(makeBGRA())
+    try require(!rgb.hasMetadataReport, "RGB does not need a YUV matrix")
+  }
   await test("progressiveFrameFieldMarkersRemainAcceptable") {
     let pb = try makeNV12(fullRange: false)
     var fieldCount: Int32 = 1
@@ -442,6 +502,129 @@ func runCaptureFidelitySuite() async {
         "every reconstructed 10-bit channel sample is preserved")
     }
   }
+  await test("tenBitPQAndHLGPreserveNativeSamplesAndHDRSignaling") {
+    let transfers: [(CFString, Int)] = [
+      (kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, 16),
+      (kCVImageBufferTransferFunction_ITU_R_2100_HLG, 18),
+    ]
+    for (transfer, code) in transfers {
+      let buffer = try makeTenBitBiPlanar(fullRange: false)
+      CVBufferSetAttachment(
+        buffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020,
+        .shouldPropagate)
+      CVBufferSetAttachment(
+        buffer, kCVImageBufferTransferFunctionKey, transfer, .shouldPropagate)
+      CVBufferSetAttachment(
+        buffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020,
+        .shouldPropagate)
+      let lightLevels = Data([0x03, 0xE8, 0x01, 0x90])
+      CVBufferSetAttachment(
+        buffer, kCVImageBufferContentLightLevelInfoKey, lightLevels as CFData, .shouldPropagate)
+      let capture = try makeCapture(buffer)
+      guard case .planes(let expected) = capture.payload else {
+        throw CaptureFidelityTestError.assertion("expected ten-bit HDR planes")
+      }
+      let restored = try JSONDecoder().decode(
+        CapturedCapture.self, from: JSONEncoder().encode(capture))
+      try require(
+        restored.color?.contentLightLevels == Array(lightLevels),
+        "HDR light-level metadata survives persistence")
+      let encoded = try restored.encodeAVIF()
+      let decoded = try LosslessAVIF.decode(encoded: encoded.data)
+      try require(
+        decoded.depth == 10 && decoded.range == 0 && decoded.colorPrimaries == 9
+          && decoded.transferCharacteristics == code && decoded.matrixCoefficients == 9,
+        "ten-bit limited-range BT.2020 and PQ/HLG signaling survive persistence and AVIF")
+      try require(decoded.planes == expected.contiguous, "every native HDR sample is preserved")
+      guard let image = avifImageCreateEmpty() else {
+        throw CaptureFidelityTestError.setup("HDR metadata image")
+      }
+      defer { avifImageDestroy(image) }
+      guard let decoder = avifDecoderCreate() else {
+        throw CaptureFidelityTestError.setup("HDR metadata decoder")
+      }
+      defer { avifDecoderDestroy(decoder) }
+      let status = encoded.data.withUnsafeBufferPointer {
+        avifDecoderReadMemory(decoder, image, $0.baseAddress, $0.count)
+      }
+      try require(status == AVIF_RESULT_OK, "HDR metadata independently decoded")
+      try require(
+        image.pointee.clli.maxCLL == 1000 && image.pointee.clli.maxPALL == 400,
+        "HDR light levels survive final AVIF")
+    }
+  }
+  await test("unmappedHDRRenderingMetadataIsRetainedWithoutRejectingCapture") {
+    for (key, size) in [
+      (kCVImageBufferMasteringDisplayColorVolumeKey, 24),
+      (kCVImageBufferAmbientViewingEnvironmentKey, 8),
+    ] {
+      let buffer = try makeTenBitBiPlanar(fullRange: false)
+      CVBufferSetAttachment(
+        buffer, key, Data(repeating: 0, count: size) as CFData, .shouldPropagate)
+      let capture = try makeCapture(buffer)
+      try require(capture.hasMetadataReport, "unmapped metadata creates a report")
+      let restored = try JSONDecoder().decode(
+        CapturedCapture.self, from: JSONEncoder().encode(capture))
+      let entries =
+        restored.metadata.attachmentArchive?.entries.filter { $0.key == key as String } ?? []
+      try require(
+        !entries.isEmpty && entries.allSatisfy(\.exact), "original metadata is archived losslessly")
+      for entry in entries {
+        let values =
+          try PropertyListSerialization.propertyList(from: entry.payload, format: nil)
+          as! [String: Any]
+        try require(
+          values["value"] as? Data == Data(repeating: 0, count: size),
+          "every original metadata byte persists")
+      }
+      _ = try restored.encodeAVIF()
+    }
+    for originalSource in [false, true] {
+      let capture = try makeCapture(
+        makeTenBitBiPlanar(fullRange: false),
+        sampleHDR10Plus: originalSource ? nil : Data([0xB5, 0]),
+        sourceHDR10Plus: originalSource ? Data([0xB5, 0]) : nil)
+      try require(capture.hasMetadataReport, "dynamic HDR metadata does not reject the capture")
+      let entries =
+        capture.metadata.attachmentArchive?.entries.filter {
+          $0.key == kCMSampleAttachmentKey_HDR10PlusPerFrameData as String
+        } ?? []
+      try require(
+        entries.count == 1, "original HDR10+ attachment retained once in its source scope")
+      let values =
+        try PropertyListSerialization.propertyList(from: entries[0].payload, format: nil)
+        as! [String: Any]
+      try require(values["value"] as? Data == Data([0xB5, 0]), "HDR10+ bytes retained exactly")
+      _ = try capture.encodeAVIF()
+    }
+  }
+  await test("unknownNestedNonpropagatingMetadataIsRetainedAsTypedData") {
+    let buffer = try makeNV12(fullRange: false)
+    let key = "org.pixelbooth.synthetic.UnknownMetadata" as CFString
+    let original: [String: Any] = [
+      "binary": Data((0...255).map { UInt8($0) }),
+      "nested": ["number": NSNumber(value: 1.25), "flag": true],
+      "text": "vendor namespace value",
+    ]
+    CVBufferSetAttachment(buffer, key, original as CFDictionary, .shouldNotPropagate)
+    let capture = try makeCapture(buffer)
+    let restored = try JSONDecoder().decode(
+      CapturedCapture.self, from: JSONEncoder().encode(capture))
+    guard
+      let entry = restored.metadata.attachmentArchive?.entries.first(where: {
+        $0.key == key as String && $0.scope == "delivered.pixels.nonpropagating"
+      })
+    else { throw CaptureFidelityTestError.assertion("nonpropagating attachment missing") }
+    try require(
+      entry.exact && entry.encoding == "binary-property-list",
+      "typed attachment is archived losslessly")
+    let wrapped =
+      try PropertyListSerialization.propertyList(from: entry.payload, format: nil) as! [String: Any]
+    let value = wrapped["value"] as! NSDictionary
+    try require(
+      value.isEqual(to: original),
+      "binary, numeric, boolean and nested values survive JSON persistence")
+  }
   await test("malformedSnapshotAndLegacyUnknownRangeRefused") {
     let pb = try makeNV12(fullRange: false)
     let capture = try makeCapture(pb)
@@ -600,12 +783,16 @@ func runCaptureFidelitySuite() async {
     try require(
       decoded.planes == expected.contiguous, "BGR24 native channels survive the full archive path")
   }
-  await test("unsupportedColorInterpretationsFailClosed") {
+  await test("unknownColorInterpretationsRetainSourceBeforeEncodingFailure") {
     let gammaBuffer = try makeNV12(fullRange: false)
     CVBufferSetAttachment(
       gammaBuffer, kCVImageBufferGammaLevelKey, NSNumber(value: 1.8), .shouldPropagate)
     do {
-      _ = try makeCapture(gammaBuffer)
+      let capture = try makeCapture(gammaBuffer)
+      try require(
+        capture.hasMetadataReport && capture.metadata.colorEncodingFailure != nil,
+        "gamma source is captured with metadata and diagnostic")
+      _ = try capture.encodeAVIF()
       throw CaptureFidelityTestError.assertion("standalone gamma accepted")
     } catch is CapturedCapture.SnapshotError {}
 
@@ -614,7 +801,11 @@ func runCaptureFidelitySuite() async {
       logBuffer, kCVImageBufferLogTransferFunctionKey, kCVImageBufferLogTransferFunction_AppleLog,
       .shouldPropagate)
     do {
-      _ = try makeCapture(logBuffer)
+      let capture = try makeCapture(logBuffer)
+      try require(
+        capture.hasMetadataReport && capture.metadata.colorEncodingFailure != nil,
+        "log source is captured with metadata and diagnostic")
+      _ = try capture.encodeAVIF()
       throw CaptureFidelityTestError.assertion("Apple Log accepted as unspecified CICP")
     } catch is CapturedCapture.SnapshotError {}
 

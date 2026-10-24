@@ -70,6 +70,23 @@ that file only when `DEVELOPER_DIR` is not already set in the environment.
 
 ## The fidelity contract, in short
 
+Captures with metadata that PixelBooth cannot map to standard output fields
+are still retained. Supported JPEG/AVIF output includes the original attachment
+archive in application XMP; Capture Status shows a metadata warning and offers
+**Metadata Report…**. After a successful Photos import, captures with reports
+keep their local image, source snapshot and report until explicitly discarded.
+Reports stay local and may contain device identifiers and included location
+metadata; exporting or sharing one is a deliberate user action. If the base
+color interpretation cannot be encoded faithfully, the source and report remain
+durably saved on the Mac while final image export needs additional support.
+
+A missing YUV matrix is reported even when an ICC profile is present. The
+image still saves with an unspecified matrix and retained diagnostic evidence.
+Bounded observations from earlier frames in the same stream are retained
+separately; they do not override the shutter frame's color interpretation.
+The [Brio color investigation](docs/BRIO_COLOR_INVESTIGATION.md) records why
+USB descriptors, advertised formats, and delivered frames must be distinguished.
+
 Camera identity prefers AVFoundation, then USB descriptor strings, then an
 attributed USB vendor/product ID map. Missing manufacturer values are omitted
 from generated Exif. USB identity enrichment never opens the USB device or

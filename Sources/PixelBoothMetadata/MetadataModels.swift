@@ -88,8 +88,14 @@ public struct FrameMetadataSnapshot: Hashable, Sendable, Codable {
   /// Capture backend and host software version observed at the shutter.
   public var captureBackend: String?
   public var captureBackendVersion: String?
+  public var attachmentArchive: CaptureAttachmentArchive?
+  /// Only blocks final encoding when the base color interpretation itself is
+  /// unavailable. Source pixels and metadata can still be staged durably.
+  public var colorEncodingFailure: String?
   public var usbIdentity: USBDeviceIdentity?
   public var deviceIdentity: DeviceIdentityResolution?
+  /// Bounded prior delivered-frame evidence, never used to fill current color tags.
+  public var streamColorObservations: [DeliveredColorObservation]?
 
   public init(
     sampleBufferAttachments: [String: String] = [:],
@@ -108,9 +114,12 @@ public struct FrameMetadataSnapshot: Hashable, Sendable, Codable {
     hostObservedDeviceModel: String? = nil,
     captureBackend: String? = nil,
     captureBackendVersion: String? = nil,
+    attachmentArchive: CaptureAttachmentArchive? = nil,
+    colorEncodingFailure: String? = nil,
     usbIdentity: USBDeviceIdentity? = nil,
     deviceIdentity: DeviceIdentityResolution? = nil,
-    hostObservedDeviceModelID: String? = nil
+    hostObservedDeviceModelID: String? = nil,
+    streamColorObservations: [DeliveredColorObservation]? = nil
   ) {
     self.sampleBufferAttachments = sampleBufferAttachments
     self.pixelBufferAttachments = pixelBufferAttachments
@@ -128,9 +137,12 @@ public struct FrameMetadataSnapshot: Hashable, Sendable, Codable {
     self.hostObservedDeviceModel = hostObservedDeviceModel
     self.captureBackend = captureBackend
     self.captureBackendVersion = captureBackendVersion
+    self.attachmentArchive = attachmentArchive
+    self.colorEncodingFailure = colorEncodingFailure
     self.usbIdentity = usbIdentity
     self.deviceIdentity = deviceIdentity
     self.hostObservedDeviceModelID = hostObservedDeviceModelID
+    self.streamColorObservations = streamColorObservations
   }
 }
 

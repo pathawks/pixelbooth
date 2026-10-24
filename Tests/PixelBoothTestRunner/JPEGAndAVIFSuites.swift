@@ -561,6 +561,16 @@ func runJPEGSuite() async {
         continue
       }
       check(retained == bytes, "JPEG image-coding bytes remain byte-exact for \(type)")
+      let archivedSegments =
+        capture.metadata.attachmentArchive?.entries.filter {
+          $0.scope == "source.jpeg"
+        } ?? []
+      let sourceMetadata = sourceCoding.segments.filter {
+        (0xE0...0xEF).contains($0.marker) || $0.marker == 0xFE
+      }
+      check(
+        archivedSegments.map(\.payload) == sourceMetadata.map { Data($0.payload) },
+        "all source JPEG metadata segments are also available to the diagnostic report")
       let retainedCoding = try JPEGParser.parse(retained)
       check(
         retainedCoding.scanAndEOI == sourceCoding.scanAndEOI,

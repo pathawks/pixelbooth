@@ -401,8 +401,9 @@ public enum CMIOCaptureDiscovery {
 
 /// Delivers sample buffers from the CMIO buffer queue to the sinks.
 /// Narrow, documented exception: the poller holds immutable configuration
-/// snapshots and a lock-protected flag only; frame forwarding reuses the
-/// module's sink registry exactly like the AVFoundation delegate path.
+/// snapshots, lock-protected flags, and a color tracker accessed only on its
+/// serial polling queue. Frame forwarding reuses the module's sink registry
+/// exactly like the AVFoundation delegate path.
 final class CMIOFramePoller: @unchecked Sendable {
   private let registry: SinkRegistry
   private let deviceUID: String
@@ -418,6 +419,7 @@ final class CMIOFramePoller: @unchecked Sendable {
   private let stallReported = OSAllocatedUnfairLock<Bool>(initialState: false)
   private let onStall: @Sendable () -> Void
   private let stallTimeoutNanos: UInt64 = 3_000_000_000
+  private var colorTracker = StreamColorObservationTracker()
 
   init(
     registry: SinkRegistry, deviceUID: String, generation: Int,
@@ -458,9 +460,10 @@ final class CMIOFramePoller: @unchecked Sendable {
         while let raw = CMSimpleQueueDequeue(queueRef) {
           let sample = Unmanaged<CMSampleBuffer>.fromOpaque(raw).takeRetainedValue()
           guard
-            let frame = DeliveredFrame.make(
+            var frame = DeliveredFrame.make(
               sampleBuffer: sample, deviceUniqueID: deviceUID, generation: generation)
           else { continue }
+          frame.streamColorObservations = colorTracker.observe(frame)
           lastDeliveryNanos = DispatchTime.now().uptimeNanoseconds
           for entry in registry.snapshot() {
             entry.offer(frame)

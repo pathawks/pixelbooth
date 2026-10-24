@@ -103,6 +103,12 @@ Do not reopen them in future work.
 
 ## Metadata, time, location (settled)
 
+- Metadata that cannot be represented in native output fields does not reject
+  the shutter. Durably retain the native image and attachment archive first;
+  save supported JPEG/AVIF images with an exact application-XMP archive and a
+  capture-specific diagnostic report. Preserve local evidence for reports.
+  If the base color interpretation itself cannot be encoded faithfully, retain
+  the source and report as a recoverable export limitation instead of guessing.
 - Prefer meaningful AVFoundation make/model, then matched USB descriptor
   strings, then explicitly attributed USB vendor/product ID lookups. Preserve
   raw API observations separately; generated Exif omits placeholders. Persist

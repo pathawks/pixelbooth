@@ -19,6 +19,7 @@ struct PixelBoothTestRunner {
     await runReproSuite()
     await runModeSelectorSuite()
     await runFormatFrameRateSuite()
+    await runStreamColorObservationSuite()
     await runUSBIdentitySuite()
     await runReadinessSuite()
     await runFreshnessSuite()

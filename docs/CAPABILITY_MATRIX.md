@@ -53,9 +53,23 @@ is shown; samples are never silently converted)
   precedence. Missing or ambiguous matches stay unknown. Supported maximum,
   configured rate, and measured delivery rate are separate facts; no qualified
   per-format CMIO rate query is issued.
+- Ten-bit BT.2020 PQ and HLG samples, color signaling, and content-light-level
+  metadata have synthetic capture/snapshot/JSON/AVIF round-trip coverage. This
+  does not establish HDR delivery from a particular camera. Supplemental
+  mastering-display, ambient-viewing and HDR10+ per-frame metadata is retained
+  in a typed attachment archive and output application XMP, with a local report
+  when native rendering support is pending. It does not reject the shutter.
+  Log transfer, conflicting color descriptions and other base interpretations
+  that cannot be represented faithfully retain a durable source and diagnostic
+  report while final export is unresolved; no silent SDR conversion occurs.
 - No claim in this matrix is accepted from documentation alone: lossless
   claims are verified by encoding fixtures and comparing native-channel
   samples after decoding.
+- Missing delivered YUV matrix metadata is saved as unspecified and produces a
+  retained metadata report, including with an ICC profile. Earlier stream
+  observations are separate evidence, never an automatic color override. The
+  [Brio investigation](BRIO_COLOR_INVESTIGATION.md) verified intermittent tags
+  and differences between USB, advertised, and actual delivered metadata.
 - Layout facts and adapter availability are separate: the shared FourCC model
   describes known formats, while `PixelFormatFourCC.nativePlaneFormats` is the
   exact list routed through production archival adapters.

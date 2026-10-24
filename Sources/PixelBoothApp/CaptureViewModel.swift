@@ -162,7 +162,8 @@ final class FrameIngest: FrameSink, @unchecked Sendable {
       hostMonotonicNanos: source.hostMonotonicNanos,
       hostWallClockISO: source.hostWallClockISO,
       sourceFourCC: source.sourceFourCC,
-      sourceSampleBuffer: source.sourceSampleBuffer ?? source.sampleBuffer)
+      sourceSampleBuffer: source.sourceSampleBuffer ?? source.sampleBuffer,
+      streamColorObservations: source.streamColorObservations)
     CMIOFrameBox.shared.store(output.pixelBuffer, from: source)
     return decodedFrame
   }

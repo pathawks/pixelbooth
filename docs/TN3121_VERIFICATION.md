@@ -142,9 +142,50 @@ property (`kCMIOStreamPropertyFormatDescription`) is settable:
   macOS 27.0 Build 26A428 (app log: renegotiated device format to
   1552×1552).
 
+## BRIO rates and delivered HDR inspection (2026-10-23)
+
+Observed on macOS 27.0.1 (Build 26A434), Logitech BRIO:
+
+- Production `CMIOCaptureDiscovery.modes` enumerated 41 representations and
+  reported a supported maximum rate for all 41. Each advertised CMIO format
+  had one exactly equal AVFoundation format description; dimensions/FourCC
+  alone were insufficient to distinguish the two 1920×1080 `420v` modes.
+  Those modes reported approximately 30 and 60 fps respectively; both
+  3840×2160 and 4096×2160 `420v` modes reported approximately 30 fps.
+- This enumeration only read properties. It did not start an AVFoundation
+  session or issue a qualified CMIO rate query. The qualified-query crash
+  recorded by commit `777b4e4` was not retested; its underlying cause remains
+  unresolved. Current-format CMIO rates are read without a qualifier and
+  associated only with a format that stays equal across the read.
+- Advertised pixel layouts were 8-bit `420v` and `yuvs`. AVFoundation reported
+  only its sRGB capture color space. Advertised format descriptions carried
+  BT.709 primaries/matrix and SMPTE 240M transfer, with no PQ/HLG signaling.
+- A bounded, permission-authorized CMIO probe read one actual buffer in the
+  idle camera's existing 1920×1080 `420v` mode. The sample format description
+  and pixel-buffer attachments agreed on BT.709 primaries/matrix and SMPTE
+  240M transfer. No mastering-display, content-light-level, gamma, or
+  ambient-viewing metadata was present in those inspected attachments.
+  The probe stopped the stream, changed no format/settings, and saved no
+  pixels. This establishes SDR signaling at that delivery boundary; it does
+  not establish whether camera-side RightLight processing was enabled or
+  what the USB-level acquisition path did.
+- Synthetic production-path tests separately verify exact 10-bit BT.2020 PQ
+  and HLG samples and signaling through capture snapshot, JSON persistence,
+  and AVIF decode. These tests do not establish hardware HDR delivery.
+
+Interactive mode switching, full live archival comparison, and Photos
+integration were not exercised by this inspection.
+
 ## Re-verification
 
+The [2026-10-23–24 Brio color investigation](BRIO_COLOR_INVESTIGATION.md)
+extends the single-buffer inspection above. Actual color metadata depends on
+the configured path: some modes delivered BT.601 only on an early frame and
+omitted it thereafter, while others delivered BT.709 throughout. Earlier
+one-buffer results are point-in-time observations, not camera-wide defaults.
+
 Re-run `.build/out/Products/Debug/HardwareProbe` after SDK updates; record
-results in this file with the OS build. The probe restricts delivery
-experiments to built-in cameras so external devices (e.g. Continuity iPhone
-cameras) are never activated by the probe.
+results in this file with the OS build. Ordinary delivery experiments are
+restricted to built-in cameras. The opt-in `--color-metadata --device-uid UID`
+diagnostic can inspect an external camera after refusing busy devices; it
+requires an explicit UID and never automatically substitutes another camera.

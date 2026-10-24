@@ -14,6 +14,12 @@ struct HardwareProbe {
     print("=== PixelBooth hardware probe ===")
     print("OS: \(ProcessInfo.processInfo.operatingSystemVersionString)")
 
+    // This opt-in probe refuses missing authorization instead of displaying
+    // a permission prompt or running any of the existing mode experiments.
+    if CommandLine.arguments.contains("--color-metadata") {
+      exit(await ColorMetadataProbe.run(arguments: Array(CommandLine.arguments.dropFirst())))
+    }
+
     var status = AVCaptureDevice.authorizationStatus(for: .video)
     print("Camera permission: \(status.rawValue)")
 

@@ -36,13 +36,16 @@ public struct DeliveredFrame: @unchecked Sendable {
   /// Set by bounded H.264 admission when a dependency gap requires VideoToolbox
   /// to reset before decoding the next random-access sample.
   public var requiresDecoderReset: Bool
+  /// Earlier actual delivery observations; not inherited per-frame color tags.
+  public var streamColorObservations: [DeliveredColorObservation]?
 
   public init(
     sampleBuffer: CMSampleBuffer, generation: Int, deviceUniqueID: String,
     fourCC: UInt32, width: Int, height: Int, timestampNanos: UInt64,
     hostMonotonicNanos: UInt64, hostWallClockISO: String,
     sourceFourCC: UInt32? = nil, sourceSampleBuffer: CMSampleBuffer? = nil,
-    requiresDecoderReset: Bool = false
+    requiresDecoderReset: Bool = false,
+    streamColorObservations: [DeliveredColorObservation]? = nil
   ) {
     self.sampleBuffer = sampleBuffer
     self.generation = generation
@@ -56,6 +59,7 @@ public struct DeliveredFrame: @unchecked Sendable {
     self.hostMonotonicNanos = hostMonotonicNanos
     self.hostWallClockISO = hostWallClockISO
     self.requiresDecoderReset = requiresDecoderReset
+    self.streamColorObservations = streamColorObservations
   }
 
   public var retainedByteCount: Int {
@@ -185,13 +189,14 @@ extension FrameSink {
   public func streamStopped(_ stop: StreamStop) {}
 }
 
-/// Per-capture-queue delegate. Narrow, documented exception: this class holds
-/// no mutable state and only forwards buffers into the actor; it is confined
-/// to a single capture queue.
+/// Per-capture-queue delegate. Its color-observation tracker is accessed only
+/// by callbacks on the single serial capture queue. A new delegate is created
+/// for each configured stream; immutable device/generation context never changes.
 final class CaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
   weak var service: CaptureService?
   let deviceUniqueID: String
   let generation: Int
+  private var colorTracker = StreamColorObservationTracker()
 
   init(service: CaptureService, deviceUniqueID: String, generation: Int) {
     self.service = service
@@ -204,11 +209,12 @@ final class CaptureDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
     _ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
     from connection: AVCaptureConnection
   ) {
-    guard let service else { return }
-    // The actor hop copies the retained reference, not the buffer contents.
-    // The buffer stays alive for the duration of forwarding; sinks that want
-    // to keep it call CMSampleBufferInvalidate-free retention via storing it.
-    service.forwardBuffer(sampleBuffer, deviceUniqueID: deviceUniqueID, generation: generation)
+    guard let service,
+      var frame = DeliveredFrame.make(
+        sampleBuffer: sampleBuffer, deviceUniqueID: deviceUniqueID, generation: generation)
+    else { return }
+    frame.streamColorObservations = colorTracker.observe(frame)
+    service.forwardFrame(frame)
   }
 }
 
@@ -604,6 +610,10 @@ public actor CaptureService {
       let frame = DeliveredFrame.make(
         sampleBuffer: buffer, deviceUniqueID: deviceUniqueID, generation: generation)
     else { return }
+    forwardFrame(frame)
+  }
+
+  nonisolated func forwardFrame(_ frame: DeliveredFrame) {
     for entry in sinkRegistry.snapshot() { entry.offer(frame) }
   }
 

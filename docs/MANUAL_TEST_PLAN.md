@@ -35,6 +35,22 @@ VID lookup. Inspect the retained capture/report after unplugging: VID, PID,
 USB strings, association method and observation time must remain available.
 Do not infer a connection from a matching camera display name.
 
+Metadata report checks: use a known HDR/metadata-capable source. An unmapped
+supplemental attachment must not reject the shutter. Verify exact native-channel
+output, report availability in Capture Status, exported JSON, archive data in
+the finalized file's XMP, and survival across relaunch without duplicate import.
+Confirm local report captures consume staging capacity and explicit deletion
+reclaims it. If the base color interpretation is unavailable, verify a durable
+local source/report and an export limitation rather than a discarded shutter.
+
+For YUV with an ICC profile but no matrix attachment, confirm the image saves
+with an unspecified matrix and an available report. Check that early stream
+color observations survive capture, relaunch and XMP embedding, retain their
+own frame/time/generation/profile identity, and do not become a shutter-frame
+matrix override. Reconfigure or disconnect and verify old stream observations
+cannot appear in a new configuration. Compare the opt-in color probe across
+backends; see [the Brio investigation](BRIO_COLOR_INVESTIGATION.md).
+
 ## 2. Native delivery verification (TN3121)
 
 1. Select a UVC camera exposing MJPEG.
