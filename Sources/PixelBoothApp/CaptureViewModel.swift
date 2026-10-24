@@ -1149,6 +1149,8 @@ final class CaptureViewModel: ObservableObject {
       case nil: "unknown"
       }
     snapshot.captureBackendVersion = ProcessInfo.processInfo.operatingSystemVersionString
+    snapshot.includeEstimatedDisparity =
+      UserDefaults.standard.object(forKey: "includeEstimatedDisparity") as? Bool ?? true
     guard shutterRevision == configurationRevision, frame.deviceUniqueID == self.activeDeviceID,
       frame.generation == self.activeGeneration
     else {

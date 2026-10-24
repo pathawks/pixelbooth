@@ -12,6 +12,8 @@ image data** and **explaining exactly what was saved**.
   [`docs/CAPABILITY_MATRIX.md`](docs/CAPABILITY_MATRIX.md), encoded in-process
   by pinned libavif + libaom at speed 0 and verified by exact native-channel
   round-trip comparison
+- **Estimated disparity** in AVIF using DepthAnythingV2 Small, running locally
+  through Core ML; the primary image remains sample-exact
 - Photos-first saving with durable staging, a crash-recoverable journal, and
   recoverable failure states
 
@@ -62,6 +64,104 @@ captures recoverable for the next launch.
 | `swift run --skip-build PixelBoothTestRunner` | Automated test suite |
 | `scripts/fetch_deps.sh` | Re-fetch/rebuild libavif 1.3.0 + libaom 3.13.1 (checksum-verified) |
 | `scripts/fetch_depth_model.sh` | Fetch, verify, and compile the selected pinned DepthAnythingV2 Core ML model |
+
+## Estimated disparity in AVIF
+
+Settings > Disparity > **Include Estimated Disparity in AVIF** is initially
+enabled. The choice is saved with each accepted capture, so changing it does
+not change photographs already queued. Older staged captures without that
+choice retain their original behavior. JPEG passthrough captures remain JPEG.
+
+The checked-in build choices are Apple's Apache-2.0 Core ML conversions of
+**DepthAnythingV2 Small F16** (default) and **Small F32**. Inference runs locally
+during encoding, once per photograph. No model download or network access
+happens during capture. Build scripts fetch the pinned model files with
+SHA-256 verification and compile them with Xcode.
+
+Choose a public build variant explicitly:
+
+```sh
+PIXELBOOTH_DEPTH_VARIANT=SmallF16 scripts/build_app.sh
+PIXELBOOTH_DEPTH_VARIANT=SmallF32 scripts/build_app.sh
+```
+
+The same selection works with `scripts/validate.sh` and
+`scripts/fetch_depth_model.sh`. CI validates both Small variants. An explicit
+variant takes precedence over the automatic local override.
+
+A Git-ignored `depth-model.local.json` can supply a personal pinned model,
+including Large, without changing the checked-in catalog. When present,
+ordinary `scripts/build_app.sh` and `scripts/validate.sh` use that override.
+The local file contains the model's immutable source, checksums, license and
+actual Core ML interface, using `{"schemaVersion": 1, "model": ...}` with the
+same model-entry schema as [`scripts/depth-models.json`](scripts/depth-models.json).
+Model weights, compiled models and the local
+configuration stay out of Git. Large weights use CC-BY-NC-4.0; a personal
+Large build carries that model's license rather than claiming the Small
+model's Apache license.
+
+The resulting app contains one selected model, its `DepthModel.json`
+descriptor, and its full license. Switching variants replaces those resources
+together. The runtime verifies the selected model's feature names, geometry,
+output representation and version; saved disparity metadata and the inspector
+identify the model actually used. Invalid selections fail explicitly.
+
+Inference uses a separate 8-bit sRGB rendering of the verified primary AVIF,
+with alpha composited on black, stretched to the selected model's full input
+field without cropping or mirroring (518×392 for Apple's Small models). This
+can distort aspect ratio for the estimate. The primary archival planes never
+pass through that rendering and are never resized. The auxiliary map retains
+the selected model's output geometry and maps over the full primary image.
+
+The map is an **application-generated relative inverse-depth estimate**, with
+larger values nearer. It is neither measured camera depth nor a distance in
+meters. The model's floating-point predictions are normalized using their
+minimum/maximum and quantized to 8 bits. A hidden monochrome AV1 auxiliary
+image stores those prepared samples losslessly, with a depth `auxC` property
+and `auxl` reference to the primary image. Its XMP records
+`NativeFormat=fdis`, `StoredFormat=L008` (numeric pixel-format identifiers on
+disk), relative accuracy, model identity, normalization bounds, and the
+application-generated origin. Apple's float/integer endpoint fields allow
+ImageIO to reconstruct native Float32 disparity. This does not restore precision
+discarded by quantization or mean the file stores exact Float32 predictions.
+
+With a Portrait rendering intent, the native endpoints use the fixed
+`portrait-relative-v1` range (approximately 1.777344–6.09375). This application
+rendering scale prevents arbitrary model output ranges from exaggerating blur
+and applies equally to Small and Large outputs. The source model bounds and
+quantization remain recorded separately, so the prepared samples can still be
+reconstructed in their original relative scale. A constant estimate stays
+uniform at the rendering minimum. This range was preferred in one manual
+capture comparison; it is an artistic default, not measured physical distance
+or camera calibration. Attachments without a rendering intent retain the
+source reconstruction range; older journal descriptors retain that behavior.
+
+Validation decodes the prepared disparity plane and compares every sample;
+it also checks that attaching the map preserves the primary image's coding
+data and decoded native channels. Inference or auxiliary validation failures
+retain the staged source and expose a recoverable encoding failure. Processing
+remains serialized and staging reserves additional space for the map.
+
+The synthetic inference fixture also checks native `fdis` reconstruction through
+ImageIO and `AVDepthData`, including relative accuracy and every reconstructed
+sample. Enabled AVIF captures also carry an application-selected rendering
+intent: a centered 10% × 10% MWG `Focus` region on the primary image and
+`depthBlurEffect:SimulatedAperture=2.8` on the disparity item. Their versioned
+provenance identifies application defaults, not detected subjects, camera
+autofocus, or the camera's physical aperture. Primary focus dimensions refer
+to the saved image, independent of model geometry and preview mirroring.
+Existing source Exif is retained verbatim; source XMP properties win conflicts
+when the application fields are merged. Compatible source face regions are
+retained alongside the generated Focus region; an existing source Focus takes
+precedence. Ambiguous region structures or mismatched source dimensions are
+retained without adding a default region or guessing a coordinate conversion.
+
+Native Core Image checks verify that its depth-blur factory reads the saved
+focus and aperture defaults. These checks do not establish Apple Photos
+Portrait recognition or real-world estimation accuracy. Photos remains a
+separate manual check. We do not copy an opaque iPhone `REND` block or Apple
+MakerNote, invent camera calibration, or declare unmeasured depth quality to
+claim Portrait support.
 
 ## Project-local Xcode selection
 

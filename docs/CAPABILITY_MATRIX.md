@@ -11,6 +11,7 @@ is shown; samples are never silently converted)
 |--------|--------|----------|
 | JPEG (passthrough) | ✅ pipeline + tests | Segment-level byte exactness through metadata-only insertion (`JPEGAndAVIFSuites.swift`) |
 | AVIF (lossless) | ✅ | libavif 1.3.0 + libaom 3.13.1, quality 100, speed 0; exact native-channel decode-compare (smoke + `AVIFRoundTripTests` section of the runner) |
+| AVIF estimated disparity auxiliary | ✅ synthetic software path; production Photos recognition unverified | Build-selected DepthAnythingV2, relative estimate, quantized L008 lossless AV1 storage; primary samples unchanged; versioned virtual Portrait scale with retained raw model bounds; ImageIO/AVDepthData fdis reconstruction; application-default MWG focus + simulated aperture read by Core Image (`AVIFDisparitySuite`, `DepthSuite`, `DisparityQueueSuite`, `PortraitMetadataSuite`) |
 | HEIC | — excluded by product decision; never an output | — |
 
 ## Input representations

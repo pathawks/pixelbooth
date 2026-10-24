@@ -40,6 +40,8 @@ struct PixelBoothTestRunner {
     await runCaptureConcurrencySuite()
     await runPersistenceSuite()
     await runSaveQueueBufferSuite()
+    await runDisparityQueueSuite()
+    await runDepthConfigurationQueueSuite()
     await runRecoverySuite()
     runHardwareDependentNotes()
     exit(Int32(reportSummary()))

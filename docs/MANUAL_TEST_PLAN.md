@@ -85,6 +85,45 @@ Expected: image-coding data identical; only metadata additions differ.
 
 Expected: lossless round-trip verified; no invented settings.
 
+### Estimated disparity
+
+For build-selection regression, use explicit `PIXELBOOTH_DEPTH_VARIANT=SmallF16`
+or `SmallF32` when assembling the app. A personal `depth-model.local.json`
+override applies only when no explicit preset is selected. Confirm the bundled
+`DepthModel.json`, model and license match that selection, then reopen the
+assembled app before the capture checks below. A Large build must identify
+Large in saved metadata and the inspector rather than retaining Small labels.
+
+1. Build with `scripts/build_app.sh` and reopen the assembled app. In Settings,
+   confirm Include Estimated Disparity in AVIF is enabled. Capture a supported
+   uncompressed or decoded H.264 frame and confirm the save details identify
+   DepthAnythingV2, relative disparity, and verified `fdis/L008` storage.
+2. Compare with the setting disabled: primary dimensions, native channels,
+   range, color descriptors and alpha must remain identical for the same staged
+   source. Mirror Preview must not mirror either saved primary or saved map.
+3. Queue a capture, change the setting, and relaunch with waiting work. Its
+   shutter-time request must survive; changing Settings affects new captures.
+4. Separately inspect auxiliary readback using ImageIO/AVDepthData, recording
+   actual type, geometry, sample representation and relative accuracy. Failure
+   to expose an Apple depth dictionary is distinct from AVIF container/sample
+   verification and must be reported.
+5. Check that primary XMP contains an MWG `Focus` region with the saved primary
+   dimensions and that depth XMP contains `SimulatedAperture=2.8`, with
+   application-default provenance. The initial focus is centered; it is not a
+   detected person, pet or camera autofocus result. The native Core Image
+   depth-blur factory must read aperture 2.8 and focus rectangle
+   `[0.45, 0.45, 0.1, 0.1]` in normalized lower-left coordinates.
+6. Only the user performs Photos import/recognition checks. Record the exact
+   file SHA-256 and Photos/macOS versions, whether Portrait controls appear,
+   and whether toggling Portrait, changing aperture and moving focus visibly
+   work after reopening the photo. Record export/reimport separately. These
+   behaviors are not established by the automated tests. Do not infer metric
+   distances, camera calibration, or Portrait support from `fdis` or native
+   Core Image rendering alone.
+
+Automated tests use generated patterns and an injected importer; they do not
+open, import into, or otherwise modify a Photos library.
+
 ## 5. H.264 input
 
 The automated 8-bit encoded-fixture-to-AVIF acceptance test passed on macOS

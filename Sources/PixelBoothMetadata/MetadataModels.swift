@@ -88,6 +88,9 @@ public struct FrameMetadataSnapshot: Hashable, Sendable, Codable {
   /// Capture backend and host software version observed at the shutter.
   public var captureBackend: String?
   public var captureBackendVersion: String?
+  /// Shutter-time request for application-generated relative disparity in AVIF.
+  /// Nil means no request in legacy snapshots; JPEG passthrough is unaffected.
+  public var includeEstimatedDisparity: Bool?
   public var attachmentArchive: CaptureAttachmentArchive?
   /// Only blocks final encoding when the base color interpretation itself is
   /// unavailable. Source pixels and metadata can still be staged durably.
@@ -114,6 +117,7 @@ public struct FrameMetadataSnapshot: Hashable, Sendable, Codable {
     hostObservedDeviceModel: String? = nil,
     captureBackend: String? = nil,
     captureBackendVersion: String? = nil,
+    includeEstimatedDisparity: Bool? = nil,
     attachmentArchive: CaptureAttachmentArchive? = nil,
     colorEncodingFailure: String? = nil,
     usbIdentity: USBDeviceIdentity? = nil,
@@ -137,6 +141,7 @@ public struct FrameMetadataSnapshot: Hashable, Sendable, Codable {
     self.hostObservedDeviceModel = hostObservedDeviceModel
     self.captureBackend = captureBackend
     self.captureBackendVersion = captureBackendVersion
+    self.includeEstimatedDisparity = includeEstimatedDisparity
     self.attachmentArchive = attachmentArchive
     self.colorEncodingFailure = colorEncodingFailure
     self.usbIdentity = usbIdentity

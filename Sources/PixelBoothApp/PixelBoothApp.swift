@@ -1316,6 +1316,7 @@ struct ShutterButton: View {
 }
 
 struct SettingsView: View {
+  @AppStorage("includeEstimatedDisparity") private var includeEstimatedDisparity = true
   @AppStorage("includeLocation") private var includeLocation = true
   @AppStorage("locationMaximumAge") private var locationMaximumAge = 60.0
   @AppStorage("countdownSeconds") private var countdownSeconds = 0.0
@@ -1351,6 +1352,16 @@ struct SettingsView: View {
         Text("Capture")
       } footer: {
         Text("Captures are added directly to Photos.")
+      }
+
+      Section {
+        Toggle("Include Estimated Disparity in AVIF", isOn: $includeEstimatedDisparity)
+      } header: {
+        Text("Disparity")
+      } footer: {
+        Text(
+          "DepthAnythingV2 runs on this Mac to add a relative disparity map. Estimates are not measured distances. This adds processing time; the original image samples are preserved. JPEG captures are unchanged."
+        )
       }
 
       Section("Preview") {

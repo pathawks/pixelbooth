@@ -56,7 +56,7 @@ let package = Package(
     // AVFoundation capture: discovery, configuration, sample delivery, provenance.
     .target(name: "PixelBoothCapture", dependencies: ["PixelBoothCore", "PixelBoothAdapters"], path: "Sources/PixelBoothCapture"),
     // Destination: staging, journal, Photos-first import, recovery.
-    .target(name: "PixelBoothLibrary", dependencies: ["PixelBoothCore", "PixelBoothAVIF", "PixelBoothAdapters", "PixelBoothCapture", "PixelBoothMetadata", "PixelBoothJPEG"], path: "Sources/PixelBoothLibrary"),
+    .target(name: "PixelBoothLibrary", dependencies: ["PixelBoothCore", "PixelBoothAVIF", "PixelBoothDepth", "PixelBoothAdapters", "PixelBoothCapture", "PixelBoothMetadata", "PixelBoothJPEG"], path: "Sources/PixelBoothLibrary"),
     // SwiftUI application.
     .executableTarget(
       name: "PixelBoothApp",

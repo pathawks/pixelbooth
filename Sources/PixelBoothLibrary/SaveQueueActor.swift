@@ -10,6 +10,7 @@ import PixelBoothAVIF
 import PixelBoothAdapters
 import PixelBoothCapture
 import PixelBoothCore
+import PixelBoothDepth
 import PixelBoothJPEG
 import PixelBoothMetadata
 
@@ -138,10 +139,53 @@ private actor StagedFileValidationWorker {
 /// Serializes all AOM work so Save As can request the same encoder without
 /// competing with a background Photos encode or exceeding the thread budget.
 private actor AVIFEncodingWorker {
+  private let estimator = DepthAnythingV2Estimator()
+  private let testDisparityEstimator: (@Sendable ([UInt8]) async throws -> RelativeDisparityMap)?
+  private var encoding = false
+  private var waiters: [CheckedContinuation<Void, Never>] = []
+
+  init(disparityEstimator: (@Sendable ([UInt8]) async throws -> RelativeDisparityMap)? = nil) {
+    self.testDisparityEstimator = disparityEstimator
+  }
+
   func encode(
-    _ capture: CapturedCapture, exifPayload: [UInt8], xmpPayload: [UInt8]
-  ) throws -> (data: [UInt8], settings: LosslessAVIF.AppliedSettings) {
-    try capture.encodeAVIF(exifPayload: exifPayload, xmpPayload: xmpPayload)
+    _ capture: CapturedCapture, exifPayload: [UInt8], xmpPayload: [UInt8],
+    portraitRenderIntent: PortraitRenderIntent?
+  ) async throws -> (
+    data: [UInt8], settings: LosslessAVIF.AppliedSettings, disparity: AVIFDisparity.Descriptor?
+  ) {
+    // Keep the entire job serialized across the estimator actor hop, including
+    // an overlapping explicit Save Original request. No second AOM job starts
+    // while a primary image and its derived map are in flight.
+    if encoding {
+      await withCheckedContinuation { waiters.append($0) }
+    }
+    encoding = true
+    defer {
+      if waiters.isEmpty {
+        encoding = false
+      } else {
+        waiters.removeFirst().resume()
+      }
+    }
+    try Task.checkCancellation()
+    let primary = try capture.encodeAVIF(exifPayload: exifPayload, xmpPayload: xmpPayload)
+    guard capture.metadata.includeEstimatedDisparity == true else {
+      return (primary.data, primary.settings, nil)
+    }
+    let map: RelativeDisparityMap
+    if let testDisparityEstimator {
+      map = try await testDisparityEstimator(primary.data)
+    } else {
+      map = try await estimator.estimate(avifData: primary.data)
+    }
+    let result = try AVIFDisparity.attach(
+      to: primary.data, width: map.width, height: map.height,
+      relativeDisparity: map.values,
+      modelIdentifier: map.modelIdentifier,
+      preprocessingDescription: map.preprocessingDescription,
+      outputDescription: map.outputDescription, portraitRenderIntent: portraitRenderIntent)
+    return (result.data, primary.settings, result.descriptor)
   }
 }
 
@@ -318,7 +362,7 @@ public actor SaveQueueActor {
   private var stagingRoot: URL
   private let saveAsWorker = SaveAsWorker()
   private let stagedFileValidationWorker = StagedFileValidationWorker()
-  private let avifEncodingWorker = AVIFEncodingWorker()
+  private let avifEncodingWorker: AVIFEncodingWorker
   private let journalMaxEntries = 200
   private let maximumStagedBytes: UInt64
   private let testImporter: (@Sendable (URL, Date) async -> ImportResult)?
@@ -328,8 +372,10 @@ public actor SaveQueueActor {
     stagingRoot: URL? = nil,
     importer: (@Sendable (URL, Date) async -> ImportResult)? = nil,
     maximumStagedBytes: UInt64 = 512 * 1024 * 1024,
-    photosAuthorizationProvider: (@Sendable (Bool) async -> PhotosAuthorizationState)? = nil
+    photosAuthorizationProvider: (@Sendable (Bool) async -> PhotosAuthorizationState)? = nil,
+    disparityEstimator: (@Sendable ([UInt8]) async throws -> RelativeDisparityMap)? = nil
   ) {
+    self.avifEncodingWorker = AVIFEncodingWorker(disparityEstimator: disparityEstimator)
     self.testImporter = importer
     self.testPhotosAuthorizationProvider = photosAuthorizationProvider
     self.maximumStagedBytes = maximumStagedBytes
@@ -624,6 +670,10 @@ public actor SaveQueueActor {
 
     case .planes(let snapshot):
       let dimensions = try snapshot.nativeDimensions()
+      let portraitRenderIntent =
+        capture.metadata.includeEstimatedDisparity == true
+        ? try PortraitRenderIntent(primaryWidth: dimensions.width, primaryHeight: dimensions.height)
+        : nil
       // Lossless AVIF from planes, verified by exact native-channel decode.
       // Metadata: the same application XMP provenance model as the JPEG path,
       // plus Exif carrying the host-observed device identity and capture time
@@ -631,7 +681,7 @@ public actor SaveQueueActor {
       // never presented as camera-provided metadata).
       let provenance =
         try Self.deviceIdentityProvenance(capture) + capture.archivedMetadataProvenance()
-      let xmp = PixelBoothXMP.build(
+      let generatedXMP = PixelBoothXMP.build(
         captureUUID: capture.uuid, appVersion: AppVersion.current,
         captureBackend: capture.metadata.captureBackend ?? "unknown",
         backendVersion: capture.metadata.captureBackendVersion ?? "unknown",
@@ -645,21 +695,44 @@ public actor SaveQueueActor {
         mediaTimeNanos: capture.timestampNanos,
         wallClockAnchorISO: capture.metadata.wallClockAnchorISO,
         sourceFormat: CaptureFormat.fourCCString(capture.fourCC),
-        dataSource: String(describing: capture.dataSource ?? .unknown))
-      let exif = ExifBuilder.build(
-        make: capture.metadata.deviceIdentity?.manufacturer
-          ?? capture.metadata.hostObservedDeviceMake,
-        model: capture.metadata.deviceIdentity?.model ?? capture.metadata.hostObservedDeviceModel,
-        software: "PixelBooth \(AppVersion.current)",
-        captureISO: capture.acceptedAtISO,
-        location: capture.metadata.hostLocation)
-      let (data, settings) = try await avifEncodingWorker.encode(
-        capture, exifPayload: exif, xmpPayload: xmp)
+        dataSource: String(describing: capture.dataSource ?? .unknown),
+        portraitRenderIntent: portraitRenderIntent)
+      let xmp: [UInt8]
+      if let sourceXMP = capture.metadata.embeddedSourceXMP {
+        xmp = try JPEGMetadataWriter.mergingXMP(source: sourceXMP, additional: generatedXMP)
+      } else {
+        xmp = generatedXMP
+      }
+      let exif =
+        capture.metadata.embeddedSourceExif
+        ?? ExifBuilder.build(
+          make: capture.metadata.deviceIdentity?.manufacturer
+            ?? capture.metadata.hostObservedDeviceMake,
+          model: capture.metadata.deviceIdentity?.model ?? capture.metadata.hostObservedDeviceModel,
+          software: "PixelBooth \(AppVersion.current)",
+          captureISO: capture.acceptedAtISO,
+          location: capture.metadata.hostLocation)
+      let (data, settings, disparity) = try await avifEncodingWorker.encode(
+        capture, exifPayload: exif, xmpPayload: xmp, portraitRenderIntent: portraitRenderIntent)
       let url = dir.appendingPathComponent("capture.avif")
       try durableAtomicWrite(Data(data), to: url)
       let digest = SHA256.hash(data: data)
       let hex = digest.map { String(format: "%02x", $0) }.joined()
-      return (url, hex, settings.codec, "quality=\(settings.quality) speed=\(settings.speed)")
+      var appliedSettings = "quality=\(settings.quality) speed=\(settings.speed)"
+      if let disparity {
+        appliedSettings +=
+          "; DepthAnythingV2 estimated relative disparity \(disparity.width)×\(disparity.height) fdis/L008, lossless storage verified"
+        appliedSettings += "; model=\(disparity.modelIdentifier)"
+        if let scale = disparity.renderingScale {
+          appliedSettings +=
+            "; application relative render scale=\(scale.rawValue) \(disparity.nativeMinimumDisparity)…\(disparity.nativeMaximumDisparity)"
+        }
+        if let intent = disparity.portraitRenderIntent {
+          appliedSettings +=
+            "; application render intent v1: simulated aperture \(intent.simulatedAperture), center focus; Photos Portrait recognition unverified"
+        }
+      }
+      return (url, hex, settings.codec, appliedSettings)
     }
   }
 
@@ -1029,6 +1102,13 @@ public actor SaveQueueActor {
       let (withMetadata, additionOverflow) = outputReserve.addingReportingOverflow(metadataReserve)
       guard !overflow, !additionOverflow else { throw capacityExceededError() }
       outputReserve = withMetadata
+    }
+    if case .planes = capture.payload, capture.metadata.includeEstimatedDisparity == true {
+      // Configurations allow at most 1,048,576 gray8 samples. Include a
+      // conservative encoding/metadata allowance for output and its atomic copy.
+      let (withDisparity, overflow) = outputReserve.addingReportingOverflow(2 * 1024 * 1024)
+      guard !overflow else { throw capacityExceededError() }
+      outputReserve = withDisparity
     }
     let (sourceAndOutput, firstOverflow) = UInt64(encodedSourceBytes).addingReportingOverflow(
       outputReserve)
