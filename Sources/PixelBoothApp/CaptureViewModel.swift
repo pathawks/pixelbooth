@@ -904,6 +904,7 @@ final class CaptureViewModel: ObservableObject {
 
         let backend: Backend
         let selectedFrameRate: Double?
+        let configuredMode: CameraMode
         do {
           _ = try await self.cmioService.configure(
             deviceUniqueID: id, mode: cameraMode,
@@ -911,6 +912,7 @@ final class CaptureViewModel: ObservableObject {
             operationToken: self.configurationToken)
           guard self.windowActive, revision == self.configurationRevision else { return }
           selectedFrameRate = await self.cmioService.configuredFrameRate
+          configuredMode = await self.cmioService.configuredMode ?? cameraMode
           guard self.windowActive, revision == self.configurationRevision else { return }
           backend = .cmio
         } catch {
@@ -922,6 +924,7 @@ final class CaptureViewModel: ObservableObject {
             operationToken: self.configurationToken)
           guard self.windowActive, revision == self.configurationRevision else { return }
           selectedFrameRate = await self.service.configuredFrameRate
+          configuredMode = cameraMode
           guard self.windowActive, revision == self.configurationRevision else { return }
           backend = .avfoundation
         }
@@ -929,7 +932,10 @@ final class CaptureViewModel: ObservableObject {
         guard self.windowActive, revision == self.configurationRevision else { return }
         self.activeBackend = backend
         self.configuredFrameRate = selectedFrameRate
-        self.activeMode = cameraMode.asCaptureFormat
+        if let index = self.availableModes.firstIndex(where: { $0.id == configuredMode.id }) {
+          self.availableModes[index] = configuredMode
+        }
+        self.activeMode = configuredMode.asCaptureFormat
         self.activeGeneration = configurationGeneration
         self.activeDeviceID = id
         CMIOFrameBox.shared.beginConfiguration(
@@ -938,7 +944,7 @@ final class CaptureViewModel: ObservableObject {
         await self.ingest.beginConfiguration(
           deviceID: id, generation: configurationGeneration,
           frameIntervalNanos: frameIntervalNanos,
-          expectedFormat: cameraMode.asCaptureFormat)
+          expectedFormat: configuredMode.asCaptureFormat)
         guard self.windowActive, revision == self.configurationRevision else { return }
         switch backend {
         case .cmio:

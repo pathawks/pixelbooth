@@ -126,7 +126,7 @@ enum CMIOProperty {
   static func doubleProperty(_ objectID: CMIOObjectID, _ selector: CMIOObjectPropertySelector)
     -> Double?
   {
-    guard let size = rawDataSize(objectID, selector), size >= MemoryLayout<Double>.size else {
+    guard let size = rawDataSize(objectID, selector), size == MemoryLayout<Double>.size else {
       return nil
     }
     var addr = address(selector)
@@ -308,66 +308,75 @@ public enum CMIOCaptureDiscovery {
   }
 
   /// CameraMode list from the CMIO stream's advertised formats, with depth,
-  /// chroma, and range filled from the shared FourCC facts table. Frame rates
-  /// are queried only for the format the stream is currently delivering (the
-  /// qualified per-format query crashes the camera plugin on this OS build —
-  /// TN3121 finding 5); all other modes report the rate as unknown.
+  /// chroma, and range filled from the shared FourCC facts table. Rates come
+  /// from exact AVFoundation format matches, with the current format's CMIO
+  /// capabilities taking precedence. Enumeration never starts an AVF session
+  /// or issues a qualified CMIO property query.
   public static func modes(deviceUID: String) -> [CameraMode] {
     guard let located = locate(deviceUID: deviceUID) else { return [] }
-    let current = currentFormat(located)
-    let currentDims = current.map { CMVideoFormatDescriptionGetDimensions($0) }
-    let currentFourCC = current.map { CMFormatDescriptionGetMediaSubType($0) }
+    let advertised =
+      AVCaptureDevice(uniqueID: deviceUID)?.formats.map {
+        FormatFrameRateCapabilities(format: $0)
+      } ?? []
+    let current = currentFrameRateCapabilities(located)
     return formats(located).map { desc in
       let dims = CMVideoFormatDescriptionGetDimensions(desc)
       let fourCC = CMFormatDescriptionGetMediaSubType(desc)
       let probe = CaptureFormatFacts.applying(
         to: CaptureFormat(
           width: Int(dims.width), height: Int(dims.height), fourCC: fourCC))
-      var minRate = 0.0
-      var maxRate = 0.0
-      // Rates are queried only for the format the stream currently delivers;
-      // the qualified per-format read crashes the plugin (finding 5).
-      let isCurrent =
-        currentDims?.width != nil && Int(dims.width) == Int(currentDims!.width)
-        && Int(dims.height) == Int(currentDims!.height) && fourCC == currentFourCC
-      if isCurrent, let ranges = frameRateRangesForCurrentFormat(located) {
-        minRate = ranges.map { $0.minimum }.min() ?? 0
-        maxRate = ranges.map { $0.maximum }.max() ?? 0
-      }
-      return CameraMode(
+      let mode = CameraMode(
         deviceID: deviceUID,
         formatID: formatIdentity(desc),
         mediaSubType: fourCC,
         dimensions: (Int(dims.width), Int(dims.height)),
-        minFrameRate: minRate, maxFrameRate: maxRate,
+        minFrameRate: 0, maxFrameRate: 0,
         pixelFormat: fourCC,
         bitsPerChannel: probe.bitsPerChannel,
         chromaSampling: probe.chromaSampling,
         yuvRange: probe.yuvRange)
+      return FormatFrameRateCapabilities.matching(
+        desc, current: current, advertised: advertised)?.updating(mode) ?? mode
     }
+  }
+
+  /// Associate an unqualified rate read only with a stable current format.
+  /// A format change during the query leaves the capabilities unknown.
+  static func currentFrameRateCapabilities(_ located: Located) -> FormatFrameRateCapabilities? {
+    guard let before = currentFormat(located),
+      let ranges = frameRateRangesForCurrentFormat(located),
+      let after = currentFormat(located),
+      CMFormatDescriptionEqual(before, otherFormatDescription: after)
+    else { return nil }
+    return FormatFrameRateCapabilities(
+      formatDescription: after,
+      ranges: ranges.map { SupportedFrameRateRange(minimum: $0.minimum, maximum: $0.maximum) })
   }
 
   /// Frame-rate ranges (fps) for the stream's CURRENT format, via an
   /// unqualified property read. The QUALIFIED variant (passing a format
   /// description) crashes the camera plugin on this OS build —
   /// `GetFormatIndexFromQualifier → CFEqual` on DAL-internal state (verified
-  /// crash, TN3121 finding 5) — so it must never be called. Rates for
-  /// non-current formats are therefore reported as unknown, never zero.
+  /// crash recorded in commit 777b4e4) — so it must never be called. Other
+  /// formats obtain rates only through exact AVFoundation description matches.
   public static func frameRateRangesForCurrentFormat(_ located: Located)
     -> [(minimum: Double, maximum: Double)]?
   {
     var addr = CMIOProperty.address(CMIOProperty.frameRateRangesSelector)
     var size: UInt32 = 0
-    guard CMIOObjectGetPropertyDataSize(located.streamID, &addr, 0, nil, &size) == 0, size > 0
+    let stride = MemoryLayout<AudioValueRange>.size
+    guard CMIOObjectGetPropertyDataSize(located.streamID, &addr, 0, nil, &size) == 0,
+      size > 0, size <= 1_048_576, Int(size).isMultiple(of: stride)
     else { return nil }
     var buffer = Array(
       repeating: AudioValueRange(mMinimum: 0, mMaximum: 0),
-      count: Int(size) / MemoryLayout<AudioValueRange>.size)
+      count: Int(size) / stride)
     var used: UInt32 = 0
-    guard CMIOObjectGetPropertyData(located.streamID, &addr, 0, nil, size, &used, &buffer) == 0
+    guard CMIOObjectGetPropertyData(located.streamID, &addr, 0, nil, size, &used, &buffer) == 0,
+      used <= size, Int(used).isMultiple(of: stride)
     else { return nil }
-    let count = Int(used) / MemoryLayout<AudioValueRange>.size
-    return buffer.prefix(count).map { (max(0, $0.mMinimum), max(0, $0.mMaximum)) }
+    let count = Int(used) / stride
+    return buffer.prefix(count).map { ($0.mMinimum, $0.mMaximum) }
   }
 
   /// Find the advertised format matching a mode's dimensions and pixel format.
@@ -524,6 +533,7 @@ public actor CMIOCaptureService {
   private var callbackRefCon: UnsafeMutableRawPointer?
   private let sinkRegistry = SinkRegistry()
   public private(set) var configuredFrameRate: Double?
+  public private(set) var configuredMode: CameraMode?
 
   public init() {}
 
@@ -541,7 +551,7 @@ public actor CMIOCaptureService {
   /// 1552×1552. The direct CMIO format write, by contrast, crashes the
   /// camera plugin (TN3121 finding 4) and must not be used.
   private func renegotiateViaAVFoundation(
-    deviceUniqueID: String, mode: CameraMode,
+    deviceUniqueID: String, mode: CameraMode, target: CMFormatDescription,
     operationToken: CaptureConfigurationToken?, revision: Int?
   ) throws {
     if let revision, let operationToken, !operationToken.isCurrent(revision) {
@@ -550,18 +560,16 @@ public actor CMIOCaptureService {
     guard let device = AVCaptureDevice(uniqueID: deviceUniqueID) else {
       throw CMIOCaptureError.deviceNotFound(deviceUniqueID)
     }
-    guard
-      let avfFormat = device.formats.first(where: { fmt in
-        let d = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
-        return Int(d.width) == mode.dimensions.width && Int(d.height) == mode.dimensions.height
-          && CMFormatDescriptionGetMediaSubType(fmt.formatDescription) == mode.mediaSubType
-      })
-    else {
+    let matchingFormats = device.formats.filter {
+      CMFormatDescriptionEqual(target, otherFormatDescription: $0.formatDescription)
+    }
+    guard matchingFormats.count == 1 else {
       throw CMIOCaptureError.formatUnavailable(
         width: mode.dimensions.width,
         height: mode.dimensions.height,
         fourCC: mode.mediaSubType)
     }
+    let avfFormat = matchingFormats[0]
     let session = AVCaptureSession()
     guard let input = try? AVCaptureDeviceInput(device: device),
       session.canAddInput(input)
@@ -592,6 +600,7 @@ public actor CMIOCaptureService {
     {
       throw CMIOCaptureError.configurationSuperseded
     }
+    configuredMode = nil
     guard let located = CMIOCaptureDiscovery.locate(deviceUID: deviceUniqueID) else {
       throw CMIOCaptureError.deviceNotFound(deviceUniqueID)
     }
@@ -601,7 +610,6 @@ public actor CMIOCaptureService {
         fourCC: mode.mediaSubType)
     }
     let targetDims = CMVideoFormatDescriptionGetDimensions(target)
-    let targetFourCC = CMFormatDescriptionGetMediaSubType(target)
 
     detachDelivery()
 
@@ -611,9 +619,7 @@ public actor CMIOCaptureService {
     // `activeFormat` path and verify the CMIO stream followed.
     func streamMatchesRequest() -> Bool {
       guard let current = CMIOCaptureDiscovery.currentFormat(located) else { return false }
-      let dims = CMVideoFormatDescriptionGetDimensions(current)
-      return Int(dims.width) == mode.dimensions.width && Int(dims.height) == mode.dimensions.height
-        && CMFormatDescriptionGetMediaSubType(current) == targetFourCC
+      return CMFormatDescriptionEqual(target, otherFormatDescription: current)
     }
 
     if streamMatchesRequest() {
@@ -622,7 +628,7 @@ public actor CMIOCaptureService {
       )
     } else {
       try renegotiateViaAVFoundation(
-        deviceUniqueID: deviceUniqueID, mode: mode,
+        deviceUniqueID: deviceUniqueID, mode: mode, target: target,
         operationToken: operationToken, revision: requestedGeneration)
       // Poll briefly for the renegotiation to become visible at the CMIO
       // layer, then verify; refusal (with AVFoundation fallback) is honest.
@@ -658,10 +664,10 @@ public actor CMIOCaptureService {
         "CMIO configure: renegotiated device format to \(targetDims.width)×\(targetDims.height)")
     }
 
-    let frameRanges =
-      CMIOCaptureDiscovery.frameRateRangesForCurrentFormat(located)?.map {
-        SupportedFrameRateRange(minimum: $0.minimum, maximum: $0.maximum)
-      } ?? []
+    let capabilities = CMIOCaptureDiscovery.currentFrameRateCapabilities(located)
+    let matchedCapabilities = FormatFrameRateCapabilities.matching(
+      target, current: capabilities, advertised: [])
+    let frameRanges = matchedCapabilities?.ranges ?? []
     let rateCeiling = requestedFrameRate ?? (mode.maxFrameRate > 0 ? mode.maxFrameRate : nil)
     let chosenRate = FrameRateSelection.highestSupported(in: frameRanges, ceiling: rateCeiling)
     if let requestedGeneration, let operationToken,
@@ -700,6 +706,7 @@ public actor CMIOCaptureService {
       throw CMIOCaptureError.configurationSuperseded
     }
     generation = requestedGeneration ?? (generation + 1)
+    configuredMode = matchedCapabilities?.updating(mode) ?? mode
     self.located = located
     deviceUID = deviceUniqueID
     return generation

@@ -20,6 +20,11 @@ results (OS/SDK/hardware/camera/mode/library versions) when run; report
 4. Confirm the Mode dropdown lists actual advertised formats with dimensions,
    FourCC, known depth/chroma, and max frame rate; unknown values must display
    as unknown, not zero.
+5. On a BRIO, check the distinct 1080p representations as well as both 4K
+   sizes: rates must belong to the exact format, including distinctions beyond
+   dimensions/FourCC. Switch modes and verify that current CMIO supported rates
+   refresh the selected label without losing the selection or restarting it
+   again. Keep configured and measured delivery rates separate from the maximum.
 
 Expected: real devices, honest mode labels.
 

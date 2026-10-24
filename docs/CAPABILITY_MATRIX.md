@@ -48,6 +48,11 @@ is shown; samples are never silently converted)
 
 ## Honest notes
 
+- Mode frame rates use exact `CMFormatDescriptionEqual` matches between CMIO
+  and AVFoundation, with unqualified CMIO current-format ranges taking
+  precedence. Missing or ambiguous matches stay unknown. Supported maximum,
+  configured rate, and measured delivery rate are separate facts; no qualified
+  per-format CMIO rate query is issued.
 - No claim in this matrix is accepted from documentation alone: lossless
   claims are verified by encoding fixtures and comparing native-channel
   samples after decoding.

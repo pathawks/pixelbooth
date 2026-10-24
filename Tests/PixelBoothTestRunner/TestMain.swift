@@ -18,6 +18,7 @@ struct PixelBoothTestRunner {
   static func main() async {
     await runReproSuite()
     await runModeSelectorSuite()
+    await runFormatFrameRateSuite()
     await runReadinessSuite()
     await runFreshnessSuite()
     await runAdapterSuite()
