@@ -8,6 +8,57 @@ The app never depends on Homebrew or system-installed codec libraries at runtime
 | libavif | 1.3.0 | https://github.com/AOMediaCodec/libavif/archive/refs/tags/v1.3.0.tar.gz | `0a545e953cc049bf5bcf4ee467306a2f113a75110edf59e61248873101cd26c1` |
 | aom (libaom, AV1 encoder) | 3.13.1 | https://storage.googleapis.com/aom-releases/libaom-3.13.1.tar.gz | `19e45a5a7192d690565229983dad900e76b513a02306c12053fb9a262cbeca7d` |
 
+## Build-selected DepthAnythingV2 Core ML model
+
+Apple's Small F16 and F32 packages are pinned to the
+[`apple/coreml-depth-anything-v2-small` revision
+`cfef6f6f2a70783dedc0bfae40cecbc2052285d3`](https://huggingface.co/apple/coreml-depth-anything-v2-small/tree/cfef6f6f2a70783dedc0bfae40cecbc2052285d3).
+The checked-in catalog, `scripts/depth-models.json`, contains only these two
+Apache-2.0 selections. `PIXELBOOTH_DEPTH_VARIANT=SmallF16` is the default;
+`SmallF32` selects the other official package. An explicit variant bypasses
+the automatic Git-ignored `depth-model.local.json` override. An explicit
+`PIXELBOOTH_DEPTH_OVERRIDE` path can select a custom descriptor; setting both
+explicit selectors is rejected as ambiguous.
+
+`scripts/fetch_depth_model.sh` delegates to the standard-library Python helper
+`scripts/depth_model.py`. Every package file, archive and license has a pinned
+SHA-256. Custom archive extraction rejects unsafe paths and links. Source
+model/weights checksums are verified independently after extraction. Compilation
+uses the selected Xcode and SDK; cache stamps include the complete selection
+and toolchain, and generated files are checked against a digest manifest.
+
+Prepared selections live under `vendor/build/depth/`; `selected` resolves to
+one complete configuration directory. App assembly and validation resolve that
+directory from that preparation invocation so the model, `DepthModel.json` and
+license remain a matched set even if another process changes the selected
+link. A preparation lock serializes shared-cache writes. Failed preparation retains
+the previous selection and fails the build. Model sources, compiled models and
+personal overrides are not checked into Git.
+
+The pinned F16 model specification SHA-256 is
+`44ac97a3efcfd52113183fb2862ff59cd0368e9ec2e30a90a54980dd11407042`;
+the weights SHA-256 is
+`fa60d9b6a155734f59029ebb882fd54e549bfaee3539c1a9cbd2cbbab64a0fed`.
+The F32 specification SHA-256 is
+`dfd7fd461ab2544f4951e757a59d878d6af93b5544541ed534329d84e958f0c9`;
+its weights SHA-256 is
+`6b02236f9b6c8c4694904f89c0fc84c3b6175cde43f9f918f77948708c36b58d`.
+Manifest and license hashes are also pinned in the catalog. Compiled model bytes
+are toolchain-dependent. The chosen model is bundled as `PixelBoothDepth.mlmodelc`;
+its identity, geometry, source hashes and license identifier are recorded in
+`DepthModel.json`. The full selected license is bundled as
+`ThirdPartyNotices/DepthModel-LICENSE`.
+
+Both actual Small model descriptions specify 518×392 RGB input and a 518×392
+half-float image output, including the F32 package. Their graphs normalize
+nonnegative inverse-depth predictions by their per-image maximum. Custom models
+can instead declare bounded image Float32 or strided Float16/Float32 array
+outputs and raw nonnegative relative values. The runtime checks the declared
+interface against the loaded model and refuses a mismatch. These are relative
+estimates, not metric depth. App preprocessing and quantization are documented
+in the README. Large weights carry CC-BY-NC-4.0; a local Large override must
+provide that license rather than inheriting the Small model's Apache license.
+
 ## Why these versions
 
 - **libavif 1.3.0** exposes the `quality`/`qualityAlpha` encoder API

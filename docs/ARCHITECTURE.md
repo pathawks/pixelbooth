@@ -8,13 +8,14 @@
 | `PixelBoothAdapters` | Pure-Swift sample-layout adapters (YUY2/UYVY/NV12/BGR/BGRA, 10-bit bi-planar) | Plane repacking only; never a conversion of meaningful samples |
 | `PixelBoothJPEG` | JPEG segment parsing and metadata-only insertion | Marker-level byte exactness; rejects malformed input |
 | `PixelBoothAVIF` | Lossless AVIF encode + verification via pinned libavif/libaom | Round-trip verification is mandatory before "valid" |
+| `PixelBoothDepth` | Build-selected DepthAnythingV2 Core ML inference from a derived primary rendering | Validated model descriptor and actor-owned model; finite relative estimates, no archival primary conversion |
 | `PixelBoothMetadata` | Metadata observation models, application XMP namespace, location acceptance policy | Provenance labeling (camera/host/app) |
 | `PixelBoothCapture` | Capture backends: CoreMediaIO HAL (primary) and AVFoundation (fallback); discovery, configuration, frame delivery | Capture queues, CMIO stream state, generation tags |
 | `PixelBoothLibrary` | Frame store, staging, journal, Photos-first save pipeline | Durable capture data |
 | `PixelBoothApp` | SwiftUI presentation | No archival-path logic |
 | `PixelBoothCAvif` | C shim over the pinned libavif 1.3.0 API | Boundary between Swift and pinned C libraries |
 
-Dependency direction is strictly downward: App → Library/Capture → AVIF/JPEG/Metadata/Adapters → Core. Nothing points back up.
+Dependency direction is strictly downward: App → Library/Capture → AVIF/JPEG/Metadata/Adapters → Core, with Library → Depth for local inference. Nothing points back up.
 
 ## Concurrency ownership
 

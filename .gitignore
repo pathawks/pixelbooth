@@ -9,3 +9,4 @@ build/
 xcuserdata/
 .build/out/
 DerivedData/
+depth-model.local.json

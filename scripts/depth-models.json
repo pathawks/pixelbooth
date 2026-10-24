@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 1,
+  "models": {
+    "SmallF16": {
+      "packageName": "DepthAnythingV2SmallF16.mlpackage",
+      "source": {
+        "kind": "files",
+        "baseURL": "https://huggingface.co/apple/coreml-depth-anything-v2-small/resolve/cfef6f6f2a70783dedc0bfae40cecbc2052285d3/DepthAnythingV2SmallF16.mlpackage",
+        "files": [
+          {
+            "path": "Manifest.json",
+            "sha256": "2883ae290c48fe916dc5ececac03a7d847fa277165a49ef5652fa1d2b9cb55f7",
+            "size": 617
+          },
+          {
+            "path": "Data/com.apple.CoreML/model.mlmodel",
+            "sha256": "44ac97a3efcfd52113183fb2862ff59cd0368e9ec2e30a90a54980dd11407042",
+            "size": 399433
+          },
+          {
+            "path": "Data/com.apple.CoreML/weights/weight.bin",
+            "sha256": "fa60d9b6a155734f59029ebb882fd54e549bfaee3539c1a9cbd2cbbab64a0fed",
+            "size": 49419072
+          }
+        ]
+      },
+      "license": {
+        "url": "https://raw.githubusercontent.com/DepthAnything/Depth-Anything-V2/00bd582c62e7ba8feb559f57b4a3c051bb6690b5/LICENSE",
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      },
+      "descriptor": {
+        "schemaVersion": 1,
+        "modelResourceName": "PixelBoothDepth",
+        "modelIdentifier": "apple/coreml-depth-anything-v2-small/DepthAnythingV2SmallF16@cfef6f6f2a70783dedc0bfae40cecbc2052285d3;model-sha256=44ac97a3efcfd52113183fb2862ff59cd0368e9ec2e30a90a54980dd11407042;weights-sha256=fa60d9b6a155734f59029ebb882fd54e549bfaee3539c1a9cbd2cbbab64a0fed",
+        "sourceRevision": "cfef6f6f2a70783dedc0bfae40cecbc2052285d3",
+        "sourceModelSHA256": "44ac97a3efcfd52113183fb2862ff59cd0368e9ec2e30a90a54980dd11407042",
+        "sourceWeightsSHA256": "fa60d9b6a155734f59029ebb882fd54e549bfaee3539c1a9cbd2cbbab64a0fed",
+        "licenseIdentifier": "Apache-2.0",
+        "inputFeatureName": "image",
+        "inputWidth": 518,
+        "inputHeight": 392,
+        "outputFeatureName": "depth",
+        "outputWidth": 518,
+        "outputHeight": 392,
+        "outputRepresentation": "imageFloat16",
+        "outputNormalizedByMaximum": true,
+        "modelVersionString": "2.0"
+      }
+    },
+    "SmallF32": {
+      "packageName": "DepthAnythingV2SmallF32.mlpackage",
+      "source": {
+        "kind": "files",
+        "baseURL": "https://huggingface.co/apple/coreml-depth-anything-v2-small/resolve/cfef6f6f2a70783dedc0bfae40cecbc2052285d3/DepthAnythingV2SmallF32.mlpackage",
+        "files": [
+          {
+            "path": "Manifest.json",
+            "sha256": "048f5f5fbc11cff5ee8ab21e3a97830b7e0aacab5404eff0b3ea198dd1a39336",
+            "size": 617
+          },
+          {
+            "path": "Data/com.apple.CoreML/model.mlmodel",
+            "sha256": "dfd7fd461ab2544f4951e757a59d878d6af93b5544541ed534329d84e958f0c9",
+            "size": 366829
+          },
+          {
+            "path": "Data/com.apple.CoreML/weights/weight.bin",
+            "sha256": "6b02236f9b6c8c4694904f89c0fc84c3b6175cde43f9f918f77948708c36b58d",
+            "size": 98821504
+          }
+        ]
+      },
+      "license": {
+        "url": "https://raw.githubusercontent.com/DepthAnything/Depth-Anything-V2/00bd582c62e7ba8feb559f57b4a3c051bb6690b5/LICENSE",
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      },
+      "descriptor": {
+        "schemaVersion": 1,
+        "modelResourceName": "PixelBoothDepth",
+        "modelIdentifier": "apple/coreml-depth-anything-v2-small/DepthAnythingV2SmallF32@cfef6f6f2a70783dedc0bfae40cecbc2052285d3;model-sha256=dfd7fd461ab2544f4951e757a59d878d6af93b5544541ed534329d84e958f0c9;weights-sha256=6b02236f9b6c8c4694904f89c0fc84c3b6175cde43f9f918f77948708c36b58d",
+        "sourceRevision": "cfef6f6f2a70783dedc0bfae40cecbc2052285d3",
+        "sourceModelSHA256": "dfd7fd461ab2544f4951e757a59d878d6af93b5544541ed534329d84e958f0c9",
+        "sourceWeightsSHA256": "6b02236f9b6c8c4694904f89c0fc84c3b6175cde43f9f918f77948708c36b58d",
+        "licenseIdentifier": "Apache-2.0",
+        "inputFeatureName": "image",
+        "inputWidth": 518,
+        "inputHeight": 392,
+        "outputFeatureName": "depth",
+        "outputWidth": 518,
+        "outputHeight": 392,
+        "outputRepresentation": "imageFloat16",
+        "outputNormalizedByMaximum": true,
+        "modelVersionString": "2.0"
+      }
+    }
+  }
+}

@@ -21,6 +21,12 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
+DEPTH_SELECTION_FILE="$(mktemp "${TMPDIR:-/tmp}/pixelbooth-depth-selection.XXXXXX")"
+trap 'rm -f "$DEPTH_SELECTION_FILE"' EXIT
+scripts/fetch_depth_model.sh --selection-file "$DEPTH_SELECTION_FILE"
+# Use this invocation's immutable selection, even during another model build.
+IFS= read -r DEPTH_RESOURCES < "$DEPTH_SELECTION_FILE"
+
 APP="build/PixelBooth.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -31,6 +37,10 @@ mkdir -p "$APP/Contents/Resources/en.lproj"
 cp "Support/en.lproj/InfoPlist.strings" "$APP/Contents/Resources/en.lproj/"
 mkdir -p "$APP/Contents/Resources/ThirdPartyNotices"
 cp vendor/notices/* "$APP/Contents/Resources/ThirdPartyNotices/"
+cp -R "$DEPTH_RESOURCES/PixelBoothDepth.mlmodelc" "$APP/Contents/Resources/"
+cp "$DEPTH_RESOURCES/DepthModel.json" "$APP/Contents/Resources/"
+cp "$DEPTH_RESOURCES/model-LICENSE" \
+  "$APP/Contents/Resources/ThirdPartyNotices/DepthModel-LICENSE"
 
 # Sign: ad-hoc by default for local development; pass a Developer ID
 # identity to also sign for distribution.

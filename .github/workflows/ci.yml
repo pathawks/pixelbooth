@@ -11,6 +11,11 @@ on:
 jobs:
   build-test:
     runs-on: xcode-27  # arm64 macOS 27 runner with Xcode 27 preinstalled
+    strategy:
+      matrix:
+        depth_model: [SmallF16, SmallF32]
+    env:
+      PIXELBOOTH_DEPTH_VARIANT: ${{ matrix.depth_model }}
     steps:
       - uses: actions/checkout@v4
       - name: Show toolchain

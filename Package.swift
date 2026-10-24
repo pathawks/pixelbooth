@@ -12,6 +12,7 @@ let package = Package(
     .library(name: "PixelBoothAdapters", targets: ["PixelBoothAdapters"]),
     .library(name: "PixelBoothJPEG", targets: ["PixelBoothJPEG"]),
     .library(name: "PixelBoothAVIF", targets: ["PixelBoothAVIF"]),
+    .library(name: "PixelBoothDepth", targets: ["PixelBoothDepth"]),
     .library(name: "PixelBoothMetadata", targets: ["PixelBoothMetadata"]),
     .library(name: "PixelBoothCapture", targets: ["PixelBoothCapture"]),
     .library(name: "PixelBoothLibrary", targets: ["PixelBoothLibrary"]),
@@ -48,6 +49,8 @@ let package = Package(
     .target(name: "PixelBoothJPEG", dependencies: ["PixelBoothCore"], path: "Sources/PixelBoothJPEG"),
     // AVIF lossless encoding via pinned libavif+libaom, plus round-trip verification.
     .target(name: "PixelBoothAVIF", dependencies: ["PixelBoothCore", "PixelBoothAdapters", "PixelBoothCAvifShim"], path: "Sources/PixelBoothAVIF"),
+    // On-device estimated disparity, isolated from the archival sample path.
+    .target(name: "PixelBoothDepth", path: "Sources/PixelBoothDepth"),
     // Metadata collection/serialization: Exif, XMP, ICC, HDR, location, provenance.
     .target(name: "PixelBoothMetadata", dependencies: ["PixelBoothCore"], path: "Sources/PixelBoothMetadata"),
     // AVFoundation capture: discovery, configuration, sample delivery, provenance.
@@ -76,7 +79,7 @@ let package = Package(
     // load the SDK Testing macro plugin, and XCTest requires full Xcode).
     .executableTarget(
       name: "PixelBoothTestRunner",
-      dependencies: ["PixelBoothCore", "PixelBoothAdapters", "PixelBoothJPEG", "PixelBoothAVIF", "PixelBoothMetadata", "PixelBoothLibrary", "PixelBoothCapture"],
+      dependencies: ["PixelBoothCore", "PixelBoothAdapters", "PixelBoothJPEG", "PixelBoothAVIF", "PixelBoothDepth", "PixelBoothMetadata", "PixelBoothLibrary", "PixelBoothCapture"],
       path: "Tests/PixelBoothTestRunner",
       resources: [.copy("Fixtures")]
     ),

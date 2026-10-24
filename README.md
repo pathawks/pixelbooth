@@ -22,6 +22,7 @@ Requirements:
 - macOS 27.0 SDK and full Xcode 27 for app builds. The headless test runner can
   be built with Command Line Tools, but they cannot load the SwiftUI macro plugin
   required by the app target.
+- Python 3.9 or newer for model preparation (Xcode's `/usr/bin/python3` works)
 - Camera permission when running the app
 
 ```sh
@@ -60,6 +61,7 @@ captures recoverable for the next launch.
 | `swift build --product PixelBooth` | Executable only |
 | `swift run --skip-build PixelBoothTestRunner` | Automated test suite |
 | `scripts/fetch_deps.sh` | Re-fetch/rebuild libavif 1.3.0 + libaom 3.13.1 (checksum-verified) |
+| `scripts/fetch_depth_model.sh` | Fetch, verify, and compile the selected pinned DepthAnythingV2 Core ML model |
 
 ## Project-local Xcode selection
 
@@ -139,6 +141,7 @@ Sources/PixelBoothCore/        Domain models, mode selection, readiness
 Sources/PixelBoothAdapters/    Pure-Swift sample-layout adapters
 Sources/PixelBoothJPEG/        JPEG segment parsing + metadata-only writer
 Sources/PixelBoothAVIF/        Lossless AVIF encoder/verifier (libavif bridge)
+Sources/PixelBoothDepth/       Local Core ML relative-disparity estimation
 Sources/PixelBoothMetadata/    Exif/XMP/ICC/HDR/location metadata models
 Sources/PixelBoothCapture/     AVFoundation discovery/configuration/delivery
 Sources/PixelBoothLibrary/     Staging, journal, Photos-first save pipeline

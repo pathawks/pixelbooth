@@ -1,5 +1,16 @@
 # Third-party notices
 
+PixelBooth bundles a build-selected Core ML conversion of Depth Anything V2,
+based on work by Lihe Yang and contributors. `DepthModel.json` in the app's
+Resources identifies the actual model, source revision, file hashes and
+license. The selected model's full license is included as
+`DepthModel-LICENSE` in the app's ThirdPartyNotices directory.
+
+The checked-in Small F16/F32 selections use Apple's Apache-2.0 conversion:
+https://huggingface.co/apple/coreml-depth-anything-v2-small.
+Local overrides supply their own pinned model and corresponding license;
+the selected license governs that model's distribution and use.
+
 PixelBooth statically links the following third-party libraries:
 
 ## libavif 1.3.0
