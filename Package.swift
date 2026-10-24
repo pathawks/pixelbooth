@@ -48,7 +48,7 @@ let package = Package(
     // JPEG preservation (segment parsing + metadata-only re-insertion).
     .target(name: "PixelBoothJPEG", dependencies: ["PixelBoothCore"], path: "Sources/PixelBoothJPEG"),
     // AVIF lossless encoding via pinned libavif+libaom, plus round-trip verification.
-    .target(name: "PixelBoothAVIF", dependencies: ["PixelBoothCore", "PixelBoothAdapters", "PixelBoothCAvifShim"], path: "Sources/PixelBoothAVIF"),
+    .target(name: "PixelBoothAVIF", dependencies: ["PixelBoothCore", "PixelBoothAdapters", "PixelBoothCAvifShim", "PixelBoothMetadata"], path: "Sources/PixelBoothAVIF"),
     // On-device estimated disparity, isolated from the archival sample path.
     .target(name: "PixelBoothDepth", path: "Sources/PixelBoothDepth"),
     // Metadata collection/serialization: Exif, XMP, ICC, HDR, location, provenance.

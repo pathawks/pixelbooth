@@ -170,7 +170,8 @@ public struct PixelBoothXMP {
     mediaTimeNanos: UInt64,
     wallClockAnchorISO: String,
     sourceFormat: String? = nil,
-    dataSource: String? = nil
+    dataSource: String? = nil,
+    portraitRenderIntent: PortraitRenderIntent? = nil
   ) -> [UInt8] {
     var xmp = """
       <?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
@@ -198,6 +199,17 @@ public struct PixelBoothXMP {
     xmp += "\n  \(namespacePrefix):SchemaVersion=\"\(schemaVersion)\""
     xmp += "\n  \(namespacePrefix):MediaTimeNanos=\"\(mediaTimeNanos)\""
     xmp += "\n  \(namespacePrefix):WallClockAnchor=\"\(escape(wallClockAnchorISO))\""
+    if let intent = portraitRenderIntent {
+      xmp += "\n  \(namespacePrefix):PortraitProfileVersion=\"\(intent.version)\""
+      xmp += "\n  \(namespacePrefix):PortraitRenderIntentOrigin=\"\(intent.origin.rawValue)\""
+      xmp += "\n  \(namespacePrefix):PortraitRenderIntentRole=\"external-rendering-instructions\""
+      xmp += "\n  \(namespacePrefix):PortraitSimulatedAperture=\"\(intent.simulatedAperture)\""
+      xmp += "\n  \(namespacePrefix):PortraitFocusCoordinateSystem=\"normalized-top-left\""
+      xmp += "\n  \(namespacePrefix):PortraitFocusCenterX=\"\(intent.focusCenterX)\""
+      xmp += "\n  \(namespacePrefix):PortraitFocusCenterY=\"\(intent.focusCenterY)\""
+      xmp += "\n  \(namespacePrefix):PortraitFocusWidth=\"\(intent.focusWidth)\""
+      xmp += "\n  \(namespacePrefix):PortraitFocusHeight=\"\(intent.focusHeight)\""
+    }
     if let loc = hostLocation {
       xmp += "\n  \(namespacePrefix):HostLatitude=\"\(loc.latitude)\""
       xmp += "\n  \(namespacePrefix):HostLongitude=\"\(loc.longitude)\""
@@ -233,8 +245,37 @@ public struct PixelBoothXMP {
         xmp += "\n  \(namespacePrefix):Provenance\(i)ObservedAt=\"\(escape(at))\""
       }
     }
-    xmp += ">\n</rdf:Description>\n</rdf:RDF>\n</x:xmpmeta>\n<?xpacket end=\"w\"?>"
+    xmp += ">\n"
+    if let intent = portraitRenderIntent { xmp += portraitFocusXMP(intent) }
+    xmp += "</rdf:Description>\n</rdf:RDF>\n</x:xmpmeta>\n<?xpacket end=\"w\"?>"
     return Array(xmp.utf8)
+  }
+
+  private static func portraitFocusXMP(_ intent: PortraitRenderIntent) -> String {
+    """
+    <mwg-rs:Regions xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/" xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#" xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#" rdf:parseType="Resource">
+      <mwg-rs:AppliedToDimensions rdf:parseType="Resource">
+        <stDim:w>\(intent.primaryWidth)</stDim:w>
+        <stDim:h>\(intent.primaryHeight)</stDim:h>
+        <stDim:unit>pixel</stDim:unit>
+      </mwg-rs:AppliedToDimensions>
+      <mwg-rs:RegionList>
+        <rdf:Bag>
+          <rdf:li rdf:parseType="Resource">
+            <mwg-rs:Type>Focus</mwg-rs:Type>
+            <mwg-rs:Area rdf:parseType="Resource">
+              <stArea:x>\(intent.focusCenterX)</stArea:x>
+              <stArea:y>\(intent.focusCenterY)</stArea:y>
+              <stArea:w>\(intent.focusWidth)</stArea:w>
+              <stArea:h>\(intent.focusHeight)</stArea:h>
+              <stArea:unit>normalized</stArea:unit>
+            </mwg-rs:Area>
+          </rdf:li>
+        </rdf:Bag>
+      </mwg-rs:RegionList>
+    </mwg-rs:Regions>
+
+    """
   }
 
   static func escape(_ s: String) -> String {

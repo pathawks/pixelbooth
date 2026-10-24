@@ -288,6 +288,19 @@ extension Array where Element == UInt8 {
 /// This is a metadata-only path: image-coding segments and scan payload are
 /// byte-identical before and after.
 public enum JPEGMetadataWriter {
+  /// Merge raw XMP packets using the same bounded, entity-disabled parser as
+  /// JPEG insertion. Source properties win conflicts. An application Focus
+  /// region is appended to an existing source region bag only when no source
+  /// Focus exists and both packets declare matching primary dimensions.
+  /// Unsupported region structures remain untouched. The result is raw XML
+  /// suitable for an AVIF metadata item.
+  public static func mergingXMP(source: [UInt8], additional: [UInt8]) throws -> [UInt8] {
+    try JPEGXMPPacket.makeOutput(
+      sourcePackets: [Data(source)], additionalPacket: additional,
+      appendingApplicationFocus: true
+    ).mergedPacket
+  }
+
   /// Insert additional APP1 XMP and/or Exif segments without touching the
   /// image-coding data. Where safe merging is impossible (e.g. a source Exif
   /// block with MakerNotes), the source metadata is preserved as-is and

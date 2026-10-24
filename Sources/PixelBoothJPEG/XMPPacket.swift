@@ -8,6 +8,8 @@ enum JPEGXMPPacket {
   private static let xmpNamespace = "adobe:ns:meta/"
   private static let rdfNamespace = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
   private static let xmpNoteNamespace = "http://ns.adobe.com/xmp/note/"
+  private static let regionNamespace = "http://www.metadataworkinggroup.com/schemas/regions/"
+  private static let dimensionNamespace = "http://ns.adobe.com/xap/1.0/sType/Dimensions#"
   private static let maximumPacketBytes = 4 * 1_024 * 1_024
   private static let maximumXMLDepth = 128
   private static let maximumXMLNodes = 100_000
@@ -91,7 +93,9 @@ enum JPEGXMPPacket {
     return packets
   }
 
-  static func makeOutput(sourcePackets: [Data], additionalPacket: [UInt8]) throws -> Output {
+  static func makeOutput(
+    sourcePackets: [Data], additionalPacket: [UInt8], appendingApplicationFocus: Bool = false
+  ) throws -> Output {
     let appData = Data(additionalPacket)
     let appDocument = try parse(appData)
     guard findRDF(in: appDocument.root, inheritedNamespaces: [:]) != nil else {
@@ -118,11 +122,203 @@ enum JPEGXMPPacket {
       return try output(for: Data(serializePacket(mergedDocument.root).utf8))
     }
 
+    if appendingApplicationFocus {
+      appendApplicationFocus(from: appDocument.root, to: &mergedDocument.root)
+    }
     let sourceProperties = collectProperties(in: mergedDocument.root, inheritedNamespaces: [:])
     try appendRDFChildren(
       from: appDocument.root, to: &mergedDocument.root,
       inheritedNamespaces: [:], filteringConflicts: true, conflicts: sourceProperties)
-    return try output(for: Data(serializePacket(mergedDocument.root).utf8))
+    let packet = Data(serializePacket(mergedDocument.root).utf8)
+    if appendingApplicationFocus { _ = try parse(packet) }
+    return try output(for: packet)
+  }
+
+  private struct ScopedElement {
+    var path: [Int]
+    var namespaces: [String: String]
+  }
+
+  /// This focused merge never replaces source Regions, its dimensions, or its
+  /// unknown fields. Ambiguous and unsupported RDF forms retain source priority.
+  private static func appendApplicationFocus(from application: Element, to source: inout Element) {
+    let sourceRegions = regionProperties(in: source)
+    let appRegions = regionProperties(in: application)
+    guard sourceRegions.count == 1, appRegions.count == 1,
+      let sourceResource = resource(sourceRegions[0], in: source),
+      let appResource = resource(appRegions[0], in: application),
+      let sourceBag = regionBag(in: sourceResource, root: source),
+      let appBag = regionBag(in: appResource, root: application),
+      let sourceEntries = bagEntries(in: sourceBag, root: source),
+      let appEntries = bagEntries(in: appBag, root: application)
+    else { return }
+
+    for entry in sourceEntries {
+      guard let entryResource = resource(entry, in: source),
+        let types = propertyValues(
+          "Type", namespace: regionNamespace, in: entryResource, root: source),
+        types.count <= 1
+      else { return }
+      if types.first == "Focus" { return }
+    }
+    guard let sourceDimensions = regionDimensions(in: sourceResource, root: source),
+      let appDimensions = regionDimensions(in: appResource, root: application),
+      sourceDimensions == appDimensions
+    else { return }
+
+    let focusEntries = appEntries.filter { entry in
+      guard let entryResource = resource(entry, in: application),
+        let types = propertyValues(
+          "Type", namespace: regionNamespace, in: entryResource, root: application)
+      else { return false }
+      return types == ["Focus"]
+    }
+    guard focusEntries.count == 1, let focus = focusEntries.first,
+      var copied = element(at: focus.path, in: application),
+      var bag = element(at: sourceBag.path, in: source)
+    else { return }
+    // The application entry may use prefixes bound on any ancestor. Localize
+    // those bindings so source aliases cannot change the appended property's meaning.
+    copied.attributes = focus.namespaces.reduce(into: copied.attributes) { attributes, binding in
+      let name = binding.key.isEmpty ? "xmlns" : "xmlns:\(binding.key)"
+      if attributes[name] == nil { attributes[name] = binding.value }
+    }
+    bag.children.append(.element(copied))
+    _ = replaceElement(at: sourceBag.path, in: &source, with: bag)
+  }
+
+  private static func regionProperties(in root: Element) -> [ScopedElement] {
+    guard let rdf = findRDF(in: root, inheritedNamespaces: [:]),
+      let rdfElement = element(at: rdf.path, in: root)
+    else { return [] }
+    var result: [ScopedElement] = []
+    for (index, child) in rdfElement.children.enumerated() {
+      guard case .element(let description) = child else { continue }
+      let scope = namespaceScope(parent: rdf.namespaces, attributes: description.attributes)
+      guard
+        expandedName(description.name, namespaces: scope, isAttribute: false)
+          == PropertyKey(namespace: rdfNamespace, localName: "Description")
+      else { continue }
+      let subjectAttributes = description.attributes.compactMap { name, value -> String? in
+        guard let key = expandedName(name, namespaces: scope, isAttribute: true),
+          key.namespace == rdfNamespace
+        else { return nil }
+        if key.localName == "about" { return value }
+        if key.localName == "ID" || key.localName == "nodeID" { return "non-primary-subject" }
+        return nil
+      }
+      guard subjectAttributes.count <= 1, subjectAttributes.allSatisfy(\.isEmpty) else { continue }
+      guard
+        !description.attributes.contains(where: { name, _ in
+          expandedName(name, namespaces: scope, isAttribute: true)
+            == PropertyKey(namespace: regionNamespace, localName: "Regions")
+        })
+      else { return [] }
+      let location = ScopedElement(path: rdf.path + [index], namespaces: scope)
+      result += children("Regions", namespace: regionNamespace, in: location, root: root)
+    }
+    return result
+  }
+
+  private static func children(
+    _ name: String, namespace: String, in parent: ScopedElement, root: Element
+  ) -> [ScopedElement] {
+    guard let element = element(at: parent.path, in: root) else { return [] }
+    return element.children.enumerated().compactMap { index, child in
+      guard case .element(let child) = child else { return nil }
+      let scope = namespaceScope(parent: parent.namespaces, attributes: child.attributes)
+      guard
+        expandedName(child.name, namespaces: scope, isAttribute: false)
+          == PropertyKey(namespace: namespace, localName: name)
+      else { return nil }
+      return ScopedElement(path: parent.path + [index], namespaces: scope)
+    }
+  }
+
+  private static func resource(_ location: ScopedElement, in root: Element) -> ScopedElement? {
+    guard let element = element(at: location.path, in: root) else { return nil }
+    for (name, value) in element.attributes {
+      let key = expandedName(name, namespaces: location.namespaces, isAttribute: true)
+      if key == PropertyKey(namespace: rdfNamespace, localName: "resource") { return nil }
+      if key == PropertyKey(namespace: rdfNamespace, localName: "parseType"), value != "Resource" {
+        return nil
+      }
+    }
+    let descriptions = children("Description", namespace: rdfNamespace, in: location, root: root)
+    if descriptions.isEmpty { return location }
+    guard descriptions.count == 1,
+      element.children.filter({
+        if case .element = $0 { return true }
+        return false
+      }).count == 1
+    else { return nil }
+    return descriptions[0]
+  }
+
+  private static func regionBag(in regions: ScopedElement, root: Element) -> ScopedElement? {
+    let lists = children("RegionList", namespace: regionNamespace, in: regions, root: root)
+    guard lists.count == 1 else { return nil }
+    let bags = children("Bag", namespace: rdfNamespace, in: lists[0], root: root)
+    guard bags.count == 1, let list = element(at: lists[0].path, in: root),
+      list.children.filter({
+        if case .element = $0 { return true }
+        return false
+      }).count == 1
+    else { return nil }
+    return bags[0]
+  }
+
+  private static func bagEntries(in bag: ScopedElement, root: Element) -> [ScopedElement]? {
+    guard let element = element(at: bag.path, in: root) else { return nil }
+    let entries = children("li", namespace: rdfNamespace, in: bag, root: root)
+    guard
+      entries.count
+        == element.children.filter({
+          if case .element = $0 { return true }
+          return false
+        }).count
+    else { return nil }
+    return entries
+  }
+
+  private static func regionDimensions(in regions: ScopedElement, root: Element) -> [Double]? {
+    let dimensions = children(
+      "AppliedToDimensions", namespace: regionNamespace, in: regions, root: root)
+    guard dimensions.count == 1, let value = resource(dimensions[0], in: root),
+      let widths = propertyValues("w", namespace: dimensionNamespace, in: value, root: root),
+      let heights = propertyValues("h", namespace: dimensionNamespace, in: value, root: root),
+      let units = propertyValues("unit", namespace: dimensionNamespace, in: value, root: root),
+      widths.count == 1, heights.count == 1, units == ["pixel"],
+      let width = Double(widths[0]), let height = Double(heights[0]),
+      width.isFinite, height.isFinite, width > 0, height > 0,
+      width.rounded() == width, height.rounded() == height
+    else { return nil }
+    return [width, height]
+  }
+
+  private static func propertyValues(
+    _ name: String, namespace: String, in location: ScopedElement, root: Element
+  ) -> [String]? {
+    guard let element = element(at: location.path, in: root) else { return nil }
+    let key = PropertyKey(namespace: namespace, localName: name)
+    var values = element.attributes.compactMap { attribute, value in
+      expandedName(attribute, namespaces: location.namespaces, isAttribute: true) == key
+        ? value.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+    }
+    for child in children(name, namespace: namespace, in: location, root: root) {
+      guard let scalar = self.element(at: child.path, in: root),
+        !scalar.children.contains(where: {
+          if case .element = $0 { return true }
+          return false
+        })
+      else { return nil }
+      values.append(
+        scalar.children.compactMap { node in
+          if case .text(let text) = node { return text }
+          return nil
+        }.joined().trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+    return values
   }
 
   private struct ExtensionChunk {
@@ -339,8 +535,9 @@ enum JPEGXMPPacket {
 
     for child in sourceRDF.children {
       guard case .element(var copied) = child else { continue }
+      let originalScope = namespaceScope(parent: sourceNamespaces, attributes: copied.attributes)
       guard
-        expandedName(copied.name, namespaces: sourceNamespaces, isAttribute: false)
+        expandedName(copied.name, namespaces: originalScope, isAttribute: false)
           == PropertyKey(namespace: rdfNamespace, localName: "Description")
       else {
         destinationRDF.children.append(child)
@@ -355,13 +552,16 @@ enum JPEGXMPPacket {
           parent: sourceNamespaces, attributes: copied.attributes)
         copied.attributes = copied.attributes.filter { name, _ in
           guard let key = expandedName(name, namespaces: copiedNamespaces, isAttribute: true),
-            name != "rdf:about"
+            key != PropertyKey(namespace: rdfNamespace, localName: "about")
           else { return true }
           return !conflicts.contains(key)
         }
         copied.children.removeAll { child in
           guard case .element(let property) = child,
-            let key = expandedName(property.name, namespaces: copiedNamespaces, isAttribute: false)
+            let key = expandedName(
+              property.name,
+              namespaces: namespaceScope(parent: copiedNamespaces, attributes: property.attributes),
+              isAttribute: false)
           else { return false }
           return conflicts.contains(key)
         }
@@ -381,17 +581,25 @@ enum JPEGXMPPacket {
     else { return [] }
     var result: Set<PropertyKey> = []
     for child in rdfElement.children {
-      guard case .element(let description) = child,
-        expandedName(description.name, namespaces: rdf.namespaces, isAttribute: false)
+      guard case .element(let description) = child else { continue }
+      let scope = namespaceScope(parent: rdf.namespaces, attributes: description.attributes)
+      guard
+        expandedName(description.name, namespaces: scope, isAttribute: false)
           == PropertyKey(namespace: rdfNamespace, localName: "Description")
       else { continue }
-      let scope = namespaceScope(parent: rdf.namespaces, attributes: description.attributes)
-      for name in description.attributes.keys where name != "rdf:about" {
-        if let key = expandedName(name, namespaces: scope, isAttribute: true) { result.insert(key) }
+      for name in description.attributes.keys {
+        if let key = expandedName(name, namespaces: scope, isAttribute: true),
+          key != PropertyKey(namespace: rdfNamespace, localName: "about")
+        {
+          result.insert(key)
+        }
       }
       for property in description.children {
         guard case .element(let property) = property,
-          let key = expandedName(property.name, namespaces: scope, isAttribute: false)
+          let key = expandedName(
+            property.name,
+            namespaces: namespaceScope(parent: scope, attributes: property.attributes),
+            isAttribute: false)
         else { continue }
         result.insert(key)
       }
