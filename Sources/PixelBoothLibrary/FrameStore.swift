@@ -105,15 +105,23 @@ public actor FrameStore {
 
   /// The newest complete frame that is sufficiently fresh at evaluation time.
   /// Waits up to `timeoutNanos` for a fresh frame if the newest is stale.
-  public func newestFreshFrame(timeoutNanos: UInt64) async -> DeliveredFrame? {
-    let deadline = DispatchTime.now().uptimeNanoseconds + timeoutNanos
+  /// Clock and polling dependencies allow deterministic tests of delivery and
+  /// expiry without relying on executor scheduling within a freshness window.
+  public func newestFreshFrame(
+    timeoutNanos: UInt64,
+    nowNanos: @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
+    waitForNextPoll: @Sendable () async -> Void = {
+      try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+  ) async -> DeliveredFrame? {
+    let deadline = nowNanos() + timeoutNanos
     while true {
-      let now = DispatchTime.now().uptimeNanoseconds
+      let now = nowNanos()
       if let candidate = newestEligibleFrame(nowNanos: now) {
         return candidate
       }
       if now >= deadline { return nil }
-      try? await Task.sleep(nanoseconds: 5_000_000)
+      await waitForNextPoll()
     }
   }
 

@@ -9,8 +9,19 @@ import Foundation
 import PixelBoothCapture
 import PixelBoothCore
 import PixelBoothLibrary
+import Synchronization
 
 private enum FreshnessTestError: Error { case setup(String) }
+
+private final class FreshnessTestClock: Sendable {
+  private let nanos = Mutex<UInt64>(1_000_000_000)
+
+  var now: UInt64 { nanos.withLock { $0 } }
+
+  func advance(by delta: UInt64) {
+    nanos.withLock { $0 += delta }
+  }
+}
 
 private func makeFrame(
   deviceID: String = "fixture",
@@ -109,27 +120,74 @@ func runFreshnessSuite() async {
 
   await test("waitingShutterAcceptsResumedDelivery") {
     let store = FrameStore()
+    let clock = FreshnessTestClock()
     await store.beginConfiguration(
       deviceID: "fixture", generation: 1,
       frameIntervalNanos: 33_333_333)
     let stale = try makeFrame(
-      observedNanos: DispatchTime.now().uptimeNanoseconds - 1_000_000_000)
+      observedNanos: clock.now - 1_000_000_000)
     let staleStored = await store.store(stale)
     check(staleStored, "stale frame stored")
 
-    let resume = Task {
-      try? await Task.sleep(nanoseconds: 80_000_000)
-      guard let fresh = try? makeFrame(observedNanos: DispatchTime.now().uptimeNanoseconds)
-      else { return }
-      _ = await store.store(fresh)
-    }
-    let selected = await store.newestFreshFrame(timeoutNanos: 1_000_000_000)
-    await resume.value
-    check(selected != nil, "delivery resuming within the timeout satisfies the shutter")
+    // Resume only after the shutter has found no eligible frame and suspended.
+    // Controlled time keeps a busy CI executor from aging out this single frame.
+    let fresh = try makeFrame(observedNanos: clock.now + 80_000_000, mediaNanos: 2)
+    let selected = await store.newestFreshFrame(
+      timeoutNanos: 1_000_000_000,
+      nowNanos: { clock.now },
+      waitForNextPoll: {
+        clock.advance(by: 80_000_000)
+        let stored = await store.store(fresh)
+        check(stored, "resumed frame is stored during the shutter wait")
+      })
+    check(selected?.timestampNanos == 2, "the resumed frame satisfies the waiting shutter")
+    check(clock.now == 1_080_000_000, "the shutter selects on the first poll after delivery")
     if let selected {
-      let freshAtSelection = await store.isFresh(selected)
+      let freshAtSelection = await store.isFresh(selected, nowNanos: clock.now)
       check(freshAtSelection, "selected frame is fresh at selection time")
     }
+  }
+
+  await test("waitingShutterTimesOutWithoutFreshDelivery") {
+    let store = FrameStore()
+    let clock = FreshnessTestClock()
+    await store.beginConfiguration(
+      deviceID: "fixture", generation: 1,
+      frameIntervalNanos: 33_333_333)
+    let stale = try makeFrame(observedNanos: clock.now - 1_000_000_000)
+    _ = await store.store(stale)
+
+    let selected = await store.newestFreshFrame(
+      timeoutNanos: 1_000_000_000,
+      nowNanos: { clock.now },
+      waitForNextPoll: { clock.advance(by: 100_000_000) })
+    check(selected == nil, "stale delivery never satisfies the shutter")
+    check(clock.now == 2_000_000_000, "waiting ends at the configured deadline")
+  }
+
+  await test("waitingShutterRejectsDeliveryThatExpiresBeforeNextPoll") {
+    let store = FrameStore()
+    let clock = FreshnessTestClock()
+    await store.beginConfiguration(
+      deviceID: "fixture", generation: 1,
+      frameIntervalNanos: 33_333_333)
+    let resumed = try makeFrame(observedNanos: clock.now + 80_000_000, mediaNanos: 2)
+
+    let selected = await store.newestFreshFrame(
+      timeoutNanos: 1_000_000_000,
+      nowNanos: { clock.now },
+      waitForNextPoll: {
+        if clock.now == 1_000_000_000 {
+          clock.advance(by: 80_000_000)
+          _ = await store.store(resumed)
+          // Simulate the selection task resuming after this frame has expired.
+          clock.advance(by: 120_000_000)
+        } else {
+          clock.advance(by: 100_000_000)
+        }
+      })
+    check(selected == nil, "a frame that expires while the shutter waits is rejected")
+    check(clock.now == 2_000_000_000, "expired delivery does not extend the deadline")
   }
 
   await test("invalidateDropsFramesAndRejectsLateDelivery") {
