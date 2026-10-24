@@ -32,9 +32,9 @@ public enum ExifBuilder {
     guard let dateTime = exifDateTime(from: captureISO) else { return [] }
 
     var ifd0: [Entry] = []
-    if let make, !make.isEmpty { ifd0.append(.ascii(tag: 0x010F, value: make)) }
-    if let model, !model.isEmpty { ifd0.append(.ascii(tag: 0x0110, value: model)) }
-    if let software, !software.isEmpty { ifd0.append(.ascii(tag: 0x0131, value: software)) }
+    if let make = meaningfulText(make) { ifd0.append(.ascii(tag: 0x010F, value: make)) }
+    if let model = meaningfulText(model) { ifd0.append(.ascii(tag: 0x0110, value: model)) }
+    if let software = meaningfulText(software) { ifd0.append(.ascii(tag: 0x0131, value: software)) }
     ifd0.append(.ascii(tag: 0x0132, value: dateTime))
 
     var exifIFD = [
@@ -117,6 +117,20 @@ public enum ExifBuilder {
       if entry.payload.count % 2 != 0 { out.append(0) }
     }
     return out
+  }
+
+  /// Omit whole-value placeholders from generated Exif. Preserve the exact
+  /// spelling and spacing of meaningful values; raw host observations remain
+  /// available separately in the capture snapshot and application XMP.
+  static func meaningfulText(_ value: String?) -> String? {
+    guard let value else { return nil }
+    switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "", "unknown", "unavailable", "not available", "not applicable", "n/a",
+      "none", "null", "unspecified", "undefined":
+      return nil
+    default:
+      return value
+    }
   }
 
   private static func gpsEntries(_ location: HostLocationObservation) -> [Entry]? {

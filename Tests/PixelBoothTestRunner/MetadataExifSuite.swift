@@ -49,6 +49,45 @@ func runMetadataExifSuite() async {
     }
   }
 
+  await test("ExifBuilder.omitsPlaceholderTextTags") {
+    let placeholders: [String?] = [
+      nil, "", " \t\n", "Unknown", " UNKNOWN \n", "unavailable", "Not Available",
+      "Not Applicable", "N/A", "none", "null", "unspecified", "undefined",
+    ]
+    for placeholder in placeholders {
+      let exif = ExifBuilder.build(
+        make: placeholder, model: placeholder, software: placeholder,
+        captureISO: "2026-09-24T03:26:15Z")
+      let tags = try exifIFD0Tags(exif)
+      guard tags.isDisjoint(with: [0x010F, 0x0110, 0x0131]),
+        tags.contains(0x0132), tags.contains(0x8769)
+      else { throw exifTestError("placeholder text tag written or capture time lost") }
+    }
+  }
+
+  await test("ExifBuilder.omitsUnknownMakeButRetainsKnownModelAndSoftware") {
+    let exif = ExifBuilder.build(
+      make: "Unknown", model: "Logitech BRIO", software: "PixelBooth 0.1.0",
+      captureISO: "2026-09-24T03:26:15Z")
+    let tags = try exifIFD0Tags(exif)
+    guard !tags.contains(0x010F), tags.contains(0x0110), tags.contains(0x0131),
+      exifTextContains(exif, "Logitech BRIO"), exifTextContains(exif, "PixelBooth 0.1.0")
+    else { throw exifTestError("unknown make retained or known identity lost") }
+  }
+
+  await test("ExifBuilder.preservesMeaningfulTextContainingPlaceholderWords") {
+    let make = " Unknown Camera Company "
+    let model = "N/A-100"
+    let software = "UnknownTools 1.0"
+    let exif = ExifBuilder.build(
+      make: make, model: model, software: software,
+      captureISO: "2026-09-24T03:26:15Z")
+    let tags = try exifIFD0Tags(exif)
+    guard tags.isSuperset(of: [0x010F, 0x0110, 0x0131]),
+      [make, model, software].allSatisfy({ exifTextContains(exif, $0) })
+    else { throw exifTestError("meaningful text was omitted or changed") }
+  }
+
   await test("ExifBuilder.rejectsUnparseableTime") {
     let exif = ExifBuilder.build(
       make: "Apple", model: "Camera", software: "PixelBooth", captureISO: "not-a-time")
@@ -188,6 +227,17 @@ func runMetadataExifSuite() async {
 
 private enum ExifMetadataError: Error { case setup(String) }
 private func exifTestError(_ message: String) -> ExifMetadataError { .setup(message) }
+
+private func exifIFD0Tags(_ payload: [UInt8]) throws -> Set<UInt16> {
+  guard payload.count >= 10 else { throw exifTestError("IFD0 missing") }
+  let count = Int(payload[8]) | (Int(payload[9]) << 8)
+  guard payload.count >= 10 + count * 12 + 4 else { throw exifTestError("IFD0 truncated") }
+  return Set(
+    (0..<count).map { index in
+      let offset = 10 + index * 12
+      return UInt16(payload[offset]) | (UInt16(payload[offset + 1]) << 8)
+    })
+}
 
 /// Case-sensitive substring search over the raw payload bytes.
 private func exifTextContains(_ payload: [UInt8], _ needle: String) -> Bool {

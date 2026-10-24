@@ -28,6 +28,13 @@ results (OS/SDK/hardware/camera/mode/library versions) when run; report
 
 Expected: real devices, honest mode labels.
 
+USB identity checks: compare the selected camera with its physical USB entry,
+including two identical models on different ports. Verify that AVFoundation
+manufacturer wins, then a reported USB manufacturer string, then the attributed
+VID lookup. Inspect the retained capture/report after unplugging: VID, PID,
+USB strings, association method and observation time must remain available.
+Do not infer a connection from a matching camera display name.
+
 ## 2. Native delivery verification (TN3121)
 
 1. Select a UVC camera exposing MJPEG.

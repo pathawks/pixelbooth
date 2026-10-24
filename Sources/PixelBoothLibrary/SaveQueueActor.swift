@@ -576,8 +576,9 @@ public actor SaveQueueActor {
       let generatedExif: [UInt8] =
         jpegStructure.exifSegment == nil
         ? ExifBuilder.build(
-          make: capture.metadata.hostObservedDeviceMake,
-          model: capture.metadata.hostObservedDeviceModel,
+          make: capture.metadata.deviceIdentity?.manufacturer
+            ?? capture.metadata.hostObservedDeviceMake,
+          model: capture.metadata.deviceIdentity?.model ?? capture.metadata.hostObservedDeviceModel,
           software: "PixelBooth \(AppVersion.current)",
           captureISO: capture.acceptedAtISO,
           location: capture.metadata.hostLocation)
@@ -591,7 +592,7 @@ public actor SaveQueueActor {
         actualCaptureFormat:
           "\(CaptureFormat.fourCCString(capture.pixelFourCC ?? capture.fourCC)) \(capture.width)×\(capture.height)",
         encoderSettings: "metadata-only",
-        metadataProvenance: [],
+        metadataProvenance: Self.deviceIdentityProvenance(capture),
         fidelity: capture.acquisitionEvidence.map { Self.fidelityName($0.fidelity) } ?? "unknown",
         hostLocation: capture.metadata.hostLocation,
         mediaTimeNanos: capture.timestampNanos,
@@ -630,8 +631,9 @@ public actor SaveQueueActor {
         sourceFormat: CaptureFormat.fourCCString(capture.fourCC),
         dataSource: String(describing: capture.dataSource ?? .unknown))
       let exif = ExifBuilder.build(
-        make: capture.metadata.hostObservedDeviceMake,
-        model: capture.metadata.hostObservedDeviceModel,
+        make: capture.metadata.deviceIdentity?.manufacturer
+          ?? capture.metadata.hostObservedDeviceMake,
+        model: capture.metadata.deviceIdentity?.model ?? capture.metadata.hostObservedDeviceModel,
         software: "PixelBooth \(AppVersion.current)",
         captureISO: capture.acceptedAtISO,
         location: capture.metadata.hostLocation)
@@ -1044,10 +1046,53 @@ public actor SaveQueueActor {
         MetadataObservation(
           key: "DeviceModel", rawValueString: model, provenance: .hostObserved))
     }
+    if let modelID = capture.metadata.hostObservedDeviceModelID, !modelID.isEmpty {
+      provenance.append(
+        MetadataObservation(
+          key: "DeviceModelID", rawValueString: modelID, provenance: .hostObserved))
+    }
+    if let usb = capture.metadata.usbIdentity {
+      let values: [(String, String?)] = [
+        ("USBVendorID", String(format: "0x%04X", usb.vendorID)),
+        ("USBProductID", String(format: "0x%04X", usb.productID)),
+        ("USBLocationID", String(format: "0x%08X", usb.locationID)),
+        ("USBManufacturerString", usb.manufacturer), ("USBProductString", usb.productName),
+        ("USBAssociationMethod", usb.associationMethod),
+      ]
+      for (key, value) in values {
+        if let value {
+          provenance.append(
+            MetadataObservation(
+              key: key, rawValueString: value, provenance: .hostObserved,
+              observedAtISO: usb.observedAtISO))
+        }
+      }
+    }
+    if let identity = capture.metadata.deviceIdentity {
+      if let value = identity.manufacturer, let source = identity.manufacturerSource {
+        provenance.append(
+          MetadataObservation(
+            key: "ResolvedDeviceMake", rawValueString: value,
+            provenance: source.provenance))
+        provenance.append(
+          MetadataObservation(
+            key: "DeviceMakeSource", rawValueString: source.rawValue,
+            provenance: .applicationGenerated))
+      }
+      if let value = identity.model, let source = identity.modelSource {
+        provenance.append(
+          MetadataObservation(
+            key: "ResolvedDeviceModel", rawValueString: value,
+            provenance: source.provenance))
+      }
+    }
     provenance.append(
       MetadataObservation(
         key: "ExifMakeModelMirroredFromHostObservedDeviceIdentity",
-        rawValueString: "true", provenance: .applicationGenerated))
+        rawValueString: capture.metadata.embeddedSourceExif == nil
+          && capture.metadata.deviceIdentity == nil
+          ? "true" : "false",
+        provenance: .applicationGenerated))
     return provenance
   }
 

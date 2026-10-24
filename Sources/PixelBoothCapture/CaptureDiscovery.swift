@@ -4,6 +4,7 @@
 // frame acquisition.
 
 import AVFoundation
+import CoreAudio
 import Foundation
 import PixelBoothCore
 
@@ -14,19 +15,21 @@ public struct CameraDevice: Identifiable, Hashable, Sendable {
   public var modelID: String?
   public var manufacturer: String?
   public var deviceConnected: Bool
+  public var usbIdentity: USBDeviceIdentity?
 
   public var id: String { uniqueID }
 
   public init(
     uniqueID: String, localizedName: String,
     modelID: String? = nil, manufacturer: String? = nil,
-    deviceConnected: Bool = true
+    deviceConnected: Bool = true, usbIdentity: USBDeviceIdentity? = nil
   ) {
     self.uniqueID = uniqueID
     self.localizedName = localizedName
     self.modelID = modelID
     self.manufacturer = manufacturer
     self.deviceConnected = deviceConnected
+    self.usbIdentity = usbIdentity
   }
 }
 
@@ -42,13 +45,19 @@ public actor CaptureDiscovery {
       deviceTypes: [.external, .builtInWideAngleCamera],
       mediaType: .video,
       position: .unspecified)
+    let usbRecords = USBIdentityDiscovery.records()
     return discovery.devices.map { dev in
       CameraDevice(
         uniqueID: dev.uniqueID,
         localizedName: dev.localizedName,
-        modelID: nil,  // modelID is not exposed by macOS AVFoundation
+        modelID: dev.modelID,
         manufacturer: dev.manufacturer,
-        deviceConnected: dev.isConnected)
+        deviceConnected: dev.isConnected,
+        usbIdentity: USBDeviceIdentity.matching(
+          deviceUID: dev.uniqueID,
+          isUSBTransport: UInt32(bitPattern: dev.transportType)
+            == UInt32(kAudioDeviceTransportTypeUSB),
+          records: usbRecords))
     }
   }
 

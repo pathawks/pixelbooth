@@ -70,6 +70,14 @@ that file only when `DEVELOPER_DIR` is not already set in the environment.
 
 ## The fidelity contract, in short
 
+Camera identity prefers AVFoundation, then USB descriptor strings, then an
+attributed USB vendor/product ID map. Missing manufacturer values are omitted
+from generated Exif. USB identity enrichment never opens the USB device or
+changes acquisition settings. Standard UVC identifier conventions are matched
+against location, VID and PID in IORegistry; unavailable or ambiguous matches
+remain unavailable. Numeric lookup results are application-generated identity,
+not camera-provided Exif.
+
 - Native MJPEG/JPEG input → the camera's JPEG image-coding data is preserved
   byte-for-byte; only metadata additions may change file bytes.
 - Uncompressed RGB/YUV input → every meaningful channel sample is preserved at

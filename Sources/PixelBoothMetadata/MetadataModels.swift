@@ -3,6 +3,7 @@
 // application namespace for technical information and provenance.
 
 import Foundation
+import PixelBoothCore
 
 /// Separates camera-provided data, host observations, and application-generated
 /// technical data. Preserves conflicting source values rather than choosing.
@@ -83,9 +84,12 @@ public struct FrameMetadataSnapshot: Hashable, Sendable, Codable {
   /// in the application XMP.
   public var hostObservedDeviceMake: String?
   public var hostObservedDeviceModel: String?
+  public var hostObservedDeviceModelID: String?
   /// Capture backend and host software version observed at the shutter.
   public var captureBackend: String?
   public var captureBackendVersion: String?
+  public var usbIdentity: USBDeviceIdentity?
+  public var deviceIdentity: DeviceIdentityResolution?
 
   public init(
     sampleBufferAttachments: [String: String] = [:],
@@ -103,7 +107,10 @@ public struct FrameMetadataSnapshot: Hashable, Sendable, Codable {
     hostObservedDeviceMake: String? = nil,
     hostObservedDeviceModel: String? = nil,
     captureBackend: String? = nil,
-    captureBackendVersion: String? = nil
+    captureBackendVersion: String? = nil,
+    usbIdentity: USBDeviceIdentity? = nil,
+    deviceIdentity: DeviceIdentityResolution? = nil,
+    hostObservedDeviceModelID: String? = nil
   ) {
     self.sampleBufferAttachments = sampleBufferAttachments
     self.pixelBufferAttachments = pixelBufferAttachments
@@ -121,6 +128,9 @@ public struct FrameMetadataSnapshot: Hashable, Sendable, Codable {
     self.hostObservedDeviceModel = hostObservedDeviceModel
     self.captureBackend = captureBackend
     self.captureBackendVersion = captureBackendVersion
+    self.usbIdentity = usbIdentity
+    self.deviceIdentity = deviceIdentity
+    self.hostObservedDeviceModelID = hostObservedDeviceModelID
   }
 }
 

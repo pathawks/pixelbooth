@@ -1136,6 +1136,10 @@ final class CaptureViewModel: ObservableObject {
       // never presented as camera-Exif).
       snapshot.hostObservedDeviceMake = device.manufacturer
       snapshot.hostObservedDeviceModel = device.localizedName
+      snapshot.hostObservedDeviceModelID = device.modelID
+      snapshot.usbIdentity = device.usbIdentity
+      snapshot.deviceIdentity = DeviceIdentityResolution.resolve(
+        manufacturer: device.manufacturer, model: device.localizedName, usb: device.usbIdentity)
     }
     snapshot.captureBackend =
       switch activeBackend {

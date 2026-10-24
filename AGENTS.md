@@ -103,6 +103,10 @@ Do not reopen them in future work.
 
 ## Metadata, time, location (settled)
 
+- Prefer meaningful AVFoundation make/model, then matched USB descriptor
+  strings, then explicitly attributed USB vendor/product ID lookups. Preserve
+  raw API observations separately; generated Exif omits placeholders. Persist
+  the USB IDs, strings, observation time and association method at the shutter.
 - Save all available source Exif/XMP including unknown tags/namespaces; add a
   documented, versioned application XMP namespace for technical/provenance
   data. Separate camera-provided, host-observed, and application-generated
