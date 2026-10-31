@@ -33,7 +33,9 @@ enum USBIdentityDiscovery {
         USBDeviceIdentity(
           vendorID: vendorID, productID: productID, locationID: locationID,
           manufacturer: properties["USB Vendor Name"] as? String,
-          productName: properties["USB Product Name"] as? String, observedAtISO: observed))
+          productName: properties["USB Product Name"] as? String,
+          serialNumber: properties["USB Serial Number"] as? String,
+          observedAtISO: observed))
     }
     return result
   }

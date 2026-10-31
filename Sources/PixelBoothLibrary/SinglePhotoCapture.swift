@@ -270,7 +270,7 @@ private actor SinglePhotoSession {
     await cmio.addSink(ingest, queue: sinkQueue)
     try checkActive()
 
-    let (mode, rate, backend) = try await configure(
+    let (mode, rate, backend, deviceMetadata) = try await configure(
       deviceID: id, mode: selected.mode, requestedRate: requestedRate)
     let interval: UInt64 = {
       guard let rate, rate.isFinite, rate > 0,
@@ -280,12 +280,23 @@ private actor SinglePhotoSession {
     }()
     await ingest.beginConfiguration(
       deviceID: id, generation: generation, frameIntervalNanos: interval,
-      expectedFormat: mode.asCaptureFormat)
+      expectedFormat: mode.asCaptureFormat,
+      deviceMetadata: deviceMetadata,
+      warmupFrames: ReadinessHeuristic.default.minimumFreshFrames)
     try checkActive()
     if backend == "CoreMediaIO" {
       try await cmio.start(expectedGeneration: generation, operationToken: token)
     } else {
       try await service.start(expectedGeneration: generation, operationToken: token)
+    }
+    if let usbIdentity = selected.camera.usbIdentity {
+      let ingest = self.ingest
+      let captureGeneration = generation
+      Task.detached(priority: .utility) {
+        let controls = UVCControlReader.read(identity: usbIdentity)
+        _ = await ingest.setUVCControls(
+          controls, deviceID: id, generation: captureGeneration)
+      }
     }
     while true {
       try checkActive()
@@ -332,26 +343,29 @@ private actor SinglePhotoSession {
 
   private func configure(
     deviceID: String, mode: CameraMode, requestedRate: Double?
-  ) async throws -> (CameraMode, Double?, String) {
+  ) async throws -> (CameraMode, Double?, String, CaptureDeviceMetadata?) {
     // AVFoundation-only entries retain numeric format indices. Sending one
     // through CMIO's geometry/FourCC matcher could substitute a different
     // native description, so only exact CMIO fingerprints use that backend.
     if mode.formatID?.hasPrefix("cmio-") == true {
       do {
-        _ = try await cmio.configure(
+        let cmioResult = try await cmio.configure(
           deviceUniqueID: deviceID, mode: mode, requestedFrameRate: requestedRate,
           generation: generation, operationToken: token)
         try checkActive()
-        return (await cmio.configuredMode ?? mode, await cmio.configuredFrameRate, "CoreMediaIO")
+        return (
+          await cmio.configuredMode ?? mode, await cmio.configuredFrameRate, "CoreMediaIO",
+          cmioResult.deviceMetadata
+        )
       } catch {
         try checkActive()
       }
     }
-    _ = try await service.configure(
+    let avfResult = try await service.configure(
       deviceUniqueID: deviceID, mode: mode, requestedFrameRate: requestedRate,
       generation: generation, operationToken: token)
     try checkActive()
-    return (mode, await service.configuredFrameRate, "AVFoundation")
+    return (mode, await service.configuredFrameRate, "AVFoundation", avfResult.deviceMetadata)
   }
 
   private func stop() async {

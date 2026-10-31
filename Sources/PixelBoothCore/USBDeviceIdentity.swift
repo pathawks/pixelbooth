@@ -8,12 +8,13 @@ public struct USBDeviceIdentity: Hashable, Sendable, Codable {
   public var locationID: UInt32
   public var manufacturer: String?
   public var productName: String?
+  public var serialNumber: String?
   public var observedAtISO: String?
   public var associationMethod: String?
 
   public init(
     vendorID: UInt16, productID: UInt16, locationID: UInt32,
-    manufacturer: String? = nil, productName: String? = nil,
+    manufacturer: String? = nil, productName: String? = nil, serialNumber: String? = nil,
     observedAtISO: String? = nil, associationMethod: String? = nil
   ) {
     self.vendorID = vendorID
@@ -21,6 +22,7 @@ public struct USBDeviceIdentity: Hashable, Sendable, Codable {
     self.locationID = locationID
     self.manufacturer = manufacturer
     self.productName = productName
+    self.serialNumber = serialNumber
     self.observedAtISO = observedAtISO
     self.associationMethod = associationMethod
   }

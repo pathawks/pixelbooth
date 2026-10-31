@@ -537,6 +537,7 @@ public actor CMIOCaptureService {
   private let sinkRegistry = SinkRegistry()
   public private(set) var configuredFrameRate: Double?
   public private(set) var configuredMode: CameraMode?
+  public private(set) var currentDeviceMetadata: CaptureDeviceMetadata?
 
   public init() {}
 
@@ -597,7 +598,7 @@ public actor CMIOCaptureService {
     deviceUniqueID: String, mode: CameraMode, requestedFrameRate: Double? = nil,
     generation requestedGeneration: Int? = nil,
     operationToken: CaptureConfigurationToken? = nil
-  ) async throws -> Int {
+  ) async throws -> (generation: Int, deviceMetadata: CaptureDeviceMetadata?) {
     if let requestedGeneration, let operationToken,
       !operationToken.isCurrent(requestedGeneration)
     {
@@ -712,7 +713,21 @@ public actor CMIOCaptureService {
     configuredMode = matchedCapabilities?.updating(mode) ?? mode
     self.located = located
     deviceUID = deviceUniqueID
-    return generation
+    currentDeviceMetadata = Self.captureDeviceMetadata(deviceUniqueID: deviceUniqueID)
+    return (generation, currentDeviceMetadata)
+  }
+
+  private static func captureDeviceMetadata(deviceUniqueID: String) -> CaptureDeviceMetadata? {
+    guard let device = AVCaptureDevice(uniqueID: deviceUniqueID) else { return nil }
+    var effects: [String] = []
+    if device.isCenterStageActive { effects.append("CenterStage") }
+    if device.isPortraitEffectActive { effects.append("Portrait") }
+    if device.isStudioLightActive { effects.append("StudioLight") }
+    if device.isBackgroundReplacementActive { effects.append("BackgroundReplacement") }
+    return CaptureDeviceMetadata(
+      deviceType: device.deviceType.rawValue,
+      hasFlash: device.hasFlash,
+      activeEffects: effects)
   }
 
   /// Start streaming: attach a buffer queue, start the CMIO stream, and begin

@@ -61,11 +61,22 @@ final class FrameIngest: FrameSink {
 
   func beginConfiguration(
     deviceID: String, generation: Int, frameIntervalNanos: UInt64,
-    expectedFormat: CaptureFormat
+    expectedFormat: CaptureFormat,
+    deviceMetadata: CaptureDeviceMetadata? = nil,
+    warmupFrames: Int? = nil
   ) async {
     await shared.beginConfiguration(
       deviceID: deviceID, generation: generation, frameIntervalNanos: frameIntervalNanos,
-      expectedFormat: expectedFormat)
+      expectedFormat: expectedFormat,
+      deviceMetadata: deviceMetadata, warmupFrames: warmupFrames)
+  }
+
+  /// Apply delayed UVC observations only to the matching stream.
+  @discardableResult
+  func setUVCControls(
+    _ controls: UVCControlSnapshot?, deviceID: String, generation: Int
+  ) async -> Bool {
+    await shared.setUVCControls(controls, deviceID: deviceID, generation: generation)
   }
 
   func invalidateConfiguration() async { await shared.invalidateConfiguration() }
@@ -398,9 +409,9 @@ final class CaptureViewModel: ObservableObject {
       maximumAgeSeconds: locationMaximumAgePreference)
   }
 
-  private func applyReadinessPreferences() {
+  private func currentReadinessHeuristic() -> ReadinessHeuristic {
     let defaults = UserDefaults.standard
-    let heuristic = ReadinessHeuristic(
+    return ReadinessHeuristic(
       minimumFreshFrames: min(
         max(
           defaults.integer(forKey: "minimumFreshFrames") == 0
@@ -413,6 +424,10 @@ final class CaptureViewModel: ObservableObject {
         max(
           defaults.integer(forKey: "maximumAdjustingWaitMilliseconds") == 0
             ? 5000 : defaults.integer(forKey: "maximumAdjustingWaitMilliseconds"), 1000), 20_000))
+  }
+
+  private func applyReadinessPreferences() {
+    let heuristic = currentReadinessHeuristic()
     Task { await ingest.setReadinessHeuristic(heuristic) }
   }
 
@@ -595,26 +610,29 @@ final class CaptureViewModel: ObservableObject {
         let backend: Backend
         let selectedFrameRate: Double?
         let configuredMode: CameraMode
+        let deviceMetadata: CaptureDeviceMetadata?
         do {
-          _ = try await self.cmioService.configure(
+          let cmioResult = try await self.cmioService.configure(
             deviceUniqueID: id, mode: cameraMode,
             requestedFrameRate: requestedFrameRate, generation: configurationGeneration,
             operationToken: self.configurationToken)
           guard self.windowActive, revision == self.configurationRevision else { return }
           selectedFrameRate = await self.cmioService.configuredFrameRate
           configuredMode = await self.cmioService.configuredMode ?? cameraMode
+          deviceMetadata = cmioResult.deviceMetadata
           guard self.windowActive, revision == self.configurationRevision else { return }
           backend = .cmio
         } catch {
           guard self.windowActive, revision == self.configurationRevision else { return }
           self.readinessText = "CMIO unavailable for this mode — using AVFoundation fallback"
-          _ = try await self.service.configure(
+          let avfResult = try await self.service.configure(
             deviceUniqueID: id, mode: cameraMode,
             requestedFrameRate: requestedFrameRate, generation: configurationGeneration,
             operationToken: self.configurationToken)
           guard self.windowActive, revision == self.configurationRevision else { return }
           selectedFrameRate = await self.service.configuredFrameRate
           configuredMode = cameraMode
+          deviceMetadata = avfResult.deviceMetadata
           guard self.windowActive, revision == self.configurationRevision else { return }
           backend = .avfoundation
         }
@@ -631,10 +649,13 @@ final class CaptureViewModel: ObservableObject {
         CMIOFrameBox.shared.beginConfiguration(
           deviceID: id, generation: configurationGeneration)
         let frameIntervalNanos = selectedFrameRate.map { UInt64(1_000_000_000.0 / $0) } ?? 0
+        let selectedCamera = self.cameras.first { $0.uniqueID == id }
         await self.ingest.beginConfiguration(
           deviceID: id, generation: configurationGeneration,
           frameIntervalNanos: frameIntervalNanos,
-          expectedFormat: configuredMode.asCaptureFormat)
+          expectedFormat: configuredMode.asCaptureFormat,
+          deviceMetadata: deviceMetadata,
+          warmupFrames: currentReadinessHeuristic().minimumFreshFrames)
         guard self.windowActive, revision == self.configurationRevision else { return }
         switch backend {
         case .cmio:
@@ -647,6 +668,15 @@ final class CaptureViewModel: ObservableObject {
             operationToken: self.configurationToken)
         }
         guard self.windowActive, revision == self.configurationRevision else { return }
+        if let usbIdentity = selectedCamera?.usbIdentity {
+          let ingest = self.ingest
+          let observationGeneration = configurationGeneration
+          Task.detached(priority: .utility) {
+            let controls = UVCControlReader.read(identity: usbIdentity)
+            _ = await ingest.setUVCControls(
+              controls, deviceID: id, generation: observationGeneration)
+          }
+        }
       }
     } catch {
       guard revision == configurationRevision else { return }

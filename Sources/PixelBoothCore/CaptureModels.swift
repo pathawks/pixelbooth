@@ -54,6 +54,23 @@ public struct CaptureFormat: Hashable, Sendable, Codable {
   }
 }
 
+/// Device-level observations captured at stream-configuration time. These
+/// describe the capture API and its reported capabilities, not per-frame
+/// camera optical metadata.
+public struct CaptureDeviceMetadata: Hashable, Sendable, Codable {
+  public var deviceType: String?
+  public var hasFlash: Bool?
+  public var activeEffects: [String]
+
+  public init(
+    deviceType: String? = nil, hasFlash: Bool? = nil, activeEffects: [String] = []
+  ) {
+    self.deviceType = deviceType
+    self.hasFlash = hasFlash
+    self.activeEffects = activeEffects
+  }
+}
+
 /// High-level codec family of a mode. Drives the archival pipeline.
 public enum CaptureCodecFamily: String, Hashable, Sendable, Codable {
   case nativeJPEG  // MJPEG stream: full JPEG passthrough path

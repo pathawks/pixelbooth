@@ -33,6 +33,12 @@ actor CaptureImageFinalizer {
   }
 
   func finalize(_ capture: CapturedCapture) async throws -> FinalizedCaptureImage {
+    let mapping = CaptureMetadataMapper.map(
+      cameraObservations: capture.metadata.cameraObservations,
+      uvcControls: capture.metadata.uvcControls,
+      usbSerialNumber: capture.metadata.usbIdentity?.serialNumber)
+    let flash = capture.metadata.deviceMetadata?.hasFlash == false ? UInt16(0x0020) : nil
+    let creatorTool = "PixelBooth \(AppVersion.current)"
     switch capture.payload {
     case .jpegBytes(let bytes):
       // Metadata-only addition; image-coding data stays byte-exact. Never
@@ -46,9 +52,19 @@ actor CaptureImageFinalizer {
           make: capture.metadata.deviceIdentity?.manufacturer
             ?? capture.metadata.hostObservedDeviceMake,
           model: capture.metadata.deviceIdentity?.model ?? capture.metadata.hostObservedDeviceModel,
-          software: "PixelBooth \(AppVersion.current)",
+          software: creatorTool,
           captureISO: capture.acceptedAtISO,
-          location: capture.metadata.hostLocation)
+          location: capture.metadata.hostLocation,
+          fNumber: mapping.fNumber?.value,
+          focalLength: mapping.focalLength?.value,
+          focalLengthIn35mmFilm: mapping.focalLengthIn35mmFilm?.value,
+          bodySerialNumber: mapping.bodySerialNumber?.value,
+          pixelXDimension: UInt32(exactly: capture.width),
+          pixelYDimension: UInt32(exactly: capture.height),
+          flash: flash,
+          exposureTimeSeconds: mapping.exposureTimeSeconds?.value,
+          exposureMode: mapping.exposureMode?.value,
+          whiteBalance: mapping.whiteBalance?.value)
         : []
       let additionalExif = generatedExif.isEmpty ? nil : generatedExif
       let xmp = PixelBoothXMP.build(
@@ -59,14 +75,19 @@ actor CaptureImageFinalizer {
         actualCaptureFormat:
           "\(CaptureFormat.fourCCString(capture.pixelFourCC ?? capture.fourCC)) \(capture.width)×\(capture.height)",
         encoderSettings: "metadata-only",
-        metadataProvenance: try Self.deviceIdentityProvenance(capture)
-          + capture.archivedMetadataProvenance(),
+        metadataProvenance: try Self.metadataProvenance(capture, mapping: mapping),
         fidelity: capture.acquisitionEvidence.map { Self.fidelityName($0.fidelity) } ?? "unknown",
         hostLocation: capture.metadata.hostLocation,
         mediaTimeNanos: capture.timestampNanos,
         wallClockAnchorISO: capture.metadata.wallClockAnchorISO,
         sourceFormat: CaptureFormat.fourCCString(capture.fourCC),
-        dataSource: String(describing: capture.dataSource ?? .unknown))
+        dataSource: String(describing: capture.dataSource ?? .unknown),
+        creatorTool: creatorTool,
+        frameDurationSeconds: capture.metadata.frameDurationSeconds,
+        pixelFormat: capture.metadata.deliveredPixelFormat,
+        videoRange: capture.metadata.videoRange,
+        activeEffects: capture.metadata.deviceMetadata?.activeEffects ?? [],
+        warmupFrames: capture.metadata.warmupFrames)
       let withMeta = try JPEGMetadataWriter.withAdditionalMetadata(
         original: bytes, additionalXMP: xmp, additionalExif: additionalExif)
       return FinalizedCaptureImage(
@@ -85,7 +106,7 @@ actor CaptureImageFinalizer {
       // (Photos reads Exif; the XMP labels that provenance as host-observed —
       // never presented as camera-provided metadata).
       let provenance =
-        try Self.deviceIdentityProvenance(capture) + capture.archivedMetadataProvenance()
+        try Self.metadataProvenance(capture, mapping: mapping)
       let generatedXMP = PixelBoothXMP.build(
         captureUUID: capture.uuid, appVersion: AppVersion.current,
         captureBackend: capture.metadata.captureBackend ?? "unknown",
@@ -101,7 +122,13 @@ actor CaptureImageFinalizer {
         wallClockAnchorISO: capture.metadata.wallClockAnchorISO,
         sourceFormat: CaptureFormat.fourCCString(capture.fourCC),
         dataSource: String(describing: capture.dataSource ?? .unknown),
-        portraitRenderIntent: portraitRenderIntent)
+        portraitRenderIntent: portraitRenderIntent,
+        creatorTool: creatorTool,
+        frameDurationSeconds: capture.metadata.frameDurationSeconds,
+        pixelFormat: capture.metadata.deliveredPixelFormat,
+        videoRange: capture.metadata.videoRange,
+        activeEffects: capture.metadata.deviceMetadata?.activeEffects ?? [],
+        warmupFrames: capture.metadata.warmupFrames)
       let xmp: [UInt8]
       if let sourceXMP = capture.metadata.embeddedSourceXMP {
         xmp = try JPEGMetadataWriter.mergingXMP(source: sourceXMP, additional: generatedXMP)
@@ -114,9 +141,19 @@ actor CaptureImageFinalizer {
           make: capture.metadata.deviceIdentity?.manufacturer
             ?? capture.metadata.hostObservedDeviceMake,
           model: capture.metadata.deviceIdentity?.model ?? capture.metadata.hostObservedDeviceModel,
-          software: "PixelBooth \(AppVersion.current)",
+          software: creatorTool,
           captureISO: capture.acceptedAtISO,
-          location: capture.metadata.hostLocation)
+          location: capture.metadata.hostLocation,
+          fNumber: mapping.fNumber?.value,
+          focalLength: mapping.focalLength?.value,
+          focalLengthIn35mmFilm: mapping.focalLengthIn35mmFilm?.value,
+          bodySerialNumber: mapping.bodySerialNumber?.value,
+          pixelXDimension: UInt32(exactly: dimensions.width),
+          pixelYDimension: UInt32(exactly: dimensions.height),
+          flash: flash,
+          exposureTimeSeconds: mapping.exposureTimeSeconds?.value,
+          exposureMode: mapping.exposureMode?.value,
+          whiteBalance: mapping.whiteBalance?.value)
       let (data, settings, disparity) = try await avifEncodingWorker.encode(
         capture, exifPayload: exif, xmpPayload: xmp, portraitRenderIntent: portraitRenderIntent)
       var appliedSettings = "quality=\(settings.quality) speed=\(settings.speed)"
@@ -147,11 +184,13 @@ actor CaptureImageFinalizer {
     }
   }
 
-  /// Host-observed device identity provenance for the application XMP. The
-  /// backend-reported device manufacturer/name are labeled hostObserved; the
-  /// Exif mirror is labeled applicationGenerated.
-  private static func deviceIdentityProvenance(_ capture: CapturedCapture) -> [MetadataObservation]
-  {
+  /// Host-observed device identity and camera-provided value provenance for
+  /// the application XMP. The backend-reported device manufacturer/name are
+  /// labeled hostObserved; the Exif mirror and application policy fields are
+  /// labeled applicationGenerated.
+  private static func metadataProvenance(
+    _ capture: CapturedCapture, mapping: CaptureMetadataMapping
+  ) throws -> [MetadataObservation] {
     var provenance: [MetadataObservation] = []
     if let make = capture.metadata.hostObservedDeviceMake, !make.isEmpty {
       provenance.append(
@@ -210,6 +249,71 @@ actor CaptureImageFinalizer {
           && capture.metadata.deviceIdentity == nil
           ? "true" : "false",
         provenance: .applicationGenerated))
+    if let serial = mapping.bodySerialNumber {
+      provenance.append(
+        MetadataObservation(
+          key: "USBDeviceSerialString", rawValueString: serial.value,
+          provenance: serial.source == .usbIdentity ? .hostObserved : .applicationGenerated,
+          observedAtISO: capture.metadata.usbIdentity?.observedAtISO))
+      provenance.append(
+        MetadataObservation(
+          key: "ExifBodySerialNumberSource",
+          rawValueString: "USB-host-observed-not-camera-reported",
+          provenance: .applicationGenerated))
+    }
+    if let fNumber = mapping.fNumber {
+      provenance.append(
+        MetadataObservation(
+          key: "ExifFNumberSource", rawValueString: fNumber.raw,
+          provenance: fNumber.source == .cameraAttachment ? .cameraProvided : .hostObserved))
+    }
+    if let focalLength = mapping.focalLength {
+      provenance.append(
+        MetadataObservation(
+          key: "ExifFocalLengthSource", rawValueString: focalLength.raw,
+          provenance: focalLength.source == .cameraAttachment ? .cameraProvided : .hostObserved))
+    }
+    if let focalLength35 = mapping.focalLengthIn35mmFilm {
+      provenance.append(
+        MetadataObservation(
+          key: "ExifFocalLengthIn35mmFilmSource", rawValueString: focalLength35.raw,
+          provenance: focalLength35.source == .cameraAttachment ? .cameraProvided : .hostObserved))
+    }
+    if let exposureTime = mapping.exposureTimeSeconds {
+      provenance.append(
+        MetadataObservation(
+          key: "ExifExposureTimeSource", rawValueString: exposureTime.raw,
+          provenance: exposureTime.source == .cameraAttachment ? .cameraProvided : .hostObserved))
+    }
+    if let exposureMode = mapping.exposureMode {
+      provenance.append(
+        MetadataObservation(
+          key: "ExifExposureModeSource", rawValueString: exposureMode.raw,
+          provenance: exposureMode.source == .cameraAttachment ? .cameraProvided : .hostObserved))
+    }
+    if let whiteBalance = mapping.whiteBalance {
+      provenance.append(
+        MetadataObservation(
+          key: "ExifWhiteBalanceSource", rawValueString: whiteBalance.raw,
+          provenance: whiteBalance.source == .cameraAttachment ? .cameraProvided : .hostObserved))
+    }
+    if let flash = capture.metadata.deviceMetadata?.hasFlash {
+      provenance.append(
+        MetadataObservation(
+          key: "ExifFlashValueSource",
+          rawValueString: flash ? "device-has-flash-capability" : "no-flash-function",
+          provenance: .applicationGenerated))
+    }
+    if let deviceType = capture.metadata.deviceMetadata?.deviceType {
+      provenance.append(
+        MetadataObservation(
+          key: "AVCaptureDeviceType", rawValueString: deviceType,
+          provenance: .hostObserved))
+    }
+    provenance.append(contentsOf: capture.metadata.cameraObservations)
+    provenance.append(
+      contentsOf: CaptureMetadataMapper.uvcObservations(capture.metadata.uvcControls))
+    provenance.append(contentsOf: try capture.archivedMetadataProvenance())
     return provenance
   }
 

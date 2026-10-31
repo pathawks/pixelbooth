@@ -88,6 +88,67 @@ func runMetadataExifSuite() async {
     else { throw exifTestError("meaningful text was omitted or changed") }
   }
 
+  await test("ExifBuilder.writesOptionalOpticalAndDimensionTags") {
+    let exif = ExifBuilder.build(
+      make: "Apple Inc.", model: "FaceTime HD Camera", software: "PixelBooth 0.1.0",
+      captureISO: "2026-09-24T03:26:15Z",
+      fNumber: 2.8, focalLength: 4.25, focalLengthIn35mmFilm: 28.5,
+      bodySerialNumber: "ABC123456",
+      pixelXDimension: 1920, pixelYDimension: 1080,
+      flash: 0x0020, exifVersion: "0232")
+    let tags = try exifIFD0Tags(exif)
+    let exifTags = try exifSubIFDTags(exif)
+    guard tags.contains(0x010F), tags.contains(0x0110), tags.contains(0x0131),
+      !tags.contains(0xA431)
+    else { throw exifTestError("identity or body serial tags missing") }
+    guard exifTextContains(exif, "ABC123456") else {
+      throw exifTestError("body serial number missing")
+    }
+    guard exifTags.contains(0x829D), exifTags.contains(0x920A), exifTags.contains(0x9209),
+      exifTags.contains(0xA431), exifTags.contains(0xA405),
+      exifTags.contains(0xA002), exifTags.contains(0xA003),
+      exifTags.contains(0x9000)
+    else { throw exifTestError("optical/dimension/version tags missing") }
+  }
+
+  await test("ExifBuilder.writesExposureTimeModeAndWhiteBalance") {
+    let exif = ExifBuilder.build(
+      make: "Logitech", model: "BRIO", software: "PixelBooth 0.1.0",
+      captureISO: "2026-09-24T03:26:15Z",
+      exposureTimeSeconds: 0.01,
+      exposureMode: 1,
+      whiteBalance: 0)
+    let exifTags = try exifSubIFDTags(exif)
+    guard exifTags.contains(0x829A) else { throw exifTestError("ExposureTime tag missing") }
+    guard exifTags.contains(0xA402) else { throw exifTestError("ExposureMode tag missing") }
+    guard exifTags.contains(0xA403) else { throw exifTestError("WhiteBalance tag missing") }
+    // 0.01 s is encoded as the rational 1/100.
+    guard let (numerator, denominator) = try exifRational(exif, tag: 0x829A),
+      abs(Double(numerator) / Double(denominator) - 0.01) < 0.000000001
+    else { throw exifTestError("exposure time rational missing or incorrect") }
+  }
+
+  await test("ExifBuilder.preservesMillisecondExposurePrecision") {
+    let exif = ExifBuilder.build(
+      make: nil, model: nil, software: nil,
+      captureISO: "2026-09-24T03:26:15Z", exposureTimeSeconds: 0.001)
+    guard let (numerator, denominator) = try exifRational(exif, tag: 0x829A),
+      denominator > 0,
+      abs(Double(numerator) / Double(denominator) - 0.001) < 0.000000001
+    else { throw exifTestError("1 ms exposure was rounded to the wrong value") }
+  }
+
+  await test("ExifBuilder.omitsUnspecifiedExposureTags") {
+    let exif = ExifBuilder.build(
+      make: "Logitech", model: "BRIO", software: "PixelBooth 0.1.0",
+      captureISO: "2026-09-24T03:26:15Z")
+    let exifTags = try exifSubIFDTags(exif)
+    guard
+      !exifTags.contains(0x829A), !exifTags.contains(0xA402),
+      !exifTags.contains(0xA403)
+    else { throw exifTestError("unspecified exposure tags written") }
+  }
+
   await test("ExifBuilder.rejectsUnparseableTime") {
     let exif = ExifBuilder.build(
       make: "Apple", model: "Camera", software: "PixelBooth", captureISO: "not-a-time")
@@ -235,6 +296,81 @@ private func exifIFD0Tags(_ payload: [UInt8]) throws -> Set<UInt16> {
   return Set(
     (0..<count).map { index in
       let offset = 10 + index * 12
+      return UInt16(payload[offset]) | (UInt16(payload[offset + 1]) << 8)
+    })
+}
+
+private func exifRational(_ payload: [UInt8], tag: UInt16) throws -> (UInt32, UInt32)? {
+  guard payload.count >= 10 else { throw exifTestError("IFD0 missing") }
+  let ifd0Count = Int(payload[8]) | (Int(payload[9]) << 8)
+  var exifOffset: UInt32?
+  for index in 0..<ifd0Count {
+    let offset = 10 + index * 12
+    guard offset + 12 <= payload.count else { throw exifTestError("IFD0 truncated") }
+    let candidate = UInt16(payload[offset]) | (UInt16(payload[offset + 1]) << 8)
+    if candidate == 0x8769 {
+      exifOffset =
+        UInt32(payload[offset + 8]) | (UInt32(payload[offset + 9]) << 8)
+        | (UInt32(payload[offset + 10]) << 16) | (UInt32(payload[offset + 11]) << 24)
+      break
+    }
+  }
+  guard let exifOffset, Int(exifOffset) + 2 <= payload.count else {
+    throw exifTestError("Exif IFD offset missing")
+  }
+  let base = Int(exifOffset)
+  let count = Int(payload[base]) | (Int(payload[base + 1]) << 8)
+  guard payload.count >= base + 2 + count * 12 else { throw exifTestError("Exif IFD truncated") }
+  for index in 0..<count {
+    let offset = base + 2 + index * 12
+    let candidate = UInt16(payload[offset]) | (UInt16(payload[offset + 1]) << 8)
+    guard candidate == tag else { continue }
+    let type = UInt16(payload[offset + 2]) | (UInt16(payload[offset + 3]) << 8)
+    guard type == 5 else { throw exifTestError("tag \(tag) is not a rational") }
+    let valueOffset =
+      UInt32(payload[offset + 8]) | (UInt32(payload[offset + 9]) << 8)
+      | (UInt32(payload[offset + 10]) << 16) | (UInt32(payload[offset + 11]) << 24)
+    let numeratorOffset = Int(valueOffset)
+    guard numeratorOffset + 8 <= payload.count else {
+      throw exifTestError("rational value truncated")
+    }
+    let numerator =
+      UInt32(payload[numeratorOffset]) | (UInt32(payload[numeratorOffset + 1]) << 8)
+      | (UInt32(payload[numeratorOffset + 2]) << 16) | (UInt32(payload[numeratorOffset + 3]) << 24)
+    let denominator =
+      UInt32(payload[numeratorOffset + 4])
+      | (UInt32(payload[numeratorOffset + 5]) << 8)
+      | (UInt32(payload[numeratorOffset + 6]) << 16)
+      | (UInt32(payload[numeratorOffset + 7]) << 24)
+    return (numerator, denominator)
+  }
+  return nil
+}
+
+private func exifSubIFDTags(_ payload: [UInt8]) throws -> Set<UInt16> {
+  guard payload.count >= 10 else { throw exifTestError("IFD0 missing") }
+  let ifd0Count = Int(payload[8]) | (Int(payload[9]) << 8)
+  var exifOffset: UInt32?
+  for index in 0..<ifd0Count {
+    let offset = 10 + index * 12
+    guard offset + 12 <= payload.count else { throw exifTestError("IFD0 truncated") }
+    let tag = UInt16(payload[offset]) | (UInt16(payload[offset + 1]) << 8)
+    if tag == 0x8769 {
+      exifOffset =
+        UInt32(payload[offset + 8]) | (UInt32(payload[offset + 9]) << 8)
+        | (UInt32(payload[offset + 10]) << 16) | (UInt32(payload[offset + 11]) << 24)
+      break
+    }
+  }
+  guard let exifOffset, Int(exifOffset) + 2 <= payload.count else {
+    throw exifTestError("Exif IFD offset missing")
+  }
+  let base = Int(exifOffset)
+  let count = Int(payload[base]) | (Int(payload[base + 1]) << 8)
+  guard payload.count >= base + 2 + count * 12 else { throw exifTestError("Exif IFD truncated") }
+  return Set(
+    (0..<count).map { index in
+      let offset = base + 2 + index * 12
       return UInt16(payload[offset]) | (UInt16(payload[offset + 1]) << 8)
     })
 }

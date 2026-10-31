@@ -99,6 +99,20 @@ public struct FrameMetadataSnapshot: Hashable, Sendable, Codable {
   public var deviceIdentity: DeviceIdentityResolution?
   /// Bounded prior delivered-frame evidence, never used to fill current color tags.
   public var streamColorObservations: [DeliveredColorObservation]?
+  /// Camera-provided values from frame attachments and future UVC controls.
+  public var cameraObservations: [MetadataObservation]
+  /// Device-level observations captured at stream-configuration time.
+  public var deviceMetadata: CaptureDeviceMetadata?
+  /// Valid positive sample duration, in seconds.
+  public var frameDurationSeconds: Double?
+  /// Delivered pixel format FourCC string and video range, recorded separately
+  /// from the selected device format.
+  public var deliveredPixelFormat: String?
+  public var videoRange: String?
+  /// Configured warm-up frame count (application policy, not camera metadata).
+  public var warmupFrames: Int?
+  /// Host-observed UVC control state observed after stream start.
+  public var uvcControls: UVCControlSnapshot?
 
   public init(
     sampleBufferAttachments: [String: String] = [:],
@@ -123,7 +137,14 @@ public struct FrameMetadataSnapshot: Hashable, Sendable, Codable {
     usbIdentity: USBDeviceIdentity? = nil,
     deviceIdentity: DeviceIdentityResolution? = nil,
     hostObservedDeviceModelID: String? = nil,
-    streamColorObservations: [DeliveredColorObservation]? = nil
+    streamColorObservations: [DeliveredColorObservation]? = nil,
+    cameraObservations: [MetadataObservation] = [],
+    deviceMetadata: CaptureDeviceMetadata? = nil,
+    frameDurationSeconds: Double? = nil,
+    deliveredPixelFormat: String? = nil,
+    videoRange: String? = nil,
+    warmupFrames: Int? = nil,
+    uvcControls: UVCControlSnapshot? = nil
   ) {
     self.sampleBufferAttachments = sampleBufferAttachments
     self.pixelBufferAttachments = pixelBufferAttachments
@@ -148,6 +169,70 @@ public struct FrameMetadataSnapshot: Hashable, Sendable, Codable {
     self.deviceIdentity = deviceIdentity
     self.hostObservedDeviceModelID = hostObservedDeviceModelID
     self.streamColorObservations = streamColorObservations
+    self.cameraObservations = cameraObservations
+    self.deviceMetadata = deviceMetadata
+    self.frameDurationSeconds = frameDurationSeconds
+    self.deliveredPixelFormat = deliveredPixelFormat
+    self.videoRange = videoRange
+    self.warmupFrames = warmupFrames
+    self.uvcControls = uvcControls
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case sampleBufferAttachments, pixelBufferAttachments, formatDescriptionData
+    case embeddedSourceExif, embeddedSourceXMP, embeddedSourceICC, unknownSegments
+    case hostObservations, hostLocation, mediaTimeNanos, wallClockAnchorISO, generation
+    case hostObservedDeviceMake, hostObservedDeviceModel, hostObservedDeviceModelID
+    case captureBackend, captureBackendVersion, includeEstimatedDisparity, attachmentArchive
+    case colorEncodingFailure, usbIdentity, deviceIdentity, streamColorObservations
+    case cameraObservations, deviceMetadata, frameDurationSeconds, deliveredPixelFormat
+    case videoRange, warmupFrames, uvcControls
+  }
+
+  /// Older staged captures predate cameraObservations. Treat that missing key as
+  /// an empty observation list so those journals remain recoverable.
+  public init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    sampleBufferAttachments = try values.decode(
+      [String: String].self, forKey: .sampleBufferAttachments)
+    pixelBufferAttachments = try values.decode(
+      [String: String].self, forKey: .pixelBufferAttachments)
+    formatDescriptionData = try values.decode([String: String].self, forKey: .formatDescriptionData)
+    embeddedSourceExif = try values.decodeIfPresent([UInt8].self, forKey: .embeddedSourceExif)
+    embeddedSourceXMP = try values.decodeIfPresent([UInt8].self, forKey: .embeddedSourceXMP)
+    embeddedSourceICC = try values.decodeIfPresent([UInt8].self, forKey: .embeddedSourceICC)
+    unknownSegments = try values.decode([[UInt8]].self, forKey: .unknownSegments)
+    hostObservations = try values.decode([MetadataObservation].self, forKey: .hostObservations)
+    hostLocation = try values.decodeIfPresent(HostLocationObservation.self, forKey: .hostLocation)
+    mediaTimeNanos = try values.decode(UInt64.self, forKey: .mediaTimeNanos)
+    wallClockAnchorISO = try values.decode(String.self, forKey: .wallClockAnchorISO)
+    generation = try values.decode(Int.self, forKey: .generation)
+    hostObservedDeviceMake = try values.decodeIfPresent(
+      String.self, forKey: .hostObservedDeviceMake)
+    hostObservedDeviceModel = try values.decodeIfPresent(
+      String.self, forKey: .hostObservedDeviceModel)
+    hostObservedDeviceModelID = try values.decodeIfPresent(
+      String.self, forKey: .hostObservedDeviceModelID)
+    captureBackend = try values.decodeIfPresent(String.self, forKey: .captureBackend)
+    captureBackendVersion = try values.decodeIfPresent(String.self, forKey: .captureBackendVersion)
+    includeEstimatedDisparity = try values.decodeIfPresent(
+      Bool.self, forKey: .includeEstimatedDisparity)
+    attachmentArchive = try values.decodeIfPresent(
+      CaptureAttachmentArchive.self, forKey: .attachmentArchive)
+    colorEncodingFailure = try values.decodeIfPresent(String.self, forKey: .colorEncodingFailure)
+    usbIdentity = try values.decodeIfPresent(USBDeviceIdentity.self, forKey: .usbIdentity)
+    deviceIdentity = try values.decodeIfPresent(
+      DeviceIdentityResolution.self, forKey: .deviceIdentity)
+    streamColorObservations = try values.decodeIfPresent(
+      [DeliveredColorObservation].self, forKey: .streamColorObservations)
+    cameraObservations =
+      try values.decodeIfPresent([MetadataObservation].self, forKey: .cameraObservations) ?? []
+    deviceMetadata = try values.decodeIfPresent(CaptureDeviceMetadata.self, forKey: .deviceMetadata)
+    frameDurationSeconds = try values.decodeIfPresent(Double.self, forKey: .frameDurationSeconds)
+    deliveredPixelFormat = try values.decodeIfPresent(String.self, forKey: .deliveredPixelFormat)
+    videoRange = try values.decodeIfPresent(String.self, forKey: .videoRange)
+    warmupFrames = try values.decodeIfPresent(Int.self, forKey: .warmupFrames)
+    uvcControls = try values.decodeIfPresent(UVCControlSnapshot.self, forKey: .uvcControls)
   }
 }
 
@@ -176,7 +261,13 @@ public struct PixelBoothXMP {
     wallClockAnchorISO: String,
     sourceFormat: String? = nil,
     dataSource: String? = nil,
-    portraitRenderIntent: PortraitRenderIntent? = nil
+    portraitRenderIntent: PortraitRenderIntent? = nil,
+    creatorTool: String? = nil,
+    frameDurationSeconds: Double? = nil,
+    pixelFormat: String? = nil,
+    videoRange: String? = nil,
+    activeEffects: [String] = [],
+    warmupFrames: Int? = nil
   ) -> [UInt8] {
     var xmp = """
       <?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
@@ -202,8 +293,27 @@ public struct PixelBoothXMP {
     xmp += "\n  \(namespacePrefix):EncoderSettings=\"\(escape(encoderSettings))\""
     xmp += "\n  \(namespacePrefix):AcquisitionFidelity=\"\(escape(fidelity))\""
     xmp += "\n  \(namespacePrefix):SchemaVersion=\"\(schemaVersion)\""
+    if let creatorTool = creatorTool {
+      xmp += "\n  \(namespacePrefix):CreatorTool=\"\(escape(creatorTool))\""
+    }
     xmp += "\n  \(namespacePrefix):MediaTimeNanos=\"\(mediaTimeNanos)\""
     xmp += "\n  \(namespacePrefix):WallClockAnchor=\"\(escape(wallClockAnchorISO))\""
+    if let frameDurationSeconds {
+      xmp += "\n  \(namespacePrefix):FrameDuration=\"\(frameDurationSeconds)\""
+    }
+    if let pixelFormat {
+      xmp += "\n  \(namespacePrefix):PixelFormat=\"\(escape(pixelFormat))\""
+    }
+    if let videoRange {
+      xmp += "\n  \(namespacePrefix):VideoRange=\"\(escape(videoRange))\""
+    }
+    if !activeEffects.isEmpty {
+      xmp +=
+        "\n  \(namespacePrefix):ActiveEffects=\"\(escape(activeEffects.joined(separator: ",")))\""
+    }
+    if let warmupFrames {
+      xmp += "\n  \(namespacePrefix):WarmupFrames=\"\(warmupFrames)\""
+    }
     if let intent = portraitRenderIntent {
       xmp += "\n  \(namespacePrefix):PortraitProfileVersion=\"\(intent.version)\""
       xmp += "\n  \(namespacePrefix):PortraitRenderIntentOrigin=\"\(intent.origin.rawValue)\""

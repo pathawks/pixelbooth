@@ -323,7 +323,9 @@ public final class CaptureFrameIngest: FrameSink, @unchecked Sendable {
 
   public func beginConfiguration(
     deviceID: String, generation: Int, frameIntervalNanos: UInt64,
-    expectedFormat: CaptureFormat
+    expectedFormat: CaptureFormat,
+    deviceMetadata: CaptureDeviceMetadata? = nil,
+    warmupFrames: Int? = nil
   ) async {
     resetPublishing(
       generation: generation, deviceID: deviceID, expectedFormat: expectedFormat)
@@ -332,7 +334,16 @@ public final class CaptureFrameIngest: FrameSink, @unchecked Sendable {
     processingQueue.async { [h264Decoder] in h264Decoder.invalidate() }
     await store.beginConfiguration(
       deviceID: deviceID, generation: generation,
-      frameIntervalNanos: frameIntervalNanos)
+      frameIntervalNanos: frameIntervalNanos,
+      deviceMetadata: deviceMetadata, warmupFrames: warmupFrames)
+  }
+
+  /// Apply a delayed USB read only if its stream is still active.
+  @discardableResult
+  public func setUVCControls(
+    _ controls: UVCControlSnapshot?, deviceID: String, generation: Int
+  ) async -> Bool {
+    await store.setUVCControls(controls, deviceID: deviceID, generation: generation)
   }
 
   /// Drop retained frames and stop publishing readiness for the previous

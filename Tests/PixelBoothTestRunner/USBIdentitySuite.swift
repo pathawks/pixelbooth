@@ -76,6 +76,15 @@ func runUSBIdentitySuite() async {
     check(unknown.manufacturer == nil && unknown.model == nil, "unknown IDs remain unavailable")
   }
 
+  await test("serialNumberIsCapturedAndMatchedWithIdentity") {
+    let withSerial = USBDeviceIdentity(
+      vendorID: 0x046D, productID: 0x085E, locationID: 0x1234_0000,
+      manufacturer: nil, productName: "BRIO", serialNumber: "A1B2C3D4E5")
+    let match = USBDeviceIdentity.matching(
+      deviceUID: "0x12340000046d085e", isUSBTransport: true, records: [withSerial])
+    check(match?.serialNumber == "A1B2C3D4E5", "serial number survives matching")
+  }
+
   await test("shutterSnapshotRetainsUSBIDsAndAttributionAcrossJSON") {
     var metadata = FrameMetadataSnapshot(
       mediaTimeNanos: 1, wallClockAnchorISO: "2026-10-23T12:00:00Z", generation: 1)

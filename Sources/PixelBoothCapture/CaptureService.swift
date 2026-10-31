@@ -308,6 +308,7 @@ public actor CaptureService {
   private var stopObservers: [NSObjectProtocol] = []
   private var isStreaming = false
   public private(set) var configuredFrameRate: Double?
+  public private(set) var currentDeviceMetadata: CaptureDeviceMetadata?
 
   public init() {}
 
@@ -323,7 +324,7 @@ public actor CaptureService {
     deviceUniqueID: String, mode: CameraMode,
     requestedFrameRate: Double? = nil, generation requestedGeneration: Int? = nil,
     operationToken: CaptureConfigurationToken? = nil
-  ) throws -> Int {
+  ) throws -> (generation: Int, deviceMetadata: CaptureDeviceMetadata?) {
     if let requestedGeneration, let operationToken,
       !operationToken.isCurrent(requestedGeneration)
     {
@@ -443,7 +444,20 @@ public actor CaptureService {
     }
     // Restart delivery in the final selected mode (warm-up in final mode;
     // no restart at the shutter).
-    return generation
+    currentDeviceMetadata = Self.captureDeviceMetadata(device)
+    return (generation, currentDeviceMetadata)
+  }
+
+  private static func captureDeviceMetadata(_ device: AVCaptureDevice) -> CaptureDeviceMetadata {
+    var effects: [String] = []
+    if device.isCenterStageActive { effects.append("CenterStage") }
+    if device.isPortraitEffectActive { effects.append("Portrait") }
+    if device.isStudioLightActive { effects.append("StudioLight") }
+    if device.isBackgroundReplacementActive { effects.append("BackgroundReplacement") }
+    return CaptureDeviceMetadata(
+      deviceType: device.deviceType.rawValue,
+      hasFlash: device.hasFlash,
+      activeEffects: effects)
   }
 
   /// Attach an advanced lower-frame-rate override (explicit user request).

@@ -20,6 +20,33 @@ public enum ExifBuilder {
       return Entry(tag: tag, type: 2, count: UInt32(bytes.count + 1), payload: bytes + [0])
     }
 
+    static func rational(tag: UInt16, value: Double) -> Entry? {
+      guard value.isFinite, value > 0 else { return nil }
+      let denominator = UInt32(min(1_000_000, max(1, Double(UInt32.max) / value)))
+      let scaled = (value * Double(denominator)).rounded()
+      // Use an exclusive upper bound because converting 2^32 to UInt32 traps.
+      guard scaled >= 1, scaled < Double(UInt32.max) + 1 else { return nil }
+      return Entry(
+        tag: tag, type: 5, count: 1,
+        payload: rationalBytes(UInt32(scaled), denominator))
+    }
+
+    static func short(tag: UInt16, value: UInt16) -> Entry {
+      Entry(tag: tag, type: 3, count: 1, payload: [UInt8(value & 0xff), UInt8(value >> 8)])
+    }
+
+    static func long(tag: UInt16, value: UInt32) -> Entry {
+      Entry(
+        tag: tag, type: 4, count: 1,
+        payload: [
+          UInt8(value & 0xff), UInt8((value >> 8) & 0xff), UInt8((value >> 16) & 0xff),
+          UInt8(value >> 24),
+        ])
+    }
+
+    static func undefined(tag: UInt16, value: [UInt8]) -> Entry {
+      Entry(tag: tag, type: 7, count: UInt32(value.count), payload: value)
+    }
   }
 
   /// Little-endian TIFF ("II"): IFD0, Exif sub-IFD, optional GPS IFD, then
@@ -27,7 +54,18 @@ public enum ExifBuilder {
   public static func build(
     make: String?, model: String?, software: String?,
     captureISO: String,
-    location: HostLocationObservation? = nil
+    location: HostLocationObservation? = nil,
+    fNumber: Double? = nil,
+    focalLength: Double? = nil,
+    focalLengthIn35mmFilm: Double? = nil,
+    bodySerialNumber: String? = nil,
+    pixelXDimension: UInt32? = nil,
+    pixelYDimension: UInt32? = nil,
+    flash: UInt16? = nil,
+    exifVersion: String? = "0232",
+    exposureTimeSeconds: Double? = nil,
+    exposureMode: UInt16? = nil,
+    whiteBalance: UInt16? = nil
   ) -> [UInt8] {
     guard let dateTime = exifDateTime(from: captureISO) else { return [] }
 
@@ -36,11 +74,16 @@ public enum ExifBuilder {
     if let model = meaningfulText(model) { ifd0.append(.ascii(tag: 0x0110, value: model)) }
     if let software = meaningfulText(software) { ifd0.append(.ascii(tag: 0x0131, value: software)) }
     ifd0.append(.ascii(tag: 0x0132, value: dateTime))
-
     var exifIFD = [
       Entry.ascii(tag: 0x9003, value: dateTime),
       Entry.ascii(tag: 0x9004, value: dateTime),
     ]
+    if let version = meaningfulText(exifVersion) {
+      exifIFD.append(.undefined(tag: 0x9000, value: Array(version.utf8)))
+    }
+    if let bodySerialNumber = meaningfulText(bodySerialNumber) {
+      exifIFD.append(.ascii(tag: 0xA431, value: bodySerialNumber))
+    }
     if let offset = capturedOffset(captureISO) {
       exifIFD.append(contentsOf: [
         .ascii(tag: 0x9010, value: offset),
@@ -54,6 +97,29 @@ public enum ExifBuilder {
         .ascii(tag: 0x9291, value: subsecond),
         .ascii(tag: 0x9292, value: subsecond),
       ])
+    }
+    if let exposureTimeSeconds, let entry = Entry.rational(tag: 0x829A, value: exposureTimeSeconds)
+    {
+      exifIFD.append(entry)
+    }
+    if let fNumber, let entry = Entry.rational(tag: 0x829D, value: fNumber) {
+      exifIFD.append(entry)
+    }
+    if let focalLength, let entry = Entry.rational(tag: 0x920A, value: focalLength) {
+      exifIFD.append(entry)
+    }
+    if let flash { exifIFD.append(.short(tag: 0x9209, value: flash)) }
+    if let focalLengthIn35mmFilm {
+      let rounded = max(0, min(Double(UInt16.max), focalLengthIn35mmFilm.rounded()))
+      exifIFD.append(.short(tag: 0xA405, value: UInt16(rounded)))
+    }
+    if let exposureMode { exifIFD.append(.short(tag: 0xA402, value: exposureMode)) }
+    if let whiteBalance { exifIFD.append(.short(tag: 0xA403, value: whiteBalance)) }
+    if let pixelXDimension {
+      exifIFD.append(.long(tag: 0xA002, value: pixelXDimension))
+    }
+    if let pixelYDimension {
+      exifIFD.append(.long(tag: 0xA003, value: pixelYDimension))
     }
     exifIFD.sort { $0.tag < $1.tag }
     let gpsIFD = location.flatMap(gpsEntries) ?? []

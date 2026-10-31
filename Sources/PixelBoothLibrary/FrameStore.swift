@@ -20,11 +20,18 @@ public actor FrameStore {
     public var deviceUniqueID: String
     public var generation: Int
     public var frameIntervalNanos: UInt64
+    public var deviceMetadata: CaptureDeviceMetadata?
+    public var warmupFrames: Int
 
-    public init(deviceUniqueID: String, generation: Int, frameIntervalNanos: UInt64) {
+    public init(
+      deviceUniqueID: String, generation: Int, frameIntervalNanos: UInt64,
+      deviceMetadata: CaptureDeviceMetadata? = nil, warmupFrames: Int = 8
+    ) {
       self.deviceUniqueID = deviceUniqueID
       self.generation = generation
       self.frameIntervalNanos = frameIntervalNanos
+      self.deviceMetadata = deviceMetadata
+      self.warmupFrames = warmupFrames
     }
   }
 
@@ -32,6 +39,7 @@ public actor FrameStore {
   private var frameIntervalNanos: UInt64 = 33_333_333  // refined from mode
   private var readinessHeuristic: ReadinessHeuristic
   private var readiness: ReadinessStateMachine
+  private var currentUVCControls: UVCControlSnapshot?
 
   /// Retain at most this many recent frames to bound memory.
   private var maxFrames = 12
@@ -42,7 +50,10 @@ public actor FrameStore {
     readiness = ReadinessStateMachine(heuristic: heuristic)
   }
 
-  public func beginConfiguration(deviceID: String, generation: Int, frameIntervalNanos: UInt64) {
+  public func beginConfiguration(
+    deviceID: String, generation: Int, frameIntervalNanos: UInt64,
+    deviceMetadata: CaptureDeviceMetadata? = nil, warmupFrames: Int? = nil
+  ) {
     invalidate()
     // Freshness window follows the selected mode's advertised interval. An
     // unknown rate keeps the conservative 30 fps default.
@@ -51,8 +62,25 @@ public actor FrameStore {
     requestedFrameRate =
       frameIntervalNanos > 0
       ? 1_000_000_000.0 / Double(frameIntervalNanos) : 0
+    currentUVCControls = nil
     activeConfiguration = ActiveConfiguration(
-      deviceUniqueID: deviceID, generation: generation, frameIntervalNanos: interval)
+      deviceUniqueID: deviceID, generation: generation, frameIntervalNanos: interval,
+      deviceMetadata: deviceMetadata,
+      warmupFrames: warmupFrames ?? readinessHeuristic.minimumFreshFrames)
+  }
+
+  /// Apply a delayed UVC observation after stream start without blocking
+  /// warm-up. Controls are included in subsequent frame metadata snapshots.
+  /// A read that finishes after reconfiguration or invalidation is discarded.
+  @discardableResult
+  public func setUVCControls(
+    _ controls: UVCControlSnapshot?, deviceID: String, generation: Int
+  ) -> Bool {
+    guard let active = activeConfiguration,
+      active.deviceUniqueID == deviceID, active.generation == generation
+    else { return false }
+    currentUVCControls = controls
+    return true
   }
 
   /// Drop every retained frame and the active stream identity. Called when
@@ -63,6 +91,7 @@ public actor FrameStore {
   /// frame is rejected: there is no active configuration to belong to.
   public func invalidate() {
     activeConfiguration = nil
+    currentUVCControls = nil
     frames.removeAll(keepingCapacity: true)
     measuredFrameRate = 0
     readiness = ReadinessStateMachine(heuristic: readinessHeuristic)
@@ -181,6 +210,25 @@ public actor FrameStore {
     var pixelAttachments: [String: String] = [:]
     var sampleAttachments: [String: String] = [:]
     let sourceSample = frame.sourceSampleBuffer ?? frame.sampleBuffer
+    let deviceMetadata = activeConfiguration?.deviceMetadata
+    let warmupFrames = activeConfiguration?.warmupFrames
+    let cameraObservations = CameraObservationCollector.collect(from: frame)
+    let frameDurationSeconds: Double? = {
+      let duration = CMSampleBufferGetDuration(sourceSample)
+      guard duration.isNumeric, duration.value > 0 else { return nil }
+      let seconds = Double(duration.value) / Double(duration.timescale)
+      return seconds.isFinite && seconds > 0 ? seconds : nil
+    }()
+    let deliveredFormat: CaptureFormat = {
+      if let pb = frame.sampleBuffer.imageBuffer {
+        let fourCC = CVPixelBufferGetPixelFormatType(pb)
+        return CaptureFormat(
+          width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb), fourCC: fourCC)
+      }
+      return CaptureFormat(width: frame.width, height: frame.height, fourCC: frame.fourCC)
+    }()
+    let pixelFormatString = CaptureFormat.fourCCString(deliveredFormat.fourCC)
+    let videoRange = CaptureFormatFacts.applying(to: deliveredFormat).yuvRange?.rawValue
     if let pb = frame.sampleBuffer.imageBuffer {
       let copiedAttachments =
         CMCopyDictionaryOfAttachments(
@@ -247,7 +295,14 @@ public actor FrameStore {
       hostLocation: nil,
       mediaTimeNanos: frame.timestampNanos,
       wallClockAnchorISO: frame.hostWallClockISO,
-      generation: frame.generation)
+      generation: frame.generation,
+      cameraObservations: cameraObservations,
+      deviceMetadata: deviceMetadata,
+      frameDurationSeconds: frameDurationSeconds,
+      deliveredPixelFormat: pixelFormatString,
+      videoRange: videoRange,
+      warmupFrames: warmupFrames,
+      uvcControls: currentUVCControls)
   }
 
   /// Update the frame interval when the mode changes; records the requested
