@@ -1,0 +1,54 @@
+<Window
+    x:Class="PixelBooth.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="PixelBooth">
+  <Grid x:Name="Root" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <MenuBar>
+      <MenuBarItem Title="File">
+        <MenuFlyoutItem Text="Change save folder…" Click="ChooseFolder_Click" />
+        <MenuFlyoutItem Text="Open save folder" Click="OpenFolder_Click" />
+      </MenuBarItem>
+      <MenuBarItem Title="Capture">
+        <MenuFlyoutSubItem x:Name="CameraMenu" Text="Camera" />
+        <MenuFlyoutItem x:Name="ModeMenuItem" Text="Capture format…" Click="Mode_Click" IsEnabled="False" />
+        <MenuFlyoutItem Text="Refresh cameras" Click="Refresh_Click" />
+        <MenuFlyoutSeparator />
+        <MenuFlyoutSubItem Text="Self-timer">
+          <ToggleMenuFlyoutItem x:Name="TimerOff" Text="Off" Tag="0" Click="Timer_Click" />
+          <ToggleMenuFlyoutItem x:Name="Timer3" Text="3 seconds" Tag="3" Click="Timer_Click" />
+          <ToggleMenuFlyoutItem x:Name="Timer10" Text="10 seconds" Tag="10" Click="Timer_Click" />
+        </MenuFlyoutSubItem>
+      </MenuBarItem>
+      <MenuBarItem Title="View">
+        <ToggleMenuFlyoutItem x:Name="MirrorMenuItem" Text="Mirror preview" Click="Mirror_Click" />
+        <MenuFlyoutItem Text="Capture details…" Click="Details_Click" />
+      </MenuBarItem>
+    </MenuBar>
+    <Border Grid.Row="1" Margin="16,8,16,8" CornerRadius="12" Background="#FF17191D" MinHeight="160">
+      <Grid>
+        <Image x:Name="Preview" Stretch="Uniform" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" RenderTransformOrigin="0.5,0.5" AutomationProperties.Name="Live camera preview">
+          <Image.RenderTransform><ScaleTransform x:Name="PreviewTransform" ScaleX="1"/></Image.RenderTransform>
+        </Image>
+        <TextBlock x:Name="PreviewMessage" Text="Choose a camera to begin" Foreground="White" Opacity="0.75" HorizontalAlignment="Center" VerticalAlignment="Center" TextWrapping="Wrap" />
+        <Border x:Name="SaveOverlay" Visibility="Collapsed" HorizontalAlignment="Left" VerticalAlignment="Bottom" Margin="16" Padding="12" MaxWidth="650" CornerRadius="8" Background="#DF202020">
+          <StackPanel Spacing="6">
+            <TextBlock x:Name="SaveStatus" Foreground="White" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
+            <Button x:Name="RetryButton" Content="Retry pending captures" Visibility="Collapsed" Click="Retry_Click" HorizontalAlignment="Left" />
+            <Button x:Name="RecoveryFolderButton" Content="Open recovery folder" Visibility="Collapsed" Click="OpenRecoveryFolder_Click" HorizontalAlignment="Left" />
+          </StackPanel>
+        </Border>
+        <Border x:Name="CountdownBadge" Visibility="Collapsed" Background="#B3000000" CornerRadius="48" Width="96" Height="96" HorizontalAlignment="Center" VerticalAlignment="Center">
+          <TextBlock x:Name="CountdownLabel" Foreground="White" FontSize="48" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+        </Border>
+      </Grid>
+    </Border>
+    <Grid Grid.Row="2" Margin="16,8,16,16" ColumnSpacing="16" RowSpacing="8">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+      <TextBlock x:Name="ReadyText" Text="Looking for cameras…" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+      <Button x:Name="Shutter" Grid.Column="1" Content="Take photo" Click="Shutter_Click" IsEnabled="False" Padding="28,13" Style="{ThemeResource AccentButtonStyle}" AutomationProperties.Name="Take photo" />
+      <TextBlock Grid.Column="2" Text="Space to capture" HorizontalAlignment="Right" VerticalAlignment="Center" Opacity="0.65"/>
+    </Grid>
+  </Grid>
+</Window>

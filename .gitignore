@@ -10,3 +10,8 @@ xcuserdata/
 .build/out/
 DerivedData/
 depth-model.local.json
+
+# Windows/.NET build artifacts
+/Windows/**/bin/
+/Windows/**/obj/
+/Windows/.vs/

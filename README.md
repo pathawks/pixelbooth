@@ -1,5 +1,7 @@
 # PixelBooth
 
+For the Windows-native C#/WinUI edition, see the [Windows README](Windows/README.md).
+
 A modern Photo Booth replacement for macOS, focused on **preserving camera-delivered
 image data** and **explaining exactly what was saved**.
 
